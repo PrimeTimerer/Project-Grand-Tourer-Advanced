@@ -1078,18 +1078,34 @@ namespace GT6Launcher
                 if (Directory.Exists(ToolDir))
                     Directory.Delete(ToolDir, true);
                 Directory.CreateDirectory(ToolDir);
-                // Windows' own tar reads the archive (bsdtar; Windows 10 1803 and later carry it).
+                // Windows' own tar reads the archive where it can (bsdtar: Windows 11 reads 7z). The tar of Windows 10 has no
+                // 7z reader - the setup stopped there on a fully updated Windows 10 (issue 1 of the public repository) -:
+                // there, and wherever tar fails, the launcher's own reader (SevenZip.cs) unpacks the same files.
                 string tar = Path.Combine(Environment.SystemDirectory, "tar.exe");
                 var info = new ProcessStartInfo(tar, "-xf \"" + archive + "\" -C \"" + ToolDir + "\"") { UseShellExecute = false, CreateNoWindow = true };
                 bool extracted = false;
                 if (File.Exists(tar))
                     using (Process p = Process.Start(info))
                     {
-                        p.WaitForExit(300000);
+                        if (!p.WaitForExit(300000))
+                        {
+                            try
+                            {
+                                p.Kill();
+                            }
+                            catch (Exception)
+                            {
+                            }
+                            p.WaitForExit(10000);
+                        }
                         extracted = p.HasExited && p.ExitCode == 0 && File.Exists(exe);
+                        if (!extracted)
+                            Note("tool: tar did not unpack the archive" + (p.HasExited ? " (exit code " + p.ExitCode + ")" : ""));
                     }
+                else
+                    Note("tool: this Windows has no tar.exe");
                 if (!extracted)
-                    throw new SetupFailed(L.T("설치 도구의 압축을 풀지 못했습니다. 이 Windows의 tar가 7z 형식을 읽지 못합니다 (Windows 10 최신판 또는 Windows 11이 필요합니다)."));
+                    UnpackOwn(archive);
             }
             Directory.CreateDirectory(Path.Combine(ToolDir, "GuiConfigs"));
             File.WriteAllText(Path.Combine(ToolDir, "GuiConfigs", "CurrentSettings.ini"),
@@ -1100,6 +1116,48 @@ namespace GT6Launcher
             Directory.CreateDirectory(Path.Combine(ToolDir, "log"));
             PointTool(Path.Combine(launcher.GameDir, "dev_hdd0"));
             At(1, null);
+        }
+
+        // The launcher's own 7z reader (SevenZip.cs). It unpacks beside the target folder and renames it when everything is
+        // there, so that a setup that is stopped half way never leaves a folder that has rpcs3.exe but not the rest.
+        void UnpackOwn(string archive)
+        {
+            string part = ToolDir + ".part";
+            try
+            {
+                if (Directory.Exists(ToolDir))
+                    Directory.Delete(ToolDir, true);   // what a tar that failed half way left
+                if (Directory.Exists(part))
+                    Directory.Delete(part, true);
+                int files = SevenZip.Extract(archive, part, delegate(long bytes, long all)
+                {
+                    At(0.85 + 0.14 * bytes / Math.Max(1, all), null);
+                }, Cancelled);
+                if (!File.Exists(Path.Combine(part, "rpcs3.exe")))
+                    throw new InvalidDataException("rpcs3.exe is not in the archive");
+                Directory.Move(part, ToolDir);
+                Note("tool: " + files + " files unpacked by the launcher's own 7z reader");
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Note("tool: the launcher's own 7z reader failed: " + ex);
+                throw new SetupFailed(L.T("설치 도구의 압축을 풀지 못했습니다") + ": " + ex.Message);
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(part))
+                        Directory.Delete(part, true);
+                }
+                catch (Exception)
+                {
+                }
+            }
         }
 
         static string YamlPath(string path)

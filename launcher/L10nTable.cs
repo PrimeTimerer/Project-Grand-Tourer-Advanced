@@ -318,7 +318,7 @@ namespace GT6Launcher
             {"설정 파일을 쓰지 못했습니다", "Could not write the settings file"},
             {"설치", "Install"},
             {"설치 도구를 준비하는 중", "Preparing the setup tool"},
-            {"설치 도구의 압축을 풀지 못했습니다. 이 Windows의 tar가 7z 형식을 읽지 못합니다 (Windows 10 최신판 또는 Windows 11이 필요합니다).", "The setup tool could not be unpacked: this Windows' tar cannot read the 7z format (a current Windows 10 or Windows 11 is needed)."},
+            {"설치 도구의 압축을 풀지 못했습니다", "The setup tool could not be unpacked"},
             {"설치 시작", "Start setup"},
             {"설치 실패: ", "Install failed: "},
             {"설치 완료", "Setup complete"},

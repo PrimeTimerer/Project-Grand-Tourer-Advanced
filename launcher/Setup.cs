@@ -1,7 +1,8 @@
 // The setup of a new copy: everything between "the user has the game" (an ISO or a folder of the European disc,
 // BCES01893) and "the game starts", done by the launcher with one button and nothing but a progress bar to see.
 //   1  the disc's files                     -> game\dev_bdvd            (read out of the ISO, or copied from a folder)
-//   2  RPCS3, as a tool                     -> _setup\rpcs3             (downloaded from its own releases, checked)
+//   2  RPCS3, as a tool                     -> _setup\rpcs3             (downloaded from its own releases, checked; unpacked by
+//                                                                       Windows' tar or, where that cannot read 7z, by SevenZip.cs)
 //   3  the PS3 firmware                     -> installed in that RPCS3  (downloaded from Sony's update server)
 //   4  the game's 22 update packages        -> game\dev_hdd0            (downloaded from Sony's update server, installed
 //                                                                       by RPCS3's own package installer)
