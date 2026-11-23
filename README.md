@@ -63,6 +63,12 @@ The launcher checks this repository's releases once a day. A newer release is do
 
 [BUILD.md](BUILD.md) has the steps. In short: apply `patches/*.patch` to the `ps3recomp` submodule in number order, prepare `game\` from your own disc with the launcher's setup, lift `game\EMAIN.ELF` with ps3recomp's PPU lifter, then run `build_release.bat` and `build_launcher.bat`.
 
+## Credits
+
+- **[RPCS3](https://github.com/RPCS3/rpcs3)**, the PlayStation 3 emulator. The launcher uses its official build during the setup to decrypt the game's executable and one firmware module, and deletes it afterwards. The build turns its community patches for GT6 1.22 (AlexHaust, illusion and others) into the port's switches, and RPCS3's work on how the PS3 runs Gran Turismo 6 was the reference for this port.
+- **[ps3recomp](https://github.com/sp00nznet/ps3recomp)** by sp00nznet: the static recompiler and runtime the port is built on.
+- **[Dear ImGui](https://github.com/ocornut/imgui)**: the in-game menu.
+
 ## License
 
 - The port's own code and files are under the [MIT License](LICENSE).
@@ -126,6 +132,12 @@ The launcher checks this repository's releases once a day. A newer release is do
 ### 업데이트
 
 런처는 하루에 한 번 이 저장소의 릴리스를 확인합니다. 새 릴리스가 있으면 뒤에서 받아 두었다가 다음에 런처를 열 때 적용합니다. 게임 파일, 세이브, 설정, 모드는 그대로 남습니다.
+
+### 크레딧
+
+- **[RPCS3](https://github.com/RPCS3/rpcs3)**: PlayStation 3 에뮬레이터입니다. 런처는 설치하는 동안 RPCS3 공식 빌드로 게임의 실행 파일과 펌웨어 모듈 하나를 복호화하고, 끝나면 지웁니다. 빌드는 RPCS3의 GT6 1.22용 커뮤니티 패치(AlexHaust, illusion 외)를 포트의 스위치로 만들며, PS3가 그란 투리스모 6를 어떻게 돌리는지에 대한 RPCS3의 작업이 이 포트의 기준이 되었습니다.
+- **[ps3recomp](https://github.com/sp00nznet/ps3recomp)**(sp00nznet): 이 포트의 바탕인 정적 리컴파일러와 런타임입니다.
+- **[Dear ImGui](https://github.com/ocornut/imgui)**: 게임 안 메뉴입니다.
 
 ### 빌드(개요)와 라이선스
 
