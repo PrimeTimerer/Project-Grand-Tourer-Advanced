@@ -1,0 +1,362 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 136c932..e21a3f1 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -7764,18 +7764,23 @@ typedef struct {
+     char *vs, *ps;
+     render_state_t state;
+     rsx_vertex_layout_plan layout;
+-    u64 key;
+-    u32 pso_index, born;
++    u64 key, vs_hash, ps_hash;
++    u32 pso_index, born, vs_len, ps_len;
+     int have_layout, packed, point, pull;
++    int vs_ok, ps_ok;         /* the blob is in the memory or disk cache, or its compile job is ready */
++    int submitted;            /* the pipeline workers have its descriptor */
+ } ld_ap_job;
+-#define LD_AP_JOBS 512u
+-#define LD_AP_LIMIT_FRAMES 900u
+-#define LD_AP_PER_FRAME 16u
++#define LD_AP_JOBS 2048u
++#define LD_AP_LIMIT_FRAMES 600u
++#define LD_AP_BUDGET_US 1500     /* of the drawing thread, a frame, for looking at pending jobs */
+ static ld_ap_job g_ld_ap_jobs[LD_AP_JOBS];
+ static u32 g_ld_ap_count, g_ld_ap_cursor;
+ static u8  g_ld_ap_pending[MAX_PSOS];   /* this g.psos entry is NULL because its pipeline is being made */
+ static int g_ld_ap_last_pending;        /* the last get_pso() answered NULL for that reason */
+ static int g_ld_ap_refused;             /* the pipeline workers did not take the last descriptor (table full) */
++/* build_pso measures and hashes both sources (30-60 KB each) on every call; a pending job is looked at many
++ * times, so ld_ap_step passes what it already knows. */
++static struct { int on; u32 vs_len, ps_len; u64 vs_hash, ps_hash; } g_ld_bp_hint;
+ static struct { unsigned long long started, finished, sync_final, skipped_draws, immediate, refused;
+                 u32 max_frames, report_frame; } g_ld_ap;
+ static int ld_ap_on(void)
+@@ -7799,8 +7804,11 @@ static int ld_ap_eligible(const render_state_t* rs)
+      * pipelines (ten seconds without a picture, measured; the title's own wait for a flip gives up after five). */
+     static int alive_only = -1;
+     if (alive_only < 0) { const char* e = getenv("LD_ASYNC_PSO_ALIVE"); alive_only = e && *e == '1'; }
++    /* (not while the host has paused background preparation - a movie plays: the pipeline workers stand still
++     * then, and a job waited its 600 frames out in the menu before the first race, b10_on1) */
+     return ld_ap_on() && rs->depth_test && !g_ld_movie_mode && g_ld_pw.active && g_ld_ap_count < LD_AP_JOBS &&
+-           g_ld_compile_jobs.state == LD_SCJ_RUNNING && (!alive_only || ld_ap_target_alive());
++           g_ld_compile_jobs.state == LD_SCJ_RUNNING && !InterlockedCompareExchange(&g_ld_prepare_paused, 0, 0) &&
++           (!alive_only || ld_ap_target_alive());
+ }
+ 
+ static ID3D12PipelineState* build_pso(
+@@ -7815,11 +7823,11 @@ static ID3D12PipelineState* build_pso(
+     ID3DBlob *vs = NULL, *ps = NULL, *err = NULL;
+     static u32 compile_fail_logs = 0;
+     static u32 create_fail_logs = 0;
+-    const u32 vs_length = (u32)strlen(vs_hlsl);
+-    const u32 ps_length = (u32)strlen(ps_hlsl);
+-    const u64 vs_hash = fnv1a(
++    const u32 vs_length = g_ld_bp_hint.on ? g_ld_bp_hint.vs_len : (u32)strlen(vs_hlsl);
++    const u32 ps_length = g_ld_bp_hint.on ? g_ld_bp_hint.ps_len : (u32)strlen(ps_hlsl);
++    const u64 vs_hash = g_ld_bp_hint.on ? g_ld_bp_hint.vs_hash : fnv1a(
+         vs_hlsl, vs_length, 1469598103934665603ull);
+-    const u64 ps_hash = fnv1a(
++    const u64 ps_hash = g_ld_bp_hint.on ? g_ld_bp_hint.ps_hash : fnv1a(
+         ps_hlsl, ps_length, 1469598103934665603ull);
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_note_hlsl(
+@@ -9137,9 +9145,13 @@ static ID3D12PipelineState* get_pso(
+       } }
+     int ap_pending = 0;
+     if (vi > 0 && fi > 0) {
+-        if (!g_ld_la_mode && !g_ld_la_busy && ld_ap_eligible(&rs))
++        /* (not a point draw: its geometry shader is made by the synchronous path only, so the pipeline never got
++         * ready and the lights behind the My Home menu were left out for 600 frames, b10_on1 / b10_warm1) */
++        if (!g_ld_la_mode && !g_ld_la_busy && !point_draw && ld_ap_eligible(&rs))
+             pso = ld_ap_begin(vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key, point_draw, vertex_pull, &ap_pending);
+-        else if (!g_ld_la_mode && !g_ld_la_busy && ld_la_enabled())
++        /* (with asynchronous pipelines on, nothing is scanned ahead: a scan decompiles up to 256 programs on
++         * this thread - 109 scans took 4.5 s on a first visit to a track - for draws that would not wait) */
++        else if (!g_ld_la_mode && !g_ld_la_busy && ld_la_enabled() && !ld_ap_on())
+             pso=ld_la_build(vs_hlsl,ps_hlsl,&rs,masked_layout,packed_payload,key,point_draw,vertex_pull);
+         else pso = build_pso(
+             vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key, point_draw, vertex_pull);
+@@ -9248,11 +9260,10 @@ static ID3D12PipelineState* ld_la_build(const char* vs, const char* ps, const re
+ /* One asynchronous step for a job: take the pipeline if everything is ready (mode -1 never waits and never
+  * compiles), else hand the workers what can be handed over now (mode 2: the descriptor, once both blobs are
+  * there). g_ld_pw_front puts that descriptor before the start-up recipes. */
+-/* 1 = the blob is there or a worker has the source; 0 = the compile queue is full or stopped. */
+-static int ld_ap_request(char stage, const char* source)
++/* What a source is to the workers: 2 = its blob is there (memory or disk cache), 1 = a compile worker has it,
++ * 0 = the compile queue is full or stopped. */
++static int ld_ap_request(char stage, const char* source, u32 size, u64 hash)
+ {
+-    const u32 size = (u32)strlen(source);
+-    const u64 hash = fnv1a(source, size, 1469598103934665603ull);
+     shader_blob_cache_t* cache = stage == 'V' ? &g.vs_blobs : &g.ps_blobs;
+     int post = 0, seen = 0;
+     ID3DBlob* blob = shader_blob_cache_find(cache, source, size, hash, &post, &seen);
+@@ -9260,76 +9271,128 @@ static int ld_ap_request(char stage, const char* source)
+         blob = shader_disk_cache_load_ex(stage, source, size, hash, 0);
+         if (blob) shader_blob_cache_insert_accounted(cache, source, size, hash, blob, stage, seen);
+     }
+-    if (blob) { blob->lpVtbl->Release(blob); return 1; }
+-    return ld_scj_request(&g_ld_compile_jobs, stage, source, size, hash) != NULL;
++    if (blob) { blob->lpVtbl->Release(blob); return 2; }
++    return ld_scj_request(&g_ld_compile_jobs, stage, source, size, hash) != NULL ? 1 : 0;
+ }
+-static ID3D12PipelineState* ld_ap_step(const char* vs, const char* ps, const render_state_t* state,
+-    const rsx_vertex_layout_plan* layout, int packed, u64 key, int point, int pull)
++/* One step for a job whose two blobs are there: take the pipeline if it is ready (mode -1 never waits and never
++ * compiles); else, once, hand the descriptor to the pipeline workers (mode 2), before the start-up recipes
++ * (g_ld_pw_front). */
++static ID3D12PipelineState* ld_ap_step(ld_ap_job* job)
+ {
++    const rsx_vertex_layout_plan* layout = job->have_layout ? &job->layout : NULL;
++    g_ld_bp_hint.on = 1;
++    g_ld_bp_hint.vs_len = job->vs_len; g_ld_bp_hint.ps_len = job->ps_len;
++    g_ld_bp_hint.vs_hash = job->vs_hash; g_ld_bp_hint.ps_hash = job->ps_hash;
+     g_ld_ap_refused = 0;
+     g_ld_la_mode = -1;
+-    ID3D12PipelineState* pso = build_pso(vs, ps, state, layout, packed, key, point, pull);
+-    if (!pso) {
++    ID3D12PipelineState* pso = build_pso(job->vs, job->ps, &job->state, layout, job->packed, job->key, job->point, job->pull);
++    /* handed over, and the workers have rejected it or lost it: it will not come, the synchronous path decides */
++    if (!pso && job->submitted && (g_ld_pw_last_state == 3 || g_ld_pw_last_state == -1)) g_ld_ap_refused = 1;
++    if (!pso && !job->submitted) {
++        const u64 queued = g_ld_la_queued;
+         g_ld_la_mode = 2; g_ld_pw_front = 1;
+-        build_pso(vs, ps, state, layout, packed, key, point, pull);
++        build_pso(job->vs, job->ps, &job->state, layout, job->packed, job->key, job->point, job->pull);
+         g_ld_pw_front = 0;
++        if (g_ld_la_queued != queued) job->submitted = 1;
+     }
+     g_ld_la_mode = 0;
++    g_ld_bp_hint.on = 0;
+     return pso;
+ }
+ static ID3D12PipelineState* ld_ap_begin(const char* vs, const char* ps, const render_state_t* state,
+     const rsx_vertex_layout_plan* layout, int packed, u64 key, int point, int pull, int* pending)
+ {
+     *pending = 0;
+-    const size_t nv = strlen(vs) + 1, np = strlen(ps) + 1;
+-    char* v = (char*)malloc(nv); char* p = (char*)malloc(np);
+-    ID3D12PipelineState* pso = NULL;
+-    const int accepted = v && p && ld_ap_request('V', vs) && ld_ap_request('P', ps);
+-    if (accepted) pso = ld_ap_step(vs, ps, state, layout, packed, key, point, pull);
+-    if (pso) { free(v); free(p); g_ld_ap.immediate++; return pso; }
+-    if (!accepted || g_ld_ap_refused) {
+-        /* no worker will make it: the path this draw had before */
++    const u32 nv = (u32)strlen(vs), np = (u32)strlen(ps);
++    const u64 hv = fnv1a(vs, nv, 1469598103934665603ull), hp = fnv1a(ps, np, 1469598103934665603ull);
++    const int rv = ld_ap_request('V', vs, nv, hv);
++    const int rp = rv ? ld_ap_request('P', ps, np, hp) : 0;
++    char* v = (rv && rp) ? (char*)malloc((size_t)nv + 1u) : NULL;
++    char* p = (rv && rp) ? (char*)malloc((size_t)np + 1u) : NULL;
++    if (!v || !p) {
++        /* no worker will make it: this draw builds its own, as before */
+         free(v); free(p); g_ld_ap.refused++;
+-        return ld_la_enabled() ? ld_la_build(vs, ps, state, layout, packed, key, point, pull)
+-                               : build_pso(vs, ps, state, layout, packed, key, point, pull);
++        return build_pso(vs, ps, state, layout, packed, key, point, pull);
+     }
+-    memcpy(v, vs, nv); memcpy(p, ps, np);
+-    ld_ap_job* job = &g_ld_ap_jobs[g_ld_ap_count++];
++    memcpy(v, vs, (size_t)nv + 1u); memcpy(p, ps, (size_t)np + 1u);
++    ld_ap_job* job = &g_ld_ap_jobs[g_ld_ap_count];
+     memset(job, 0, sizeof(*job));
+     job->vs = v; job->ps = p; job->state = *state; job->key = key; job->born = g_ld_frames;
++    job->vs_len = nv; job->ps_len = np; job->vs_hash = hv; job->ps_hash = hp;
+     job->packed = packed; job->point = point; job->pull = pull;
++    job->vs_ok = rv == 2; job->ps_ok = rp == 2;
+     if (layout) { job->layout = *layout; job->have_layout = 1; }
++    if (job->vs_ok && job->ps_ok) {
++        ID3D12PipelineState* pso = ld_ap_step(job);
++        if (pso || g_ld_ap_refused) {
++            if (pso) g_ld_ap.immediate++; else g_ld_ap.refused++;
++            free(v); free(p); memset(job, 0, sizeof(*job));
++            return pso ? pso : build_pso(vs, ps, state, layout, packed, key, point, pull);
++        }
++    }
++    g_ld_ap_count++;
+     g_ld_ap.started++;
+     *pending = 1;
+     return NULL;
+ }
+-/* Once a frame, on the renderer owner between two frames: finish what the workers have finished. */
++/* Once a frame, on the renderer owner between two frames: finish what the workers have finished. A job costs a
++ * hash-table look while its sources compile and about 20 us once they have; LD_AP_BUDGET_US bounds a frame's share. */
+ static void ld_ap_pump(void)
+ {
+     if (!g_ld_ap_count) return;
+-    u32 budget = g_ld_ap_count < LD_AP_PER_FRAME ? g_ld_ap_count : LD_AP_PER_FRAME;
+-    while (budget-- && g_ld_ap_count) {
++    static LONGLONG freq;
++    LARGE_INTEGER q0, q;
++    if (!freq) { QueryPerformanceFrequency(&q); freq = q.QuadPart; }
++    QueryPerformanceCounter(&q0);
++    const LONGLONG budget = freq * LD_AP_BUDGET_US / 1000000;
++    const u32 n = g_ld_ap_count;
++    for (u32 looked = 0; looked < n && g_ld_ap_count; ) {
+         if (g_ld_ap_cursor >= g_ld_ap_count) g_ld_ap_cursor = 0;
+         ld_ap_job* job = &g_ld_ap_jobs[g_ld_ap_cursor];
+-        const rsx_vertex_layout_plan* layout = job->have_layout ? &job->layout : NULL;
+         const u32 age = g_ld_frames - job->born;
+-        int done = 0;
+-        ID3D12PipelineState* pso = ld_ap_step(job->vs, job->ps, &job->state, layout, job->packed, job->key, job->point, job->pull);
+-        if (pso) { done = 1; g_ld_ap.finished++; if (age > g_ld_ap.max_frames) g_ld_ap.max_frames = age; }
+-        else if (g_ld_ap_refused || age > LD_AP_LIMIT_FRAMES || g_ld_compile_jobs.state != LD_SCJ_RUNNING || !g_ld_pw.active) {
+-            /* a compile that failed, a full recipe table, a stopped worker: the synchronous path decides */
+-            pso = build_pso(job->vs, job->ps, &job->state, layout, job->packed, job->key, job->point, job->pull);
++        ID3D12PipelineState* pso = NULL;
++        int done = 0, failed = 0;
++        if (!job->vs_ok) {
++            const int st = ld_scj_status(&g_ld_compile_jobs, 'V', job->vs, job->vs_len, job->vs_hash);
++            if (st == 2) job->vs_ok = 1; else if (st != 1) failed = 1;
++        }
++        if (!failed && !job->ps_ok) {
++            const int st = ld_scj_status(&g_ld_compile_jobs, 'P', job->ps, job->ps_len, job->ps_hash);
++            if (st == 2) job->ps_ok = 1; else if (st != 1) failed = 1;
++        }
++        if (!failed && job->vs_ok && job->ps_ok) {
++            pso = ld_ap_step(job);
++            if (pso) { done = 1; g_ld_ap.finished++; if (age > g_ld_ap.max_frames) g_ld_ap.max_frames = age; }
++            else if (g_ld_ap_refused) failed = 1;
++        }
++        if (!done && (failed || age > LD_AP_LIMIT_FRAMES || g_ld_compile_jobs.state != LD_SCJ_RUNNING || !g_ld_pw.active)) {
++            /* a compile that failed, a full recipe table, a stopped worker, or too long: the synchronous path decides */
++            { static u32 said;
++              if (PS3_LOG_FIRST(said, 12))
++                  fprintf(stderr, "[async-pso] job given to the synchronous path after %u frames: vertex shader %s, fragment "
++                                  "shader %s, descriptor %s, recipe state %d, refused %d, point %d pull %d, frame %u\n", age,
++                          job->vs_ok ? "there" : "not there", job->ps_ok ? "there" : "not there",
++                          job->submitted ? "handed over" : "not handed over", g_ld_pw_last_state, g_ld_ap_refused,
++                          job->point, job->pull, g_ld_frames); }
++            pso = build_pso(job->vs, job->ps, &job->state, job->have_layout ? &job->layout : NULL, job->packed, job->key,
++                            job->point, job->pull);
+             done = 1; g_ld_ap.sync_final++;
+         }
+-        if (!done) { g_ld_ap_cursor++; continue; }
+-        if (job->pso_index < g.n_psos && g.psos[job->pso_index].key == job->key && g_ld_ap_pending[job->pso_index]) {
+-            g.psos[job->pso_index].pso = pso;
+-            g_ld_ap_pending[job->pso_index] = 0;
+-        } else if (pso) pso->lpVtbl->Release(pso);
+-        free(job->vs); free(job->ps);
+-        *job = g_ld_ap_jobs[--g_ld_ap_count];
+-    }
+-    if (g_ld_frames - g_ld_ap.report_frame >= 600u) {
++        looked++;
++        if (done) {
++            if (job->pso_index < g.n_psos && g.psos[job->pso_index].key == job->key && g_ld_ap_pending[job->pso_index]) {
++                g.psos[job->pso_index].pso = pso;
++                g_ld_ap_pending[job->pso_index] = 0;
++            } else if (pso) pso->lpVtbl->Release(pso);
++            free(job->vs); free(job->ps);
++            *job = g_ld_ap_jobs[--g_ld_ap_count];
++        } else g_ld_ap_cursor++;
++        if ((looked & 7u) == 0u) {
++            QueryPerformanceCounter(&q);
++            if (q.QuadPart - q0.QuadPart > budget) break;
++        }
++    }
++    if (g_ld_frames - g_ld_ap.report_frame >= 300u) {
+         g_ld_ap.report_frame = g_ld_frames;
+         fprintf(stderr, "[async-pso] frame=%u pending=%u started=%llu finished=%llu ready-at-once=%llu sync-final=%llu "
+                         "refused=%llu draws-left-out=%llu longest=%u frames\n",
+@@ -15425,7 +15488,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+             const char* trim=getenv("RSX_FP_COMPILE_INIT");
+             const char* scalar=getenv("RSX_FP_COMPILE_SCALAR");
+             { const char* t = getenv("LD_SCJ_THREADS");
+-              g_ld_scj_threads = t && atoi(t) >= 1 ? (unsigned)atoi(t) : ld_ap_on() ? 4u : 2u;
++              g_ld_scj_threads = t && atoi(t) >= 1 ? (unsigned)atoi(t) : ld_ap_on() ? 6u : 2u;
+               if (ld_ap_on())
+                   fprintf(stderr, "[async-pso] on: depth-tested draws wait for their pipeline off the renderer "
+                                   "(compile workers %u; LD_ASYNC_PSO=0 = the synchronous path)\n", g_ld_scj_threads); }
+diff --git a/libs/video/rsx_pso_warmup.h b/libs/video/rsx_pso_warmup.h
+index ae4d0d0..94d1be6 100644
+--- a/libs/video/rsx_pso_warmup.h
++++ b/libs/video/rsx_pso_warmup.h
+@@ -98,7 +98,7 @@ static struct {
+     ID3D12PipelineLibrary* library;
+     ID3D12RootSignature* roots[2];
+     char dir[MAX_PATH];
+-    HANDLE threads[4];
++    HANDLE threads[8];
+     unsigned thread_count, entry_count, new_records;
+     ld_pw_entry entries[LD_PW_LIMIT];
+     ld_pw_blob* blobs[LD_PW_HASH];
+@@ -508,7 +508,7 @@ static void ld_pw_start(ID3D12Device* dev, ID3D12PipelineLibrary* lib,
+     g_ld_pw.roots[0] = root; g_ld_pw.roots[1] = point_root;
+     unsigned count = 2;
+     setting = getenv("LD_PSO_PREWARM_THREADS");
+-    if (setting) { const int n = atoi(setting); if (n >= 1 && n <= 4) count = (unsigned)n; }
++    if (setting) { const int n = atoi(setting); if (n >= 1 && n <= 8) count = (unsigned)n; }
+     for (unsigned i = 0; i < count; ++i) {
+         HANDLE t = CreateThread(NULL, 0, ld_pw_worker, NULL, 0, NULL);
+         if (t) g_ld_pw.threads[g_ld_pw.thread_count++] = t;
+@@ -547,13 +547,18 @@ static void ld_pw_start(ID3D12Device* dev, ID3D12PipelineLibrary* lib,
+     InterlockedExchange(&g_ld_pw.discovered, 1); ld_pw_progress();
+ }
+ 
++/* What the last ld_pw_take_ex found for its descriptor: -1 no recipe, 0 queued, 1 being prepared, 2 ready,
++ * 3 rejected. For a caller that does not wait and has to tell "not yet" from "never". */
++static int g_ld_pw_last_state = -1;
+ static ID3D12PipelineState* ld_pw_take_ex(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, unsigned root_kind, int wait)
+ {
+     ld_pw_identity id;
++    g_ld_pw_last_state = -1;
+     if (!g_ld_pw.active || !ld_pw_identity_make(&id, pd, root_kind)) return NULL;
+     const uint64_t key = ld_pw_key(&id, pd);
+     ld_pw_entry* e = ld_pw_find(key);
+     if (!e) { g_ld_pw.misses++; return NULL; }
++    g_ld_pw_last_state = (int)InterlockedCompareExchange(&e->state,0,0);
+     if (!wait && InterlockedCompareExchange(&e->state,0,0)!=2) return NULL;
+     /* Promote a requested queued recipe: prepare it on this thread instead of
+      * waiting behind unrelated tracks. An already running job has sole ownership. */
+diff --git a/libs/video/rsx_shader_compile_jobs.h b/libs/video/rsx_shader_compile_jobs.h
+index d5858e3..86fe864 100644
+--- a/libs/video/rsx_shader_compile_jobs.h
++++ b/libs/video/rsx_shader_compile_jobs.h
+@@ -385,6 +385,22 @@ static ID3DBlob* ld_scj_acquire(ld_scj_state* state, unsigned stage,
+     return result;
+ }
+ 
++/* 2 = the job's blob is ready, 1 = queued or being compiled, 0 = failed or cancelled, -1 = no such job (or the
++ * queue does not run). Nothing waits and nothing is taken. */
++static int ld_scj_status(ld_scj_state* state, unsigned stage, const char* source, uint32_t length, uint64_t hash)
++{
++    if (!state || !source || !length) return -1;
++    int result = -1;
++    AcquireSRWLockShared(&state->lock);
++    if (state->state == LD_SCJ_RUNNING) {
++        const ld_scj_job* job = ld_scj_find_locked(state, stage, source, length, hash);
++        if (job) result = job->status == LD_SCJ_READY ? 2
++                        : (job->status == LD_SCJ_QUEUED || job->status == LD_SCJ_WORKING) ? 1 : 0;
++    }
++    ReleaseSRWLockShared(&state->lock);
++    return result;
++}
++
+ static void ld_scj_snapshot(ld_scj_state* state, ld_scj_stats* out)
+ {
+     if (!out) return;
+diff --git a/runtime/syscalls/sys_cond.c b/runtime/syscalls/sys_cond.c
+index 8bdacb4..ea7986f 100644
+--- a/runtime/syscalls/sys_cond.c
++++ b/runtime/syscalls/sys_cond.c
+@@ -119,10 +119,20 @@ int64_t sys_cond_destroy(ppu_context* ctx)
+     return result;
+ }
+ 
++/* A host's say in the timeout of a timed wait: it is given the condition variable's id, the guest address that
++ * id was stored at when it was made, and the timeout the guest asks for (microseconds, never 0), and returns
++ * the one to use (0 = none). A title's own watchdog timeout assumes the console's timing: a host that can stall
++ * the device it waits for (a renderer compiling shaders) lengthens it here. NULL = the guest's own. */
++uint64_t (*g_sys_cond_timeout_hook)(uint32_t id, uint32_t id_address, uint64_t timeout_us) = NULL;
++
+ int64_t sys_cond_wait(ppu_context* ctx)
+ {
+     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
+     uint64_t timeout = LV2_ARG_U64(ctx, 1);
++    if (timeout && g_sys_cond_timeout_hook) {
++        const uint32_t hook_id = LV2_ARG_U32(ctx, 0);
++        timeout = g_sys_cond_timeout_hook(hook_id, hook_id && hook_id <= SYS_COND_MAX ? g_cond_id_addr[hook_id] : 0u, timeout);
++    }
+     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
+     const char* peek = getenv("PS3_COND_PEEK");
+     if (peek) {

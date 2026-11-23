@@ -1,0 +1,32 @@
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 5f6ef17..6a83695 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -65,11 +65,24 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
+           MEMORY_BASIC_INFORMATION mbi;
+           uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
+           if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
+-          if (mbi.State != MEM_COMMIT) {
++          /* A page the title pages itself (sys_mmapper page-fault notification, sys_memory.c) has to be brought
++           * in by the title's pager, as for a PPU access: committing it here handed the SPU a page of zeros
++           * (Gran Turismo 6 reads its databases through such a window, and the job that decodes them is an SPU
++           * job). Such a page is not remembered in the bitmap: the pager takes it away again. */
++          int paged = 0;
++          while (mbi.State != MEM_COMMIT) {
++              extern int ps3_mmapper_page_fault(uint32_t addr, int writing);
++              if (ps3_mmapper_page_fault((uint32_t)pg[i] << 16, 0)) {
++                  paged = 1;
++                  if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
++                  continue;                                  /* mapped now, or the pager was busy: look again */
++              }
+               if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
+-          } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
+-              return 0;
++              break;
+           }
++          if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
++              return 0;
++          if (paged) continue;
+           g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
+       }
+     }

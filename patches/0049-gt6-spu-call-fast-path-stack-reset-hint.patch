@@ -1,0 +1,83 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index b97bcbb..59c50a7 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2808,6 +2808,9 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
+      * thread-local halt state, which is a function call on Darwin, and keep
+      * the scan out of line so the common return needs no frame. */
+     if (!spu_stack_reset_needed(ctx)) return;
++    /* [GT6 0053] The byte SPU_DIRECT asks: it is nonzero at every registered entry (written before the count
++     * that makes the scan see the entry), so a zero here is "no entry at this pc" without walking the table. */
++    if (!g_spu_stack_reset_hint[(ctx->pc >> 2) & 1023u]) return;
+     spu_check_stack_reset_scan(ctx, fn);
+ }
+ 
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index fdea0f4..06bdc6b 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -1049,6 +1049,32 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+ extern volatile int g_spu_direct;                /* spu_drain.c: -1 unread, 0 off, 1 on */
+ extern uint8_t g_spu_stack_reset_hint[1024];     /* spu_channels.c, by (entry >> 2) & 1023 */
+ void spu_direct_init(void);
++
++/* [GT6 0053] The ordinary outcome of a call bracket, inline. The lifter closes every brsl/bisl with
++ *     callee(ctx); spu_drain_call(ctx, return_pc); ctx->host_depth--; spu_img_restore(ctx, saved);
++ * and nearly every time the callee has simply returned: no transfer is pending and pc is the return address.
++ * spu_drain_call then does nothing but its entry checks (first-use init, the depth guard) and leaves, behind a
++ * call, a stack-protected frame holding a jmp_buf and two thread-local address computations. A sample of Gran
++ * Turismo 6's five SPURS threads in a twelve-car pack had 0.52 ms a frame in it and 0.07 in spu_img_restore.
++ * A title defines SPU_CALL_FAST_PATH for its lifted sources to get these forms. Everything that is not that
++ * outcome (a pending transfer, another pc, an armed interrupt frame, the guard's upper half, the first use)
++ * calls the function as before, so both are the same program. */
++#ifdef SPU_CALL_FAST_PATH
++static inline void spu_drain_call_fast(spu_context* ctx, uint32_t return_pc)
++{
++    const uint32_t limit = g_spu_depth_guard_limit;
++    if (__builtin_expect(!g_spu_trampoline_fn && !((ctx->pc ^ return_pc) & SPU_LS_MASK) &&
++                         g_spu_direct >= 0 && limit && ctx->host_depth < limit / 2 && !ctx->irq_frame, 1))
++        return;
++    spu_drain_call(ctx, return_pc);
++}
++static inline void spu_img_restore_fast(spu_context* ctx, int32_t saved_img)
++{
++    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : saved_img;
++}
++#define spu_drain_call  spu_drain_call_fast
++#define spu_img_restore spu_img_restore_fast
++#endif
+ #if defined(__clang__) && defined(__has_attribute)
+ #  if __has_attribute(musttail)
+ #    define SPU_DIRECT_TAILCALLS 1
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 3bf6b95..2d97e9f 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -624,17 +624,19 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+         }
+         {
+             uint32_t pc = ctx->pc & SPU_LS_MASK;
+-            spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
+-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
+             /* Code resident in a verified slot (spu_overlay_register_verified_region
+-             * and _subregion) is in neither registry asked above: Gran Turismo 6's
++             * and _subregion) is in neither registry asked below: Gran Turismo 6's
+              * job modules and its lifted job manager are registered that way, so a
+              * job that came back on its own continuation was unwound although the
+-             * continuation is lifted [GT6 0036]. Ask the resolver dispatch uses. */
+-            if (!fn) {
+-                extern void (*spu_lifted_lookup(const spu_context*, uint32_t))(spu_context*);
+-                fn = spu_lifted_lookup(ctx, pc);
+-            }
++             * continuation is lifted [GT6 0036]. Ask the resolver dispatch uses.
++             * [GT6 0053] Asked first: only "is there lifted code here" is used (the
++             * dispatcher resolves the target again), this answer comes from the
++             * per-thread dispatch cache, and the two registry walks below ran on
++             * every job that returned on its continuation. */
++            extern void (*spu_lifted_lookup(const spu_context*, uint32_t))(spu_context*);
++            spu_drain_fn fn = spu_lifted_lookup(ctx, pc);
++            if (!fn && ctx->resident_ovl) fn = spu_lookup(pc, ctx->resident_ovl);
++            if (!fn) fn = spu_lookup(pc, ctx->image_id);
+             if (fn) {
+                 { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",

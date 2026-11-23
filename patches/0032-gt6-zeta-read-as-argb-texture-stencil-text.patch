@@ -1,0 +1,339 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 8940187..2a8b0b8 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -170,7 +170,14 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ /* Top-left windows of a surface for smaller textures that alias it (see surface_window). */
+ #define LD_SWIN_PER       2
+ #define SRV_SURF_WIN_BASE (SRV_FEEDBACK_BASE + MAX_SURFACES)
+-#define SRV_CPU_HEAP_SLOTS (SRV_SURF_WIN_BASE + MAX_SURFACES * LD_SWIN_PER)
++/* Each zeta read as an A8R8G8B8 texture (zstencil_view): its stencil plane, and the views as UAV and as SRV.
++ * A view is as large as the texture that reads it; a title reads one zeta at more than one size (Gran Turismo 6:
++ * 1440x1080 and 1536x1408 in the same frame), so there are LD_ZS_VIEWS of them per zeta. */
++#define LD_ZS_VIEWS        2
++#define SRV_ZS_SOURCE_BASE (SRV_SURF_WIN_BASE + MAX_SURFACES * LD_SWIN_PER)
++#define UAV_ZS_VIEW_BASE   (SRV_ZS_SOURCE_BASE + MAX_SURFACES)
++#define SRV_ZS_VIEW_BASE   (UAV_ZS_VIEW_BASE + MAX_SURFACES * LD_ZS_VIEWS)
++#define SRV_CPU_HEAP_SLOTS (SRV_ZS_VIEW_BASE + MAX_SURFACES * LD_ZS_VIEWS)
+ #define SRV_TABLE_SIZE   16
+ #define SRV_RING_TABLES  4096
+ 
+@@ -255,6 +262,17 @@ typedef struct {
+     u64 depth_both_draws;
+     int reject_logged;
+     u32 last_bind_frame;      /* g_ld_frames when a pass last bound it (rsx_live_draw_is_gpu_depth) */
++    /* The zeta read as an A8R8G8B8 texture at its own address (see zstencil_view). */
++    struct {
++        ID3D12Resource* tex;  /* R8G8B8A8, as large as the texture that reads it */
++        u32 w, h, remap;
++        u32 gen;              /* stencil_gen it was filled at */
++        u32 last_use;         /* g_ld_frames of the last bind: the older one makes room for a new size */
++        D3D12_RESOURCE_STATES state;
++        int valid;
++    } sview[LD_ZS_VIEWS];
++    ID3D12Resource* sview_src;/* the zeta resource the stencil-plane descriptor was written for */
++    u32 stencil_gen;          /* counts the draws and clears that may have changed depth or stencil */
+ } zdepth_t;
+ typedef struct {
+     u32 location, offset, format, width, height, pitch, remap;
+@@ -4217,6 +4235,11 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+             retire_texture(old->snapshot);
+             old->snapshot = NULL;
+         }
++        for (u32 k = 0; k < LD_ZS_VIEWS; k++) {
++            if (old->sview[k].tex) retire_texture(old->sview[k].tex);
++            memset(&old->sview[k], 0, sizeof old->sview[k]);
++        }
++        old->sview_src = NULL;
+     }
+ 
+     D3D12_HEAP_PROPERTIES hp = {0};
+@@ -4417,6 +4440,235 @@ static int zdepth_snapshot(u32 slot)
+     return 1;
+ }
+ 
++/* A zeta read as an A8R8G8B8 texture at its own address (Gran Turismo 6, 2026-11-15: no text anywhere in its
++ * menus). The game draws each string into the stencil buffer -- colour writes off, a rectangle that zeroes the
++ * stencil, then the glyph outlines as triangle fans with INVERT on stencil bit 7 -- and then draws the string's
++ * rectangle with the depth buffer bound as a texture: A8R8G8B8, linear, texel coordinates, remap 0xAAFF (every
++ * channel from B). D24S8 read that way is A = depth 23-16, R = 15-8, G = 7-0, B = stencil, so the texel is the
++ * stencil value and the fragment program makes the coverage out of it. Guest memory there holds nothing the draws
++ * wrote (the stencil lives in the host's depth resource), so every string came out fully transparent.
++ * The view is a host texture as large as the texture the title declares, filled by a compute pass from both planes
++ * of the zeta with the bind's remap applied (a live texture is sampled without it), and filled again when a draw or
++ * a clear has touched the zeta since. LD_STENCIL_VIEW=0 turns it off. */
++static ID3D12RootSignature* g_zs_rootsig;
++static ID3D12PipelineState* g_zs_pso;
++static u64 g_zs_fills;
++static int zstencil_pipeline(void)
++{
++    static int tried = 0;
++    if (g_zs_pso) return 1;
++    if (tried) return 0;
++    tried = 1;
++    static const char source[] =
++        "Texture2D<float> depth_plane : register(t0);\n"
++        "Texture2D<uint2> stencil_plane : register(t1);\n"
++        "RWTexture2D<float4> view : register(u0);\n"
++        "cbuffer C : register(b0) { uint remap; uint w; uint h; uint pad; };\n"
++        "float pick(uint4 s, uint comp) {\n"
++        "    uint op = (remap >> (8 + comp * 2)) & 3;\n"
++        "    if (op == 0) return 0.0;\n"
++        "    if (op == 1) return 1.0;\n"
++        "    return (float)s[(remap >> (comp * 2)) & 3] / 255.0;\n"
++        "}\n"
++        "[numthreads(8, 8, 1)]\n"
++        "void main(uint3 id : SV_DispatchThreadID) {\n"
++        "    if (id.x >= w || id.y >= h) return;\n"
++        "    uint d = (uint)(saturate(depth_plane.Load(int3(id.xy, 0))) * 16777215.0 + 0.5);\n"
++        "    uint4 s = uint4((d >> 16) & 255, (d >> 8) & 255, d & 255,\n"
++        "                    stencil_plane.Load(int3(id.xy, 0)).g & 255);\n"      /* guest order A, R, G, B */
++        "    view[id.xy] = float4(pick(s, 1), pick(s, 2), pick(s, 3), pick(s, 0));\n"
++        "}\n";
++    ID3DBlob* shader = NULL; ID3DBlob* errors = NULL;
++    if (FAILED(D3DCompile(source, sizeof(source) - 1u, "zstencil_view", NULL, NULL, "main", "cs_5_0",
++                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader, &errors))) {
++        fprintf(stderr, "[zstencil] shader compile failed: %s\n",
++                errors ? (const char*)errors->lpVtbl->GetBufferPointer(errors) : "?");
++        if (errors) errors->lpVtbl->Release(errors);
++        return 0;
++    }
++    if (errors) errors->lpVtbl->Release(errors);
++    D3D12_DESCRIPTOR_RANGE ranges[2] = {0};
++    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    ranges[0].NumDescriptors = 2;
++    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++    ranges[1].NumDescriptors = 1;
++    D3D12_ROOT_PARAMETER parameters[3] = {0};
++    for (u32 i = 0; i < 2; ++i) {
++        parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++        parameters[i].DescriptorTable.NumDescriptorRanges = 1;
++        parameters[i].DescriptorTable.pDescriptorRanges = &ranges[i];
++        parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    }
++    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    parameters[2].Constants.ShaderRegister = 0;
++    parameters[2].Constants.Num32BitValues = 4;
++    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    D3D12_ROOT_SIGNATURE_DESC description = {0};
++    description.NumParameters = 3;
++    description.pParameters = parameters;
++    ID3DBlob* serialized = NULL; ID3DBlob* signature_errors = NULL;
++    HRESULT hr = D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &signature_errors);
++    if (signature_errors) signature_errors->lpVtbl->Release(signature_errors);
++    if (SUCCEEDED(hr)) {
++        hr = g.dev->lpVtbl->CreateRootSignature(g.dev, 0, serialized->lpVtbl->GetBufferPointer(serialized),
++                                                serialized->lpVtbl->GetBufferSize(serialized),
++                                                &IID_ID3D12RootSignature, (void**)&g_zs_rootsig);
++        serialized->lpVtbl->Release(serialized);
++    }
++    if (SUCCEEDED(hr)) {
++        D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {0};
++        pipeline.pRootSignature = g_zs_rootsig;
++        pipeline.CS.pShaderBytecode = shader->lpVtbl->GetBufferPointer(shader);
++        pipeline.CS.BytecodeLength = shader->lpVtbl->GetBufferSize(shader);
++        hr = g.dev->lpVtbl->CreateComputePipelineState(g.dev, &pipeline, &IID_ID3D12PipelineState, (void**)&g_zs_pso);
++    }
++    shader->lpVtbl->Release(shader);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[zstencil] pipeline failed hr=0x%08lX\n", (unsigned long)hr);
++        g_zs_pso = NULL;
++        return 0;
++    }
++    return 1;
++}
++
++/* The SRV slot of zeta zi's A8R8G8B8 view for a texture of tw x th read through `remap`; 0 when there is none. */
++static u32 zstencil_view(u32 zi, u32 remap, u32 tw, u32 th)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_STENCIL_VIEW"); on = !(e && *e == '0'); }
++    if (!on || zi >= g.n_zdepths) return 0;
++    zdepth_t* z = &g.zdepths[zi];
++    if (!z->tex || !z->snapshot) return 0;   /* the depth-plane descriptor is written along with the snapshot */
++    const u32 w = tw < z->w ? tw : z->w, h = th < z->h ? th : z->h;
++    if (!w || !h || !zstencil_pipeline()) return 0;
++    if (z->sview_src != z->tex) {
++        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
++        sd.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
++        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        sd.Texture2D.MipLevels = 1;
++        sd.Texture2D.PlaneSlice = 1;
++        g.dev->lpVtbl->CreateShaderResourceView(g.dev, z->tex, &sd, srv_cpu(SRV_ZS_SOURCE_BASE + zi));
++        z->sview_src = z->tex;
++        for (u32 k = 0; k < LD_ZS_VIEWS; k++) z->sview[k].valid = 0;
++    }
++    u32 vi = LD_ZS_VIEWS;
++    for (u32 k = 0; k < LD_ZS_VIEWS; k++)
++        if (z->sview[k].tex && z->sview[k].w == w && z->sview[k].h == h) { vi = k; break; }
++    if (vi == LD_ZS_VIEWS) {
++        vi = 0;                                                    /* an empty one, else the one not used longest */
++        for (u32 k = 0; k < LD_ZS_VIEWS; k++) {
++            if (!z->sview[k].tex) { vi = k; break; }
++            if (z->sview[k].last_use < z->sview[vi].last_use) vi = k;
++        }
++        D3D12_HEAP_PROPERTIES hp = {0};
++        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++        D3D12_RESOURCE_DESC rd = {0};
++        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++        rd.Width = w;
++        rd.Height = h;
++        rd.DepthOrArraySize = 1;
++        rd.MipLevels = 1;
++        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        rd.SampleDesc.Count = 1;
++        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++        ID3D12Resource* view = NULL;
++        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void**)&view))) {
++            fprintf(stderr, "[zstencil] view create failed %u:0x%X %ux%u\n", z->location, z->offset, w, h);
++            return 0;
++        }
++        if (z->sview[vi].tex) retire_texture(z->sview[vi].tex);   /* the open command list may still read it */
++        memset(&z->sview[vi], 0, sizeof z->sview[vi]);
++        z->sview[vi].tex = view;
++        z->sview[vi].w = w;
++        z->sview[vi].h = h;
++        z->sview[vi].state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
++        ud.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++        g.dev->lpVtbl->CreateUnorderedAccessView(g.dev, view, NULL, &ud,
++                                                 srv_cpu(UAV_ZS_VIEW_BASE + zi * LD_ZS_VIEWS + vi));
++        srv_write(SRV_ZS_VIEW_BASE + zi * LD_ZS_VIEWS + vi, view);
++        fprintf(stderr, "[zstencil] zeta #%u %u:0x%X read as an A8R8G8B8 texture %ux%u (remap 0x%04X, view %u)\n",
++                zi, z->location, z->offset, w, h, remap, vi);
++    }
++    const u32 slot = SRV_ZS_VIEW_BASE + zi * LD_ZS_VIEWS + vi;
++    z->sview[vi].last_use = g_ld_frames;
++    if (z->sview[vi].valid && z->sview[vi].gen == z->stencil_gen && z->sview[vi].remap == remap) return slot;
++    if (g.srv_ring_used >= SRV_RING_TABLES) return z->sview[vi].valid ? slot : 0;
++
++    ld_ls_invalidate();   /* sets list state (compute PSO, heaps) the draw path caches */
++    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
++    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
++    g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
++    cpu.ptr += (size_t)base * g.srv_step;
++    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(SRV_DEPTH_SOURCE_BASE + zi),
++                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    cpu.ptr += g.srv_step;
++    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(SRV_ZS_SOURCE_BASE + zi),
++                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    cpu.ptr += g.srv_step;
++    g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(UAV_ZS_VIEW_BASE + zi * LD_ZS_VIEWS + vi),
++                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    D3D12_GPU_DESCRIPTOR_HANDLE source_table, destination_table;
++    g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.srv_heap, &source_table);
++    source_table.ptr += (u64)base * g.srv_step;
++    destination_table = source_table;
++    destination_table.ptr += 2u * (u64)g.srv_step;
++
++    D3D12_RESOURCE_BARRIER bars[2] = {0};
++    u32 nbar = 0;
++    bars[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    bars[nbar].Transition.pResource = z->tex;
++    bars[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    bars[nbar].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
++    bars[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    nbar++;
++    if (z->sview[vi].state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
++        bars[nbar].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        bars[nbar].Transition.pResource = z->sview[vi].tex;
++        bars[nbar].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        bars[nbar].Transition.StateBefore = z->sview[vi].state;
++        bars[nbar].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++        nbar++;
++    }
++    g.list->lpVtbl->ResourceBarrier(g.list, nbar, bars);
++
++    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
++    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
++    g.list->lpVtbl->SetPipelineState(g.list, g_zs_pso);
++    g.list->lpVtbl->SetComputeRootSignature(g.list, g_zs_rootsig);
++    g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 0, source_table);
++    g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 1, destination_table);
++    const u32 constants[4] = { remap, w, h, 0u };
++    g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 4, constants, 0);
++    g.list->lpVtbl->Dispatch(g.list, (w + 7u) / 8u, (h + 7u) / 8u, 1);
++
++    D3D12_RESOURCE_BARRIER uav_done = {0};
++    uav_done.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
++    uav_done.UAV.pResource = z->sview[vi].tex;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &uav_done);
++    D3D12_RESOURCE_BARRIER done[2] = {0};
++    done[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    done[0].Transition.pResource = z->tex;
++    done[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    done[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    done[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
++    done[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    done[1].Transition.pResource = z->sview[vi].tex;
++    done[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    done[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    done[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
++    z->sview[vi].state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    z->sview[vi].valid = 1;
++    z->sview[vi].gen = z->stencil_gen;
++    z->sview[vi].remap = remap;
++    g_zs_fills++;
++    return slot;
++}
++
+ /* NV3089 scaled blit out of a depth buffer the renderer keeps only on the GPU, into a colour buffer (2026-11-13,
+  * Saka Tsuku: cut-scenes and in-match events were blurred all over). The match resolves its 2560x1440 depth
+  * (0x012C0000) at half size into 0x00B40000 this way and reads that back as an A8R8G8B8 texture, the depth of its
+@@ -9198,6 +9450,17 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                         break;
+                     }
+             }
++            /* An A8R8G8B8 read of a zeta's own address: depth and stencil as the title sees them (zstencil_view).
++             * Not for a pass that writes no colour -- the stencil fills leave the texture bound, and each of them
++             * would fill the view again. */
++            u32 zs_slot = 0;
++            if (sampled_depth < 0 && texture_base_fmt == TEX_FMT_A8R8G8B8 && rsx_dsp_reg(&g.rsx, M_COLOR_MASK))
++                for (u32 i = 0; i < g.n_zdepths; i++)
++                    if (g.zdepths[i].tex && g.zdepths[i].location == t.location &&
++                        g.zdepths[i].offset == t.offset) {
++                        zs_slot = zstencil_view(i, t.remap & 0xFFFFu, t.width, t.height);
++                        break;
++                    }
+             if (sampled_depth >= 0) {
+                 slots[u] = SRV_ZDEPTH_BASE + sampled_depth;
+                 g_ld_zdepth_srv_binds++;
+@@ -9206,6 +9469,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                     if (zdepth_used[k] == (u32)sampled_depth) seen = 1;
+                 if (!seen && n_zdepth_used < SRV_TABLE_SIZE)
+                     zdepth_used[n_zdepth_used++] = (u32)sampled_depth;
++            } else if (zs_slot) {
++                slots[u] = zs_slot;
++                g_ld_bind_surf++;
+             } else {
+                 slots[u] = texture_srv_slot(&t);
+                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
+@@ -9299,6 +9565,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                     1.0f, 0, 0, NULL);
+                 z->cleared = 1;
+                 z->had_write = 0;
++                z->stencil_gen++;
+                 g_ld_stats.implicit_depth_clears++;
+             }
+         } else if (!g.depth_cleared) {
+@@ -9513,6 +9780,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+          * the depth pass represented by this tracked zeta. */
+         if (depth_state.depth_test && depth_state.depth_write)
+             z->had_write = 1;
++        if (depth_state.stencil_enable || (depth_state.depth_test && depth_state.depth_write))
++            z->stencil_gen++;   /* the A8R8G8B8 view of this zeta is out of date (zstencil_view) */
+     }
+     g_ld_stats.groups_executed++;
+ #if defined(YZ_PERF_PROFILE)
+@@ -9669,6 +9938,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+         }
+         if (zslot) {
+             g.zdepths[zslot - 1].cleared = 1;
++            g.zdepths[zslot - 1].stencil_gen++;
+             if (mask & RSX_CLEAR_DEPTH) {
+                 g.zdepths[zslot - 1].had_write = 0;
+                 /* Each guest zeta owns a distinct live resource.  A clear

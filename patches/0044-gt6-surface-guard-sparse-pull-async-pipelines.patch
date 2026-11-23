@@ -1,0 +1,1055 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index d81dd7a..136c932 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -125,6 +125,13 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ #include "rsx_vertex_formats.h"
+ #include "rsx_vertex_pull.h"
+ #include "rsx_fifo_prepare_scan.h"
++/* The compile queue keeps every job's source and blob until it stops. With the asynchronous pipeline path every
++ * new shader of a session goes through it, so the limits are those of a long session (a fragment program's
++ * source is 20-50 KB): past them a request is refused and that draw compiles on the renderer as before. */
++#define LD_SCJ_MAX_JOBS 8192u
++#define LD_SCJ_MAX_READY 8192u
++#define LD_SCJ_MAX_SOURCE_BYTES (192u * 1024u * 1024u)
++#define LD_SCJ_MAX_BLOB_BYTES (256u * 1024u * 1024u)
+ #include "rsx_shader_compile_jobs.h"
+ #include "rsx_shader_prepare.h"
+ #include "rsx_texture_typed.h"
+@@ -263,6 +270,17 @@ typedef struct {
+              u32 cube;        /* 0 = a 2D window; n = a cube texture of n levels made of the surface (surface_cube_window) */
+            } swin[LD_SWIN_PER];
+     u32 swin_wgen;            /* bumped by every write into the surface; a window older than it is recopied */
++    u32 ap_last, ap_prev;     /* the last two frames with a draw into the surface (ld_ap_target_alive) */
++    /* Surface guard [GT6 0045], see ld_surface_alias_ok */
++    u32 guard_gen;            /* write-watch generation at the first write of guard_frame; 0 = not known */
++    u32 guard_frame;          /* frame + 1 of the last write the guest commanded into the surface; 0 = none */
++    u32 guard_stamp_frame;    /* frame + 1 of the stamp guard_gen is from */
++    u32 guard_ok_frame, guard_ok_span;   /* a texture of that many bytes at its address was checked in that frame (+1) */
++    u32 guard_dead;           /* the guest wrote its bytes since: it is not what is at that address any more */
++    const u8* guard_base;     /* host address of its guest bytes at the stamp, and how many (pitch x height) */
++    u32 guard_bytes;
++    u8 *guard_head, *guard_tail;   /* its bytes on a first / last page it shares with a neighbour, as they were then */
++    u32 guard_head_n, guard_tail_n;
+ #if !defined(YZ_PERF_CLEAN)
+     u32 resource_serial;
+     u32 last_write_generation;
+@@ -675,11 +693,26 @@ enum {
+     LD_SURFACE_WRITE_OTHER = 7
+ };
+ 
++static void ld_surface_guard_stamp(surface_t* surface);
+ static void ld_surface_note_write(u32 target, u32 kind)
+ {
+     if (target >= MAX_SURFACES)
+         return;
+     surface_t* surface = &g.surfaces[target];
++    /* once a frame, at the first write the guest commanded (a copy this renderer makes between surfaces or from
++     * guest memory is not one) */
++    if (kind != LD_SURFACE_WRITE_COPY && (surface->guard_frame != g_ld_frames + 1u || !surface->guard_gen)) {
++        /* A surface that is drawn frame after frame keeps a stamp for eight frames: the harvest behind a stamp
++         * walks every page of the surface (1.5 ms a frame over all targets of a Gran Turismo 6 race when each got
++         * one every frame), and the title does not write the memory of a target it is rendering into. */
++        const u32 now = g_ld_frames + 1u;
++        const int continuous = surface->guard_frame + 1u == now;
++        const int first = surface->guard_frame != now;
++        surface->guard_frame = now;
++        if (!surface->guard_gen || !continuous || surface->guard_dead || now - surface->guard_stamp_frame >= 8u)
++            ld_surface_guard_stamp(surface);
++        else if (first) surface->guard_ok_frame = 0;
++    }
+     const u32 generation = ++g_ld_surface_generation;
+     surface->swin_wgen++;
+     surface->last_write_generation = generation;
+@@ -2103,6 +2136,7 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
+ /* ---------------------------------------------------------------------------
+  * command list submit/wait (simple synchronous model, like the harness)
+  * -----------------------------------------------------------------------*/
++static void ld_tex_final_release(ID3D12Resource* r);
+ static void ld_flush(ld_flush_reason reason)
+ {
+ #if defined(YZ_PERF_PROFILE)
+@@ -2195,7 +2229,7 @@ static void ld_flush(ld_flush_reason reason)
+         }
+         ld_drain_info_queue("flush");
+         for (u32 i = 0; i < next->n_retired; i++)
+-            next->retired[i]->lpVtbl->Release(next->retired[i]);
++            ld_tex_final_release(next->retired[i]);
+         next->n_retired = 0;
+         ld_fctx_load(g_fctx_cur);
+         g.alloc->lpVtbl->Reset(g.alloc);
+@@ -2246,13 +2280,13 @@ static void ld_flush(ld_flush_reason reason)
+      * fence above is the first safe point at which those old resources may be
+      * released. */
+     for (u32 i = 0; i < g.n_retired_textures; i++)
+-        g.retired_textures[i]->lpVtbl->Release(g.retired_textures[i]);
++        ld_tex_final_release(g.retired_textures[i]);
+     g.n_retired_textures = 0;
+     /* The wait above covered every earlier submit too, so the pipelined
+      * contexts' held resources are free as well. */
+     for (u32 k = 0; g_ld_pipeline && k < LD_FRAME_CTX; k++) {
+         for (u32 i = 0; i < g_fctx[k].n_retired; i++)
+-            g_fctx[k].retired[i]->lpVtbl->Release(g_fctx[k].retired[i]);
++            ld_tex_final_release(g_fctx[k].retired[i]);
+         g_fctx[k].n_retired = 0;
+     }
+     g.alloc->lpVtbl->Reset(g.alloc);
+@@ -2277,6 +2311,82 @@ void rsx_live_draw_flush(void)
+     if (g.ready) ld_flush(LD_FLUSH_GUEST_REFERENCE);
+ }
+ 
++/* Texture resource pool, LD_TEX_POOL=0 turns it off [GT6 0046]. Making a texture resource is a kernel call (about
++ * 0.2 ms; create_texture_mipped was 1.85 ms a frame of the drawing thread in a twelve-car race, sampled). A
++ * texture of the texture cache that was retired - replaced by a new picture or pushed out - is kept when its
++ * fence has passed instead of released, and the next texture of the same kind, format, size and level count
++ * is written into it (ld_tex_reuse_take, the path a refresh in place takes). Only plain 2D textures the cache
++ * retired itself: they are known to rest in the pixel-shader-resource state. */
++#define LD_TEX_POOL_N 384u
++#define LD_TEX_POOL_MARKS 1024u
++static struct { ID3D12Resource* r; u64 key; u32 bytes; } g_tex_pool[LD_TEX_POOL_N];
++static ID3D12Resource* g_tex_pool_mark[LD_TEX_POOL_MARKS];
++static u32 g_tex_pool_n, g_tex_pool_marks, g_tex_pool_took;
++static u64 g_tex_pool_bytes;
++static unsigned long long g_tex_pool_hits, g_tex_pool_puts, g_tex_pool_drops, g_tex_made;
++static int ld_tex_pool_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_TEX_POOL"); on = !(e && *e == '0'); }
++    return on;
++}
++static u64 ld_tex_pool_key(u32 fmt, u64 w, u32 h, u32 layers, u32 mips)
++{
++    return ((u64)fmt << 52) ^ (w << 36) ^ ((u64)h << 20) ^ ((u64)layers << 8) ^ mips;
++}
++/* A texture the cache retires: it may go to the pool when its fence has passed. */
++static void ld_tex_pool_note(ID3D12Resource* tex)
++{
++    if (tex && ld_tex_pool_on() && g_tex_pool_marks < LD_TEX_POOL_MARKS) g_tex_pool_mark[g_tex_pool_marks++] = tex;
++}
++/* The last reference of a retired resource: into the pool, or released. */
++static void ld_tex_final_release(ID3D12Resource* r)
++{
++    if (!r) return;
++    for (u32 i = 0; i < g_tex_pool_marks; i++) {
++        if (g_tex_pool_mark[i] != r) continue;
++        g_tex_pool_mark[i] = g_tex_pool_mark[--g_tex_pool_marks];
++        D3D12_RESOURCE_DESC d;
++        r->lpVtbl->GetDesc(r, &d);
++        const u64 bytes = (u64)d.Width * d.Height * 4u * d.DepthOrArraySize;
++        if (g_tex_pool_n < LD_TEX_POOL_N && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
++            d.Flags == D3D12_RESOURCE_FLAG_NONE && d.SampleDesc.Count == 1 && bytes <= (4u << 20) &&
++            g_tex_pool_bytes + bytes <= (192ull << 20)) {
++            g_tex_pool[g_tex_pool_n].r = r;
++            g_tex_pool[g_tex_pool_n].key = ld_tex_pool_key((u32)d.Format, d.Width, d.Height, d.DepthOrArraySize, d.MipLevels);
++            g_tex_pool[g_tex_pool_n].bytes = (u32)bytes;
++            g_tex_pool_n++; g_tex_pool_bytes += bytes; g_tex_pool_puts++;
++            return;
++        }
++        g_tex_pool_drops++;
++        break;
++    }
++    r->lpVtbl->Release(r);
++}
++static ID3D12Resource* ld_tex_pool_take(u32 fmt, u32 w, u32 h, u32 layers, u32 mips)
++{
++    const u64 key = ld_tex_pool_key(fmt, w, h, layers, mips);
++    for (u32 i = g_tex_pool_n; i-- > 0; ) {
++        if (g_tex_pool[i].key != key) continue;
++        ID3D12Resource* r = g_tex_pool[i].r;
++        g_tex_pool_bytes -= g_tex_pool[i].bytes;
++        g_tex_pool[i] = g_tex_pool[--g_tex_pool_n];
++        g_tex_pool_hits++;
++        return r;
++    }
++    return NULL;
++}
++
++static void ld_tex_pool_report(void)
++{
++    static u32 at; static unsigned long long made0, hits0;
++    if (g_ld_frames - at < 600u) return;
++    fprintf(stderr, "[tex-pool] frames %u-%u: %llu texture resources made, %llu taken from the pool instead; in the pool now %u "
++                    "(%.1f MB); kept %llu and let go %llu in all\n", at, g_ld_frames, g_tex_made - made0, g_tex_pool_hits - hits0,
++            g_tex_pool_n, (double)g_tex_pool_bytes / 1048576.0, g_tex_pool_puts, g_tex_pool_drops);
++    at = g_ld_frames; made0 = g_tex_made; hits0 = g_tex_pool_hits;
++}
++
+ static void retire_texture(ID3D12Resource* tex)
+ {
+     if (!tex) return;
+@@ -2472,12 +2582,20 @@ static ID3D12Resource* ld_tex_reuse_take(D3D12_RESOURCE_DIMENSION dim, DXGI_FORM
+ {
+     ID3D12Resource* r = g_tex_reuse;
+     g_tex_reuse = NULL;
+-    if (!r) return NULL;
+-    D3D12_RESOURCE_DESC d;
+-    r->lpVtbl->GetDesc(r, &d);
+-    if (d.Dimension != dim || d.Format != fmt || d.Width != w || d.Height != h ||
+-        d.DepthOrArraySize != depth_or_array || d.MipLevels != mips)
+-        return NULL;
++    g_tex_pool_took = 0;
++    if (r) {
++        D3D12_RESOURCE_DESC d;
++        r->lpVtbl->GetDesc(r, &d);
++        if (d.Dimension != dim || d.Format != fmt || d.Width != w || d.Height != h ||
++            d.DepthOrArraySize != depth_or_array || d.MipLevels != mips)
++            r = NULL;
++    }
++    if (!r) {                                            /* not a refresh in place: one of the pool? [GT6 0046] */
++        if (dim == D3D12_RESOURCE_DIMENSION_TEXTURE2D && g_tex_pool_n)
++            r = ld_tex_pool_take((u32)fmt, w, h, depth_or_array, mips);
++        if (!r) { g_tex_made++; return NULL; }
++        g_tex_pool_took = 1;
++    }
+     D3D12_RESOURCE_BARRIER b = {0};
+     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = r;
+     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+@@ -2554,7 +2672,7 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
+     rd.Width = lv[0].w; rd.Height = lv[0].h; rd.DepthOrArraySize = 1;
+     rd.MipLevels = (u16)n; rd.Format = fmt; rd.SampleDesc.Count = 1;
+     ID3D12Resource* tex = ld_tex_reuse_take(D3D12_RESOURCE_DIMENSION_TEXTURE2D, fmt, lv[0].w, lv[0].h, 1, n);
+-    const int reused = tex != NULL;
++    const int reused = tex != NULL && !g_tex_pool_took;
+     if (!tex &&
+         FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+@@ -2587,7 +2705,7 @@ static ID3D12Resource* create_texture_cube(
+     rd.Width = lv[0].w; rd.Height = lv[0].h; rd.DepthOrArraySize = 6;
+     rd.MipLevels = (u16)n_mips; rd.Format = fmt; rd.SampleDesc.Count = 1;
+     ID3D12Resource* tex = ld_tex_reuse_take(D3D12_RESOURCE_DIMENSION_TEXTURE2D, fmt, lv[0].w, lv[0].h, 6, n_mips);
+-    const int reused = tex != NULL;      /* refreshed in place: the cache still owns it [GT6 0036] */
++    const int reused = tex != NULL && !g_tex_pool_took;      /* refreshed in place: the cache still owns it [GT6 0036] */
+     if (!tex &&
+         FAILED(g.dev->lpVtbl->CreateCommittedResource(
+             g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+@@ -3125,6 +3243,134 @@ static int ld_ww_clean_since(const u8* p, u32 n, u32 since)
+     return 1;
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Surface guard, LD_SURFACE_GUARD=0 turns it off [GT6 0045].
++ *
++ * A render surface here outlives the title's use of its memory: Gran Turismo 6 draws the drivers' name labels
++ * into 200x48 targets during a race, frees that memory afterwards and loads the icons of its menus into it. The
++ * surfaces were still taken as what is at those addresses: a texture that starts where one started was bound to
++ * the old label picture, and the lazy mirror copied label pixels that guest memory "did not have yet" over the
++ * icon bytes the title had just written (the quick menu after a race showed a driver's name and noise where its
++ * icons are; the owner saw the track tiles turn white).
++ *
++ * RPCS3 has the same question and answers it by remembering a few words of the memory under each render target
++ * (render_target_descriptor::sync_tag) and dropping the target as a texture source when they have changed
++ * (test(), in texture_cache upload_texture / get_merged_texture_memory_region). The write watch answers it
++ * exactly here: at the first write the guest commands into a surface in a frame its pages are harvested and the
++ * generation kept (ld_surface_guard_stamp). A page of those bytes with a later generation was written by the
++ * guest after the surface was last drawn - the bytes are the guest's now:
++ *   - a texture at the surface's address is decoded from guest memory, not taken from the surface
++ *     (ld_surface_alias_ok), and the surface is dead until the title draws into it again;
++ *   - pixels the surface was remembered to hold beyond guest memory go down only into the pages the guest has
++ *     not written (ld_mirror_sync_one).
++ * Only pages that lie wholly inside the bytes count when there is one, so a neighbour's write on a shared first
++ * or last page does not take a live render target away. A compressed texture is never a view of a render target.
++ * -----------------------------------------------------------------------*/
++static unsigned long long g_ld_guard_kills, g_ld_guard_refused, g_ld_guard_kept_bytes, g_ld_guard_checks;
++static int ld_surface_guard_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_SURFACE_GUARD"); on = !(e && *e == '0'); }
++    return on;
++}
++static void ld_surface_guard_stamp(surface_t* s)
++{
++    s->guard_frame = g_ld_frames + 1u;
++    s->guard_stamp_frame = g_ld_frames + 1u;
++    s->guard_dead = 0;
++    s->guard_gen = 0;
++    s->guard_ok_frame = 0;
++    s->guard_base = NULL;
++    s->guard_bytes = s->guard_head_n = s->guard_tail_n = 0;
++    if (!ld_surface_guard_on() || !s->pitch || !s->h || s->location > 1u || !ld_ww_enabled()) return;
++    const u64 bytes = (u64)s->pitch * s->h;
++    if (bytes > 0x4000000ull) return;
++    const u8* p = guest_ptr(s->location, s->offset, (u32)bytes);
++    if (!p) return;
++    const u32 gen = ld_ww_harvest(p, (u32)bytes);
++    if (!gen) return;
++    /* The first and the last page can hold a neighbour's bytes too, and the write watch is per page: keep what
++     * the surface's own bytes on them are now, so that a later write there can be told from a write next door. */
++    const u32 head = (u32)((4096u - ((uintptr_t)p & 4095u)) & 4095u);
++    const u32 hn = head < (u32)bytes ? head : (u32)bytes;
++    const u32 tail = (u32)(((uintptr_t)p + (u32)bytes) & 4095u);
++    const u32 tn = (hn < (u32)bytes && tail <= (u32)bytes - hn) ? tail : 0u;
++    if (hn) { if (!s->guard_head) s->guard_head = (u8*)malloc(4096); if (!s->guard_head) return; memcpy(s->guard_head, p, hn); }
++    if (tn) { if (!s->guard_tail) s->guard_tail = (u8*)malloc(4096); if (!s->guard_tail) return; memcpy(s->guard_tail, p + (u32)bytes - tn, tn); }
++    s->guard_head_n = hn; s->guard_tail_n = tn;
++    s->guard_base = p; s->guard_bytes = (u32)bytes;
++    s->guard_gen = gen;
++}
++/* Did the guest write bytes [at, at+n) - inside one page, inside the surface's bytes - after the stamp? */
++static int ld_surface_guard_chunk_written(const surface_t* s, const u8* at, u32 n)
++{
++    if (g_ww_page_gen[((uintptr_t)at - (uintptr_t)vm_base) >> 12] <= s->guard_gen) return 0;
++    const u8* const end = s->guard_base + s->guard_bytes;
++    if (s->guard_head_n && at < s->guard_base + s->guard_head_n)           /* on the shared first page: by content */
++        return memcmp(at, s->guard_head + (at - s->guard_base), n) != 0;
++    if (s->guard_tail_n && at >= end - s->guard_tail_n)                    /* on the shared last page: by content */
++        return memcmp(at, s->guard_tail + (at - (end - s->guard_tail_n)), n) != 0;
++    return 1;                                                             /* a page that is the surface's alone */
++}
++/* The same for any run of the surface's bytes. */
++static int ld_surface_guard_written(const surface_t* s, const u8* p, u32 n)
++{
++    if (!s->guard_gen || !s->guard_base || p < s->guard_base) return 0;
++    if (p >= s->guard_base + s->guard_bytes) return 0;
++    if (n > (u32)(s->guard_base + s->guard_bytes - p)) n = (u32)(s->guard_base + s->guard_bytes - p);
++    if (!n || ld_ww_clean_since(p, n, s->guard_gen)) return 0;
++    for (u32 k = 0; k < n; ) {
++        u32 c = 4096u - (u32)((uintptr_t)(p + k) & 4095u);
++        if (c > n - k) c = n - k;
++        if (ld_surface_guard_chunk_written(s, p + k, c)) return 1;
++        k += c;
++    }
++    return 0;
++}
++static void ld_surface_guard_kill(surface_t* s, const char* what, u32 lo, u32 hi)
++{
++    s->guard_dead = 1;
++    g_ld_guard_kills++;
++    static u32 said;
++    if (PS3_LOG_FIRST(said, 16))
++        fprintf(stderr, "[surface-guard] surface %u:0x%X %ux%u, last drawn in frame %u: the guest has written its bytes since "
++                        "(%s 0x%X-0x%X), so it is not taken for what is at that address any more, frame %u\n",
++                s->location, s->offset, s->w, s->h, s->guard_frame - 1u, what, lo, hi, g_ld_frames);
++}
++/* May texture t, which starts at the address of surface si, be taken from that surface? */
++static int ld_surface_alias_ok(u32 si, const rsx_dsp_texture* t)
++{
++    surface_t* s = &g.surfaces[si];
++    if (!ld_surface_guard_on()) return 1;
++    if (s->guard_dead) { g_ld_guard_refused++; return 0; }
++    { const u32 base = t->format & TEX_FMT_BASE_MASK;
++      if (base == TEX_FMT_DXT1 || base == TEX_FMT_DXT23 || base == TEX_FMT_DXT45) { g_ld_guard_refused++; return 0; } }
++    if (!s->guard_gen || s->guard_frame == g_ld_frames + 1u) return 1;     /* not known, or drawn into in this frame */
++    const u32 span = texture_source_span(t);
++    if (!span) return 1;
++    if (s->guard_ok_frame == g_ld_frames + 1u && span <= s->guard_ok_span) return 1;
++    const u8* p = guest_ptr(t->location, t->offset, span);
++    if (!p || !ld_ww_harvest(p, span)) return 1;
++    g_ld_guard_checks++;
++    if (p != s->guard_base || !ld_surface_guard_written(s, p, span)) {
++        s->guard_ok_frame = g_ld_frames + 1u; s->guard_ok_span = span;
++        return 1;
++    }
++    ld_surface_guard_kill(s, "a texture reads", t->offset, t->offset + span);
++    g_ld_guard_refused++;
++    return 0;
++}
++static void ld_surface_guard_report(void)
++{
++    static unsigned long long told;
++    static u32 at;
++    if (g_ld_frames - at < 1800u || told == g_ld_guard_kills + g_ld_guard_refused) return;
++    at = g_ld_frames; told = g_ld_guard_kills + g_ld_guard_refused;
++    fprintf(stderr, "[surface-guard] up to frame %u: %llu surface(s) found overwritten by the guest, %llu texture binds "
++                    "taken from guest memory instead, %llu bytes of the guest kept under stale surface pixels, %llu checks\n",
++            g_ld_frames, g_ld_guard_kills, g_ld_guard_refused, g_ld_guard_kept_bytes, g_ld_guard_checks);
++}
++
+ /* For the match thread's pose interpolation (saka_hooks.c): the write watch
+  * over the guest's committed memory below 0x40000000, sharing the generation
+  * table (so the texture and vertex caches still see every write). */
+@@ -4006,6 +4252,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+                     entry->tex = replacement;
+                     entry->content_hash = hash;
+                     write_texture_srv(i, entry);
++                    ld_tex_pool_note(old);
+                     retire_texture(old);
+                     static u32 refresh_count = 0;
+                     refresh_count++;
+@@ -4089,8 +4336,10 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+     replacement.tex = decode_guest_texture_profiled(t, remap);
+     if (replacement.tex) {
+         texcache_t* entry = &g.textures[index];
+-        if (evicted)
++        if (evicted) {
++            ld_tex_pool_note(evicted);
+             retire_texture(evicted);
++        }
+         tex_hash_unlink(index);
+         if (entry->watch_policy.direct_hash)
+             ld_tex_ww_adaptive_note(entry, RSX_TEX_WATCH_FAILED, 0);
+@@ -4367,6 +4616,7 @@ static int ld_fragment_surface_find(const rsx_dsp_texture* t, u32 target, u32 tb
+             if (sf_i->location != t->location || sf_i->offset != t->offset ||
+                 i == target)
+                 continue;
++            if (sf_i->guard_dead && ld_surface_guard_on()) continue;
+             if (pass == 0 && (sf_i->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u) != tb_want)
+                 continue;
+             if (sf_i->w == t->width && sf_i->h == t->height) { sampled = (int)i; break; }
+@@ -5087,7 +5337,34 @@ static void ld_mirror_sync_one(surface_t* s)
+ {
+     const u32 gx0 = s->gx0, gy0 = s->gy0, w = s->gx1 - s->gx0, h = s->gy1 - s->gy0;
+     s->gx0 = s->gy0 = s->gx1 = s->gy1 = 0;
+-    u8* dst = (s->tex && s->pitch) ? (u8*)guest_ptr(s->location, s->offset + gy0 * s->pitch + gx0 * 4u, s->pitch * (h - 1u) + w * 4u) : NULL;
++    const u32 bytes = s->pitch * (h - 1u) + w * 4u;
++    u8* dst = (s->tex && s->pitch) ? (u8*)guest_ptr(s->location, s->offset + gy0 * s->pitch + gx0 * 4u, bytes) : NULL;
++    /* Surface guard [GT6 0045]: what the guest wrote after this surface was last drawn is newer than these pixels. */
++    if (dst && ld_surface_guard_on() && s->guard_gen && ld_ww_enabled() && ld_ww_harvest(dst, bytes) &&
++        dst >= s->guard_base && dst + bytes <= s->guard_base + s->guard_bytes && ld_surface_guard_written(s, dst, bytes)) {
++        u8* tmp = (u8*)malloc(bytes);
++        u32 kept = 0, copied = 0;
++        if (tmp && ld_surface_download(s, gx0, gy0, w, h, tmp, s->pitch)) {
++            for (u32 r = 0; r < h; r++) {
++                u8* row = dst + (size_t)r * s->pitch;
++                const u8* from = tmp + (size_t)r * s->pitch;
++                const u32 len = w * 4u;
++                for (u32 k = 0; k < len; ) {
++                    const uintptr_t at = (uintptr_t)(row + k);
++                    u32 n = 4096u - (u32)(at & 4095u);
++                    if (n > len - k) n = len - k;
++                    if (!ld_surface_guard_chunk_written(s, row + k, n)) { memcpy(row + k, from + k, n); copied += n; }
++                    else kept += n;
++                    k += n;
++                }
++            }
++            if (copied) rsx_ww_note_write((u32)((uintptr_t)dst - (uintptr_t)vm_base), bytes);
++        } else kept = bytes;
++        free(tmp);
++        g_ld_guard_kept_bytes += kept;
++        ld_surface_guard_kill(s, "under pixels it was remembered to hold,", s->offset + gy0 * s->pitch + gx0 * 4u,
++                              s->offset + gy0 * s->pitch + gx0 * 4u + bytes);
++    } else
+     if (dst) ld_surface_download(s, gx0, gy0, w, h, dst, s->pitch);
+     g_ld_mirror_syncs++;
+ }
+@@ -5131,7 +5408,17 @@ static void ld_mirror_seed(u32 ti, u32 maxpx)
+         surface_t* p = &g.surfaces[i];
+         u32 sx, sy, qx, qy, w, h;
+         if (i == ti || !p->tex || p->gx1 <= p->gx0 || p->gy1 <= p->gy0 || p->fmt != DXGI_FORMAT_R8G8B8A8_UNORM) continue;
++        if (ld_surface_guard_on() && p->guard_dead) continue;
+         if (ld_mirror_map(p, t, p->gx0, p->gy0, p->gx1, p->gy1, &sx, &sy, &qx, &qy, &w, &h) != 1) continue;
++        if (ld_surface_guard_on() && p->guard_gen && p->pitch && ld_ww_enabled()) {      /* [GT6 0045] */
++            const u32 pb = p->pitch * (p->gy1 - p->gy0 - 1u) + (p->gx1 - p->gx0) * 4u;
++            const u32 pa = p->offset + p->gy0 * p->pitch + p->gx0 * 4u;
++            const u8* pp = guest_ptr(p->location, pa, pb);
++            if (pp && ld_ww_harvest(pp, pb) && ld_surface_guard_written(p, pp, pb)) {
++                ld_surface_guard_kill(p, "under pixels a new target would have been seeded with,", pa, pa + pb);
++                continue;
++            }
++        }
+         ld_mirror_gpu_copy(p, t, sx, sy, qx, qy, w, h);
+         ld_surface_note_write(ti, LD_SURFACE_WRITE_COPY);
+     }
+@@ -5194,6 +5481,7 @@ static int surface_cube_window(const rsx_dsp_texture* t)
+     int si = -1;
+     for (u32 i = 0; i < g.n_surfaces; i++) {
+         const surface_t* c = &g.surfaces[i];
++        if (c->guard_dead && ld_surface_guard_on()) continue;
+         if (!c->tex || c->location != t->location || c->offset != t->offset || c->pitch != t->pitch ||
+             c->fmt != DXGI_FORMAT_R8G8B8A8_UNORM || c->w < t->width + 2u || c->h < face_rows * 6u) continue;
+         si = (int)i;
+@@ -7418,6 +7706,8 @@ static ld_la_job g_ld_la_jobs[LD_LA_JOBS];
+ static int ld_vertex_pull_on(void);
+ static ID3D12PipelineState* ld_la_build(const char*, const char*, const render_state_t*,
+     const rsx_vertex_layout_plan*, int, u64, int, int);
++static ID3D12PipelineState* ld_ap_begin(const char*, const char*, const render_state_t*,
++    const rsx_vertex_layout_plan*, int, u64, int, int, int*);
+ static int ld_la_enabled(void)
+ {
+     static int enabled=-1;
+@@ -7460,6 +7750,59 @@ static void ld_la_capture(const char* vs, const char* ps, const render_state_t*
+     ld_la_request_shader('V',vs); ld_la_request_shader('P',ps);
+ }
+ 
++/* Asynchronous pipelines, LD_ASYNC_PSO=1 [GT6 0044]. A new material met while driving used to stop the renderer
++ * for its fragment-program compile and its pipeline build (20-300 ms each, dozens on a first visit to a track).
++ * RPCS3 runs this title with its asynchronous shader mode for the same reason. Here a draw whose pipeline is not
++ * there yet is left out for the few frames the workers need: its sources go to the compile workers, the
++ * descriptor to the pipeline workers (at the head of their queue), and ld_ap_pump() puts the finished pipeline
++ * into the entry g.psos already holds for the key. Only depth-tested draws into a target that is drawn every
++ * frame qualify: geometry that the next frame draws again. Screen-space passes (post-processing, the HUD, the
++ * targets of the 2D widgets) and the first frame of a target keep the synchronous path, because a pass left
++ * out there is a wrong frame or a picture that is never drawn again. A job older than LD_AP_LIMIT_FRAMES is
++ * built synchronously, so the final answer for every key is the one the synchronous path gives. */
++typedef struct {
++    char *vs, *ps;
++    render_state_t state;
++    rsx_vertex_layout_plan layout;
++    u64 key;
++    u32 pso_index, born;
++    int have_layout, packed, point, pull;
++} ld_ap_job;
++#define LD_AP_JOBS 512u
++#define LD_AP_LIMIT_FRAMES 900u
++#define LD_AP_PER_FRAME 16u
++static ld_ap_job g_ld_ap_jobs[LD_AP_JOBS];
++static u32 g_ld_ap_count, g_ld_ap_cursor;
++static u8  g_ld_ap_pending[MAX_PSOS];   /* this g.psos entry is NULL because its pipeline is being made */
++static int g_ld_ap_last_pending;        /* the last get_pso() answered NULL for that reason */
++static int g_ld_ap_refused;             /* the pipeline workers did not take the last descriptor (table full) */
++static struct { unsigned long long started, finished, sync_final, skipped_draws, immediate, refused;
++                u32 max_frames, report_frame; } g_ld_ap;
++static int ld_ap_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_ASYNC_PSO"); on = e && *e == '1'; }
++    return on;
++}
++static u32 current_surface(void);
++static int ld_ap_target_alive(void)
++{
++    const u32 cs = current_surface();
++    if (cs == LD_INVALID_SURFACE) return 0;
++    const surface_t* t = &g.surfaces[cs];
++    return t->ap_last == g_ld_frames ? t->ap_prev + 1u == g_ld_frames : t->ap_last + 1u == g_ld_frames;
++}
++static int ld_ap_eligible(const render_state_t* rs)
++{
++    /* LD_ASYNC_PSO_ALIVE=1: only into a target that was drawn in the frame before as well. Without it the first
++     * frame of a scene qualifies too - that frame is where a first visit to a track builds over a hundred
++     * pipelines (ten seconds without a picture, measured; the title's own wait for a flip gives up after five). */
++    static int alive_only = -1;
++    if (alive_only < 0) { const char* e = getenv("LD_ASYNC_PSO_ALIVE"); alive_only = e && *e == '1'; }
++    return ld_ap_on() && rs->depth_test && !g_ld_movie_mode && g_ld_pw.active && g_ld_ap_count < LD_AP_JOBS &&
++           g_ld_compile_jobs.state == LD_SCJ_RUNNING && (!alive_only || ld_ap_target_alive());
++}
++
+ static ID3D12PipelineState* build_pso(
+     const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
+     const rsx_vertex_layout_plan* masked_layout, int packed_offsets, u64 pso_key,
+@@ -7785,6 +8128,7 @@ static ID3D12PipelineState* build_pso(
+     }
+     if (g_ld_la_mode==2) {
+         if (ld_pw_submit(&pd,point_draw ? 1u : 0u,library_id)) ++g_ld_la_queued;
++        else g_ld_ap_refused = 1;
+         vs->lpVtbl->Release(vs); ps->lpVtbl->Release(ps);
+         return NULL;
+     }
+@@ -8187,6 +8531,7 @@ static ID3D12PipelineState* get_pso(
+     const rsx_vertex_layout_plan* masked_layout, int packed_payload, int vertex_pull)
+ {
+     memset(&g_ld_current_pso, 0, sizeof(g_ld_current_pso));
++    g_ld_ap_last_pending = 0;   /* an answer of NULL from a bail below is not "being made" */
+     const int point_draw = g.rsx.current_primitive == 1u && ld_point_sprites_on();
+     const u32 start = rsx_dsp_vp_start(&g.rsx);
+     if (start >= RSX_DSP_VP_INSTR) { LD_PSO_BAIL("no vertex program uploaded (vp start out of range)"); return NULL; }
+@@ -8492,6 +8837,37 @@ static ID3D12PipelineState* get_pso(
+         const u32 point_tag = 0x31545053u;   /* SPT1: topology and geometry stage */
+         key = fnv1a(&point_tag, sizeof(point_tag), key);
+     }
++    /* User clip planes [2026-11-18]. NV4097_SET_USER_CLIP_PLANE_CONTROL (0x1478) holds a 4-bit op per plane
++     * (0 off, 1 keep d <= 0, 2 keep d >= 0); the vertex program writes the six distances into o[5].yzw and
++     * o[6].yzw. This renderer took no notice of the register, so what a title cuts off with such a plane was
++     * drawn whole. rsx_vp_apply_user_clip (the decompiler's own, used by the other engine since long) adds the
++     * distances as SV_ClipDistance to the vertex shader; a state with planes on is a pipeline state of its own.
++     * Not for point sprites (their geometry stage has its own outputs). LD_USER_CLIP=0 = ignored, as before. */
++    u32 user_clip = 0;
++    { static int on = -1;
++      if (on < 0) { const char* e = getenv("LD_USER_CLIP"); on = !(e && *e == '0'); }
++      if (on && !point_draw) {
++          const u32 ctl = rsx_dsp_reg(&g.rsx, 0x1478u);
++          if (ctl & 0x00FFFFFFu) {
++              for (u32 p = 0; p < 6; p++) {
++                  const u32 op = (ctl >> (p * 4u)) & 0xFu;
++                  if (op == 1u || op == 2u) user_clip |= op << (p * 2u);
++              }
++              static u32 seen[8], n_seen, said;
++              u32 k = 0;
++              while (k < n_seen && seen[k] != ctl) k++;
++              if (k == n_seen && n_seen < 8u) {
++                  seen[n_seen++] = ctl;
++                  fprintf(stderr, "[user-clip] control 0x%06X (planes: ops 0x%03X) first seen at frame %u\n", ctl, user_clip, g_ld_frames);
++              }
++              (void)said;
++          }
++      } }
++    if (user_clip) {
++        const u32 clip_tag = 0x31504355u;    /* UCP1: SV_ClipDistance outputs */
++        key = fnv1a(&clip_tag, sizeof(clip_tag), key);
++        key = fnv1a(&user_clip, sizeof(user_clip), key);
++    }
+     const u64 cen_flags = key;                   /* the census (ld_pso_cen_add) */
+     /* the texel-addressed units: found above with the cube and 3D masks */
+     key = fnv1a(&unnorm_mask, sizeof(unnorm_mask), key);
+@@ -8568,6 +8944,7 @@ static ID3D12PipelineState* get_pso(
+ #if defined(YZ_PERF_PROFILE)
+                   g_ld_profile.total.pso_hits++;
+ #endif
++                  g_ld_ap_last_pending = g_ld_ap_pending[i];
+                   return g.psos[i].pso;
+               }
+           }
+@@ -8580,6 +8957,7 @@ static ID3D12PipelineState* get_pso(
+ #if defined(YZ_PERF_PROFILE)
+             g_ld_profile.total.pso_hits++;
+ #endif
++            g_ld_ap_last_pending = g_ld_ap_pending[i];
+             return g.psos[i].pso;
+         }
+     } }
+@@ -8623,6 +9001,12 @@ static ID3D12PipelineState* get_pso(
+             vs_hlsl, sizeof(vs_hlsl))
+         : rsx_vp_decompile_ex(
+             vp_uc, vp_instrs * 16, vtex_mask, vs_hlsl, sizeof(vs_hlsl));
++    if (vi > 0 && user_clip && rsx_vp_apply_user_clip(vs_hlsl, sizeof(vs_hlsl), user_clip) < 0) {
++        static u32 said;        /* the text is not in the form the clip code is added to: drawn unclipped, as before */
++        if (PS3_LOG_FIRST(said, 8))
++            fprintf(stderr, "[user-clip] ops 0x%03X: the vertex shader text has no place for the clip distances (pull=%d layout=%d), drawn unclipped\n",
++                    user_clip, vertex_pull, masked_layout != NULL);
++    }
+     u32 decompiled_constant_count = 0;
+     int fi;
+     if (ld_fp_constants_buffered()) {
+@@ -8751,8 +9135,11 @@ static ID3D12PipelineState* get_pso(
+             fclose(f);
+         }
+       } }
++    int ap_pending = 0;
+     if (vi > 0 && fi > 0) {
+-        if (!g_ld_la_mode && !g_ld_la_busy && ld_la_enabled())
++        if (!g_ld_la_mode && !g_ld_la_busy && ld_ap_eligible(&rs))
++            pso = ld_ap_begin(vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key, point_draw, vertex_pull, &ap_pending);
++        else if (!g_ld_la_mode && !g_ld_la_busy && ld_la_enabled())
+             pso=ld_la_build(vs_hlsl,ps_hlsl,&rs,masked_layout,packed_payload,key,point_draw,vertex_pull);
+         else pso = build_pso(
+             vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, key, point_draw, vertex_pull);
+@@ -8761,6 +9148,9 @@ static ID3D12PipelineState* get_pso(
+     if (g_ld_la_mode) return NULL;
+     g.psos[g.n_psos].key = key;
+     g.psos[g.n_psos].pso = pso;
++    g_ld_ap_pending[g.n_psos] = (u8)ap_pending;
++    g_ld_ap_last_pending = ap_pending;
++    if (ap_pending) g_ld_ap_jobs[g_ld_ap_count - 1u].pso_index = g.n_psos;
+     g.n_psos++;
+     return pso;
+ }
+@@ -8855,6 +9245,99 @@ static ID3D12PipelineState* ld_la_build(const char* vs, const char* ps, const re
+     return pso;
+ }
+ 
++/* One asynchronous step for a job: take the pipeline if everything is ready (mode -1 never waits and never
++ * compiles), else hand the workers what can be handed over now (mode 2: the descriptor, once both blobs are
++ * there). g_ld_pw_front puts that descriptor before the start-up recipes. */
++/* 1 = the blob is there or a worker has the source; 0 = the compile queue is full or stopped. */
++static int ld_ap_request(char stage, const char* source)
++{
++    const u32 size = (u32)strlen(source);
++    const u64 hash = fnv1a(source, size, 1469598103934665603ull);
++    shader_blob_cache_t* cache = stage == 'V' ? &g.vs_blobs : &g.ps_blobs;
++    int post = 0, seen = 0;
++    ID3DBlob* blob = shader_blob_cache_find(cache, source, size, hash, &post, &seen);
++    if (!blob) {
++        blob = shader_disk_cache_load_ex(stage, source, size, hash, 0);
++        if (blob) shader_blob_cache_insert_accounted(cache, source, size, hash, blob, stage, seen);
++    }
++    if (blob) { blob->lpVtbl->Release(blob); return 1; }
++    return ld_scj_request(&g_ld_compile_jobs, stage, source, size, hash) != NULL;
++}
++static ID3D12PipelineState* ld_ap_step(const char* vs, const char* ps, const render_state_t* state,
++    const rsx_vertex_layout_plan* layout, int packed, u64 key, int point, int pull)
++{
++    g_ld_ap_refused = 0;
++    g_ld_la_mode = -1;
++    ID3D12PipelineState* pso = build_pso(vs, ps, state, layout, packed, key, point, pull);
++    if (!pso) {
++        g_ld_la_mode = 2; g_ld_pw_front = 1;
++        build_pso(vs, ps, state, layout, packed, key, point, pull);
++        g_ld_pw_front = 0;
++    }
++    g_ld_la_mode = 0;
++    return pso;
++}
++static ID3D12PipelineState* ld_ap_begin(const char* vs, const char* ps, const render_state_t* state,
++    const rsx_vertex_layout_plan* layout, int packed, u64 key, int point, int pull, int* pending)
++{
++    *pending = 0;
++    const size_t nv = strlen(vs) + 1, np = strlen(ps) + 1;
++    char* v = (char*)malloc(nv); char* p = (char*)malloc(np);
++    ID3D12PipelineState* pso = NULL;
++    const int accepted = v && p && ld_ap_request('V', vs) && ld_ap_request('P', ps);
++    if (accepted) pso = ld_ap_step(vs, ps, state, layout, packed, key, point, pull);
++    if (pso) { free(v); free(p); g_ld_ap.immediate++; return pso; }
++    if (!accepted || g_ld_ap_refused) {
++        /* no worker will make it: the path this draw had before */
++        free(v); free(p); g_ld_ap.refused++;
++        return ld_la_enabled() ? ld_la_build(vs, ps, state, layout, packed, key, point, pull)
++                               : build_pso(vs, ps, state, layout, packed, key, point, pull);
++    }
++    memcpy(v, vs, nv); memcpy(p, ps, np);
++    ld_ap_job* job = &g_ld_ap_jobs[g_ld_ap_count++];
++    memset(job, 0, sizeof(*job));
++    job->vs = v; job->ps = p; job->state = *state; job->key = key; job->born = g_ld_frames;
++    job->packed = packed; job->point = point; job->pull = pull;
++    if (layout) { job->layout = *layout; job->have_layout = 1; }
++    g_ld_ap.started++;
++    *pending = 1;
++    return NULL;
++}
++/* Once a frame, on the renderer owner between two frames: finish what the workers have finished. */
++static void ld_ap_pump(void)
++{
++    if (!g_ld_ap_count) return;
++    u32 budget = g_ld_ap_count < LD_AP_PER_FRAME ? g_ld_ap_count : LD_AP_PER_FRAME;
++    while (budget-- && g_ld_ap_count) {
++        if (g_ld_ap_cursor >= g_ld_ap_count) g_ld_ap_cursor = 0;
++        ld_ap_job* job = &g_ld_ap_jobs[g_ld_ap_cursor];
++        const rsx_vertex_layout_plan* layout = job->have_layout ? &job->layout : NULL;
++        const u32 age = g_ld_frames - job->born;
++        int done = 0;
++        ID3D12PipelineState* pso = ld_ap_step(job->vs, job->ps, &job->state, layout, job->packed, job->key, job->point, job->pull);
++        if (pso) { done = 1; g_ld_ap.finished++; if (age > g_ld_ap.max_frames) g_ld_ap.max_frames = age; }
++        else if (g_ld_ap_refused || age > LD_AP_LIMIT_FRAMES || g_ld_compile_jobs.state != LD_SCJ_RUNNING || !g_ld_pw.active) {
++            /* a compile that failed, a full recipe table, a stopped worker: the synchronous path decides */
++            pso = build_pso(job->vs, job->ps, &job->state, layout, job->packed, job->key, job->point, job->pull);
++            done = 1; g_ld_ap.sync_final++;
++        }
++        if (!done) { g_ld_ap_cursor++; continue; }
++        if (job->pso_index < g.n_psos && g.psos[job->pso_index].key == job->key && g_ld_ap_pending[job->pso_index]) {
++            g.psos[job->pso_index].pso = pso;
++            g_ld_ap_pending[job->pso_index] = 0;
++        } else if (pso) pso->lpVtbl->Release(pso);
++        free(job->vs); free(job->ps);
++        *job = g_ld_ap_jobs[--g_ld_ap_count];
++    }
++    if (g_ld_frames - g_ld_ap.report_frame >= 600u) {
++        g_ld_ap.report_frame = g_ld_frames;
++        fprintf(stderr, "[async-pso] frame=%u pending=%u started=%llu finished=%llu ready-at-once=%llu sync-final=%llu "
++                        "refused=%llu draws-left-out=%llu longest=%u frames\n",
++                g_ld_frames, g_ld_ap_count, g_ld_ap.started, g_ld_ap.finished, g_ld_ap.immediate, g_ld_ap.sync_final,
++                g_ld_ap.refused, g_ld_ap.skipped_draws, g_ld_ap.max_frames);
++    }
++}
++
+ static int ld_upload_pixel_constants(u32* out_offset)
+ {
+     if (out_offset)
+@@ -10189,6 +10672,7 @@ static int g_ld_vslab = -1;                         /* LD_VTX_SLAB */
+ int g_ld_vslab_ab = 1;                              /* a host's switch during a run (GT6_AB "vslab") */
+ int g_ld_vslab_mb = 0;                              /* > 0: a host lowers the arena's limit to this (GT6_AB "vsmb") */
+ int g_ld_vrun_ab = 1;                               /* 0: runs are converted through a list of references (GT6_AB "vrun") */
++int g_ld_vspr_ab = 1;                               /* 0: no sparse pull, to compare inside one run (GT6_AB "vspr") */
+ int g_ld_vdir_ab = 0;                               /* 1: a group goes the direct way when its span is at most 1.25 x its
+                                                      * index list, its named elements not counted (GT6_AB "vdir") */
+ static struct {
+@@ -10677,12 +11161,46 @@ static int ld_vs_direct_ok(u32 total, u32 rmin, u32 span, u64 where)
+     return yes ? 2 : 0;
+ }
+ 
++/* LD_VS_ARRAYS=0: groups drawn without an index array (DRAW_ARRAYS) take the old way again [GT6 0047]. */
++static u32 g_vs_why;      /* why ld_vs_prepare_inner last answered 0 (the [vertex-paths] line) */
++/* Sparse pull, LD_VS_SPARSE_PULL=0 turns it off [GT6 0048]. A group whose arrays change every frame gets no slab,
++ * and when its indices name only part of their span it was not converted as a run either (that converts the
++ * whole span on the drawing thread): it went the old way, which fetches and converts the named vertices one by
++ * one - 225 groups and 67,000 vertices a frame in a twelve-car race of Gran Turismo 6, most of the 8 ms a frame
++ * the drawing thread spent on vertices (b9_why1). The GPU pull copies raw bytes and converts nothing, so the
++ * span costs it a memcpy: such a group is pulled when its span is at most four times its index count and at
++ * most 256 KB of raw bytes; else, and whenever the pull says no, the old way as before. */
++static struct { unsigned long long draws, bytes, span, total, back, big; } g_vsp;
++static int ld_vs_sparse_pull_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_VS_SPARSE_PULL"); on = !(e && *e == '0'); }
++    return on;
++}
++static int ld_vs_arrays_on(void)
++{
++    static int on = -1;
++    /* Off unless asked: in a twelve-car race this moved 120 groups of about five vertices a frame, whose
++     * signatures are new every frame (47,800 "new" in 5 s, 828 blocks made), and the pack went from 26-40 to
++     * 17-23 frames a second (b9_prof3). The 78,000 vertices a frame that are still fetched on the drawing thread
++     * are in other groups - see g_vs_why. */
++    if (on < 0) { const char* e = getenv("LD_VS_ARRAYS"); on = e && *e == '1'; }
++    return on;
++}
+ static int ld_vs_prepare_inner(const rsx_vertex_layout_plan* layout, u32 prim, ld_vs_draw* out, int* plan_made)
+ {
+-    if (!dc.n_idx || dc.n_arr || !layout->stride || !layout->count) return 0;
++    /* A group of DRAW_ARRAYS batches names the elements first .. first + count - 1 of each batch, in order, with
++     * no base index (push_compact_ref(first + i, 0) on the old way): the same list an index array would hold. In
++     * a twelve-car race of Gran Turismo 6 these were 430 of 1,600 groups a frame and 79,000 vertices fetched and
++     * converted on the drawing thread every frame, because only indexed groups were asked here [GT6 0047]. */
++    const int arrays_only = !dc.n_idx && dc.n_arr && !g.video_active && ld_vs_arrays_on();   /* a movie's quads: as before */
++    g_vs_why = !dc.n_idx ? 1u : dc.n_arr ? 2u : 8u;
++    if ((!dc.n_idx && !arrays_only) || (dc.n_idx && dc.n_arr) || !layout->stride || !layout->count) return 0;
++    g_vs_why = 3u;
+     if (prim != PRIM_TRIANGLES && prim != PRIM_TRIANGLE_STRIP && prim != PRIM_TRIANGLE_FAN && prim != PRIM_QUADS)
+         return 0;
+     const u32 frame = g_ld_frames;
++    g_vs_why = 4u;
+     g_vss.asked++;
+     if ((g_vss.asked & 63u) == 0u) { ld_vs_stats(); ld_vs_sweep(frame); }
+     rsx_vertex_fetch_plan* pl = &dc.fetch_plan;
+@@ -10721,6 +11239,7 @@ static int ld_vs_prepare_inner(const rsx_vertex_layout_plan* layout, u32 prim, l
+     const u32 esz = ia.is_u32 ? 4u : 2u;
+     u64 total64 = 0;
+     for (u32 b = 0; b < dc.n_idx; b++) total64 += dc.idx[b].count;
++    for (u32 b = 0; arrays_only && b < dc.n_arr; b++) total64 += dc.arr[b].count;
+     if (total64 < 3u || total64 > (1u << 22)) { g_vss.f_shape++; return 0; }
+     const u32 total = (u32)total64;
+     if (total > g_vs_raw_cap) {
+@@ -10763,11 +11282,20 @@ static int ld_vs_prepare_inner(const rsx_vertex_layout_plan* layout, u32 prim, l
+         }
+         w += count;
+     }
+-    if (restart_on && cut) { g_vss.f_restart++; return 0; }
+-    const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
+-    if ((u64)rmax + base_index > 0x000FFFFFull) { g_vss.f_span++; return 0; }     /* the 20-bit wrap: the old way */
++    for (u32 b = 0; arrays_only && b < dc.n_arr; b++) {
++        const u32 first = dc.arr[b].first, count = dc.arr[b].count;
++        if (!count) continue;
++        if ((u64)first + count > 0x00100000ull) { g_vss.f_span++; return 0; }
++        for (u32 i = 0; i < count; i++) raw[w + i] = first + i;
++        rmin = first < rmin ? first : rmin;
++        rmax = first + count - 1u > rmax ? first + count - 1u : rmax;
++        w += count;
++    }
++    if (restart_on && cut) { g_vss.f_restart++; g_vs_why = 5u; return 0; }
++    const u32 base_index = arrays_only ? 0u : rsx_dsp_vertex_data_base_index(&g.rsx);
++    if ((u64)rmax + base_index > 0x000FFFFFull) { g_vss.f_span++; g_vs_why = 6u; return 0; }     /* the 20-bit wrap: the old way */
+     const u32 vmin = rmin + base_index, vmax = rmax + base_index;
+-    if (vmax - vmin >= LD_VS_MAX_BLOCK) { g_vss.f_span++; return 0; }
++    if (vmax - vmin >= LD_VS_MAX_BLOCK) { g_vss.f_span++; g_vs_why = 6u; return 0; }
+     u32 n_index = 0;
+     switch (prim) {
+     case PRIM_TRIANGLES:      n_index = total - total % 3u; break;
+@@ -10786,10 +11314,13 @@ static int ld_vs_prepare_inner(const rsx_vertex_layout_plan* layout, u32 prim, l
+     out->vmin = vmin;
+     out->span = vmax - vmin + 1u;
+     out->bias = base_index - vmin;
+-    const u64 where = ld_vr_mix(((u64)ia.offset << 32) | dc.idx[0].first,
+-                                ((u64)dc.n_idx << 40) ^ ((u64)dc.idx[dc.n_idx - 1u].first << 8) ^
+-                                ((u64)ia.location << 1) ^ (u64)(ia.is_u32 ? 1u : 0u));
+-#define LD_VS_DIRECT() ld_vs_direct_ok(total, rmin, out->span, where)
++    const u64 where = arrays_only
++        ? ld_vr_mix(0x0A77A75000000000ull ^ dc.arr[0].first,
++                    ((u64)dc.n_arr << 40) ^ ((u64)dc.arr[dc.n_arr - 1u].first << 8) ^ 4u)
++        : ld_vr_mix(((u64)ia.offset << 32) | dc.idx[0].first,
++                    ((u64)dc.n_idx << 40) ^ ((u64)dc.idx[dc.n_idx - 1u].first << 8) ^
++                    ((u64)ia.location << 1) ^ (u64)(ia.is_u32 ? 1u : 0u));
++#define LD_VS_DIRECT() (g_vs_why = 7u, ld_vs_direct_ok(total, rmin, out->span, where))
+ 
+     const u32 ep = (u32)g_gcm_ww_epoch + 1u;
+     ld_vs_slab* grow = NULL;
+@@ -12841,8 +13372,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     memset(&vs, 0, sizeof vs);
+     if (ld_vertex_compact_payload() && !dc.inl && ld_vs_on()) {
+         vs_on = ld_vs_prepare(&used_layout, prim, &vs);
++        int sparse_pull = 0;                                 /* [GT6 0048], see g_vsp */
++        if (!vs_on && g_vs_why == 7u && vs.span >= 32u && vs.total && ld_vertex_pull_on() && ld_vs_sparse_pull_on() && g_ld_vspr_ab &&
++            (u64)vs.span <= (u64)vs.total * 4u + 64u) {
++            vs_on = 2; sparse_pull = 1;
++        }
+         if (vs_on == 2) {
+             vertex_pull = ld_vertex_pull_prepare(&pull_plan, &vs);
++            if (vertex_pull && sparse_pull && pull_plan.bytes > (256u << 10)) { vertex_pull = 0; g_vsp.big++; }
+             if (vertex_pull && !reserve_compact_vertices(pull_plan.bytes)) {
+                 vertex_pull = 0; g_vpull.bounds++;
+             }
+@@ -12855,8 +13392,19 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 /* Compile failure must retain the established CPU draw, not
+                  * introduce a dropped group. No draw/upload side effects yet. */
+                 pull_pso = get_pso(&used_layout, 1, 1);
++                if (!pull_pso && g_ld_ap_last_pending) {
++                    /* being made (LD_ASYNC_PSO): leave the draw out now, before the CPU path fetches its
++                     * vertices and asks for a second pipeline that would only be thrown away */
++                    live_draw_csv_emit(prim, 0, "wait_pso");
++                    g_ld_ap.skipped_draws++;
++                    return;
++                }
+                 if (!pull_pso) { vertex_pull = 0; g_vpull.pso++; }
+             }
++            if (sparse_pull) {
++                if (vertex_pull) { g_vsp.draws++; g_vsp.bytes += pull_plan.bytes; g_vsp.span += vs.span; g_vsp.total += vs.total; }
++                else { vs_on = 0; g_vsp.back++; }             /* the old way, which compacts */
++            } else
+             if (!vertex_pull && !ld_vs_direct_fetch(&used_layout, &vs)) vs_on = 0;
+         }
+     }
+@@ -12992,9 +13540,47 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         ld_vc_store(vc_store, vc_verify, &used_layout, vertex_data, (u32)draw_vb_bytes,
+                     indexed, n_tri, uploaded_vertices, vc_ix);
+ 
++    { /* [vertex-paths]: which way the groups' vertices came, averaged over 600 frames */
++      static unsigned long long n[6], v[6], wn[10], wv[10], pn[12], pv[12]; static u32 at;
++      const u32 c = dc.inl ? 0u : vertex_pull ? 1u : vs_on == 1 ? 2u : vs_on == 2 ? 3u : vc ? 4u : 5u;
++      n[c]++; v[c] += uploaded_vertices;
++      if (c == 5u) {
++          const u32 w = (ld_vertex_compact_payload() && ld_vs_on()) ? (g_vs_why < 9u ? g_vs_why : 9u) : 0u;
++          wn[w]++; wv[w] += uploaded_vertices;
++          pn[prim < 11u ? prim : 11u]++; pv[prim < 11u ? prim : 11u] += uploaded_vertices;
++      }
++      if (g_ld_frames - at >= 600u) {
++          const double f = (double)(g_ld_frames - at);
++          fprintf(stderr, "[vertex-paths] a frame, up to frame %u: inline %.0f groups (%.0f vertices), pulled on the GPU %.0f (%.0f), "
++                          "from a slab %.0f, converted as a run %.0f (%.0f), from the vertex cache %.0f, fetched and converted "
++                          "%.0f (%.0f)\n", g_ld_frames, n[0] / f, v[0] / f, n[1] / f, v[1] / f, n[2] / f, n[3] / f, v[3] / f,
++                  n[4] / f, n[5] / f, v[5] / f);
++          fprintf(stderr, "[vertex-paths]   the fetched ones by reason (groups/vertices a frame): not asked %.0f/%.0f, no index array "
++                          "%.0f/%.0f, arrays and indices %.0f/%.0f, primitive %.0f/%.0f, shape %.0f/%.0f, restart %.0f/%.0f, span "
++                          "%.0f/%.0f, sparse or new %.0f/%.0f, other %.0f/%.0f\n", wn[0] / f, wv[0] / f, wn[1] / f, wv[1] / f,
++                  wn[2] / f, wv[2] / f, wn[3] / f, wv[3] / f, wn[4] / f, wv[4] / f, wn[5] / f, wv[5] / f, wn[6] / f, wv[6] / f,
++                  wn[7] / f, wv[7] / f, (wn[8] + wn[9]) / f, (wv[8] + wv[9]) / f);
++          fprintf(stderr, "[vertex-paths]   the fetched ones by primitive: points %.0f/%.0f, lines %.0f/%.0f, line loop %.0f/%.0f, line "
++                          "strip %.0f/%.0f, triangles %.0f/%.0f, strip %.0f/%.0f, fan %.0f/%.0f, quads %.0f/%.0f, quad strip "
++                          "%.0f/%.0f, polygon %.0f/%.0f\n", pn[1] / f, pv[1] / f, pn[2] / f, pv[2] / f, pn[3] / f, pv[3] / f, pn[4] / f,
++                  pv[4] / f, pn[5] / f, pv[5] / f, pn[6] / f, pv[6] / f, pn[7] / f, pv[7] / f, pn[8] / f, pv[8] / f, pn[9] / f, pv[9] / f,
++                  pn[10] / f, pv[10] / f);
++          { static unsigned long long d0, b0, s0, t0, k0, g0;
++            fprintf(stderr, "[vertex-paths]   sparse pull a frame: %.0f groups, %.0f KB raw, span %.0f elements for %.0f indices; "
++                            "%.0f back to the old way, %.0f over 256 KB\n", (g_vsp.draws - d0) / f, (g_vsp.bytes - b0) / f / 1024.0,
++                    (g_vsp.span - s0) / f, (g_vsp.total - t0) / f, (g_vsp.back - k0) / f, (g_vsp.big - g0) / f);
++            d0 = g_vsp.draws; b0 = g_vsp.bytes; s0 = g_vsp.span; t0 = g_vsp.total; k0 = g_vsp.back; g0 = g_vsp.big; }
++          memset(wn, 0, sizeof wn); memset(wv, 0, sizeof wv); memset(pn, 0, sizeof pn); memset(pv, 0, sizeof pv);
++          memset(n, 0, sizeof n); memset(v, 0, sizeof v); at = g_ld_frames;
++      } }
+     ID3D12PipelineState* pso = pull_pso ? pull_pso : get_pso(
+         ld_vertex_mask_signature() ? &used_layout : NULL,
+         ld_vertex_compact_payload(), 0);
++    if (!pso && g_ld_ap_last_pending) {
++        live_draw_csv_emit(prim, n_tri, "wait_pso");
++        g_ld_ap.skipped_draws++;
++        return;   /* LD_ASYNC_PSO: its pipeline is being made; the next frames draw it */
++    }
+     if (!pso) {
+ #if defined(YZ_PERF_PROFILE)
+         ld_profile_note_rejected_pso();
+@@ -13046,6 +13632,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g_ld_stats.group_drop_surface++;
+         return;
+     }
++    if (g.surfaces[target].ap_last != g_ld_frames) {
++        g.surfaces[target].ap_prev = g.surfaces[target].ap_last;
++        g.surfaces[target].ap_last = g_ld_frames;
++    }
+     /* LD_SKIP_SAMPLING=<hex offset>: drop draws that sample a texture at that
+      * offset. Debug only -- removing a post-process pass shows whether the
+      * scene under it has any colour at all. */
+@@ -13352,6 +13942,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+               g.surfaces[target].w == t.width && g.surfaces[target].h == t.height &&
+               (g.surfaces[target].fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u) == tb_want;
+           sampled = ld_fragment_surface_find(&t, target, tb_want, by_fmt, self_exact);
++          if (sampled >= 0 && !ld_surface_alias_ok((u32)sampled, &t)) sampled = -1;   /* [GT6 0045] */
+         }
+         /* LD_UVDBG=1: the texture coordinates of the draw that samples the PS1
+          * framebuffer. Placed here rather than in fetch_batches because that
+@@ -14830,9 +15421,14 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     if (shader_disk_cache_prepare()) {
+         ld_pso_library_init();
+         ld_pw_start(g.dev, g_pso_lib, g.rootsig_x, g_ld_point_rootsig, g_ld_shader_disk_dir);
+-        if (ld_la_enabled()) {
++        if (ld_la_enabled() || (ld_ap_on() && g_ld_pw.active)) {
+             const char* trim=getenv("RSX_FP_COMPILE_INIT");
+             const char* scalar=getenv("RSX_FP_COMPILE_SCALAR");
++            { const char* t = getenv("LD_SCJ_THREADS");
++              g_ld_scj_threads = t && atoi(t) >= 1 ? (unsigned)atoi(t) : ld_ap_on() ? 4u : 2u;
++              if (ld_ap_on())
++                  fprintf(stderr, "[async-pso] on: depth-tested draws wait for their pipeline off the renderer "
++                                  "(compile workers %u; LD_ASYNC_PSO=0 = the synchronous path)\n", g_ld_scj_threads); }
+             if (ld_scj_begin(&g_ld_compile_jobs,!(trim && *trim=='0'),!(scalar && *scalar=='0'),ld_vs_compile_flags()))
+                 fprintf(stderr,"[pipeline-lookahead] enabled: bounded read-only FIFO hints, exact shader/descriptor validation\n");
+         }
+@@ -15917,6 +16513,9 @@ void rsx_live_draw_present(u32 buffer_id)
+       g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
+       packets_at_last_frame = g_ld_stats.packets_seen; }
+     g_ld_frames++;
++    ld_ap_pump();
++    ld_surface_guard_report();
++    ld_tex_pool_report();
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_present(g_ld_frames);
+ #endif
+diff --git a/libs/video/rsx_pso_warmup.h b/libs/video/rsx_pso_warmup.h
+index 803d7dc..ae4d0d0 100644
+--- a/libs/video/rsx_pso_warmup.h
++++ b/libs/video/rsx_pso_warmup.h
+@@ -472,14 +472,22 @@ static DWORD WINAPI ld_pw_worker(LPVOID unused)
+     return 0;
+ }
+ 
++/* g_ld_pw_front (renderer owner only): the next recipes go to the head of the queue. A draw that is being
++ * skipped until its pipeline exists must not wait behind the thousands of start-up recipes. */
++static int g_ld_pw_front;
+ static int ld_pw_enqueue(ld_pw_entry* entry, ld_pw_record* record)
+ {
+     ld_pw_job* job = (ld_pw_job*)calloc(1, sizeof(*job));
+     if (!job) return 0;
+     job->entry = entry; job->record = record;
+     AcquireSRWLockExclusive(&g_ld_pw.lock);
++    if (g_ld_pw_front && entry) {
++        job->next = g_ld_pw.head; g_ld_pw.head = job;
++        if (!g_ld_pw.tail) g_ld_pw.tail = job;
++    } else {
+     if (g_ld_pw.tail) g_ld_pw.tail->next = job; else g_ld_pw.head = job;
+     g_ld_pw.tail = job;
++    }
+     WakeConditionVariable(&g_ld_pw.wake);
+     ReleaseSRWLockExclusive(&g_ld_pw.lock);
+     return 1;
+@@ -625,7 +633,13 @@ static int ld_pw_submit(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+     ld_pw_identity id;
+     if (!g_ld_pw.active || g_ld_pw.stop || !ld_pw_identity_make(&id, pd, root_kind)) return 0;
+     const uint64_t key = ld_pw_key(&id, pd);
+-    if (ld_pw_find(key)) return 1;
++    { ld_pw_entry* known = ld_pw_find(key);
++      if (known) {
++          /* Known but still queued (a start-up recipe not reached yet): a second job at the head. ld_pw_prepare
++           * takes an entry once (state 0 -> 1), so whichever job comes second does nothing. */
++          if (g_ld_pw_front && InterlockedCompareExchange(&known->state, 0, 0) == 0) ld_pw_enqueue(known, NULL);
++          return 1;
++      } }
+     if (g_ld_pw.entry_count >= LD_PW_LIMIT) { g_ld_pw.runtime_full++; return 0; }
+     const size_t payload = pd->VS.BytecodeLength + pd->PS.BytecodeLength + pd->GS.BytecodeLength;
+     const size_t n = sizeof(ld_pw_record) + payload;
+diff --git a/libs/video/rsx_shader_compile_jobs.h b/libs/video/rsx_shader_compile_jobs.h
+index 788ba73..d5858e3 100644
+--- a/libs/video/rsx_shader_compile_jobs.h
++++ b/libs/video/rsx_shader_compile_jobs.h
+@@ -40,6 +40,10 @@
+ #define LD_SCJ_MAX_BLOB (4u * 1024u * 1024u)
+ #endif
+ #define LD_SCJ_BUCKETS 2048u
++#define LD_SCJ_MAX_THREADS 8u
++/* Workers a begin starts: 2 unless the owner asks for more before ld_scj_begin (the renderer's asynchronous
++ * pipeline path, where every pending draw is waiting on this queue). */
++static unsigned g_ld_scj_threads = 2u;
+ #ifndef LD_SCJ_ALLOC
+ #define LD_SCJ_ALLOC malloc
+ #endif
+@@ -87,7 +91,7 @@ typedef struct ld_scj_state {
+     UINT vs_flags;
+     uint64_t generation;
+     LONGLONG qpc_frequency;
+-    HANDLE threads[2];
++    HANDLE threads[LD_SCJ_MAX_THREADS];
+     ld_scj_job *all, *head, *tail, *buckets[LD_SCJ_BUCKETS];
+     unsigned jobs, pending, running, ready, reserved;
+     size_t source_bytes, blob_bytes, reserved_source_bytes;
+@@ -223,7 +227,7 @@ static DWORD WINAPI ld_scj_worker(LPVOID argument)
+ static void ld_scj_shutdown(ld_scj_state* state)
+ {
+     if (!state) return;
+-    HANDLE threads[2] = { NULL, NULL }; unsigned count = 0;
++    HANDLE threads[LD_SCJ_MAX_THREADS] = { NULL }; unsigned count = 0;
+     AcquireSRWLockExclusive(&state->lock);
+     if (state->state == LD_SCJ_STOPPED) { ReleaseSRWLockExclusive(&state->lock); return; }
+     state->state = LD_SCJ_STOPPING;
+@@ -236,8 +240,8 @@ static void ld_scj_shutdown(ld_scj_state* state)
+     for (unsigned i = 0; i < count; ++i) threads[i] = state->threads[i];
+     WakeAllConditionVariable(&state->changed);
+     ReleaseSRWLockExclusive(&state->lock);
+-    /* D3DCompile cannot be interrupted safely. Only the at-most-two already
+-     * admitted jobs finish; all pending jobs and waiting acquires are cancelled. */
++    /* D3DCompile cannot be interrupted safely. Only the jobs the workers have
++     * already admitted (one each) finish; all pending jobs and waiting acquires are cancelled. */
+     for (unsigned i = 0; i < count; ++i) { WaitForSingleObject(threads[i], INFINITE); CloseHandle(threads[i]); }
+     AcquireSRWLockExclusive(&state->lock);
+     ld_scj_job* all = state->all;
+@@ -270,7 +274,8 @@ static int ld_scj_begin(ld_scj_state* state, int trim, int scalar, UINT vs_flags
+     state->qpc_frequency = QueryPerformanceFrequency(&frequency) ? frequency.QuadPart : 0;
+     memset(&state->totals, 0, sizeof(state->totals));
+     ReleaseSRWLockExclusive(&state->lock);
+-    for (unsigned i = 0; i < 2; ++i) {
++    const unsigned want = g_ld_scj_threads < 1u ? 1u : g_ld_scj_threads > LD_SCJ_MAX_THREADS ? LD_SCJ_MAX_THREADS : g_ld_scj_threads;
++    for (unsigned i = 0; i < want; ++i) {
+         HANDLE thread = LD_SCJ_CREATE_THREAD(ld_scj_worker, state);
+         if (!thread) { ld_scj_shutdown(state); return 0; }
+         AcquireSRWLockExclusive(&state->lock);

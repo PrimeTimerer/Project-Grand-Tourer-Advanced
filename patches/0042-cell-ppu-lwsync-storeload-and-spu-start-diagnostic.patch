@@ -1,0 +1,101 @@
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index d321d6b..b904d04 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1316,6 +1316,16 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+         const spu_reuse_worker* w = t->reuse_worker;
+         if ((w && (w->shutdown || w->requested != w->completed || w->joiners)) ||
+             ((w || spu_reuse_candidate(g, t)) && g->state == SPU_GROUP_STATE_RUNNING)) {
++            /* Preserve the rejection contract, but retain evidence of rare
++             * start/join overlaps before a caller waits on a guest event. */
++            static unsigned rejected_start_reports;
++            if (rejected_start_reports++ < 16) {
++                fprintf(stderr, "[SPU-worker] rejected-start group=0x%X tid=0x%X host=%lu state=%u requested=%llu completed=%llu joiners=%u shutdown=%d\n",
++                    g->id, t->tid, (unsigned long)GetCurrentThreadId(), g->state,
++                    (unsigned long long)(w ? w->requested : 0),
++                    (unsigned long long)(w ? w->completed : 0),
++                    w ? w->joiners : 0, w ? w->shutdown : 0);
++            }
+             ReleaseSRWLockExclusive(&s_spu_reuse_lock);
+             if (reuse_guard) ReleaseSRWLockExclusive(&s_spu_reuse_lifecycle_lock);
+             ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESTAT;
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 7d72630..7524c57 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -44,20 +44,20 @@ except ImportError:
+ FENCE_PREAMBLE = """\
+ /* Guest memory barriers: the lowering of sync/lwsync/eieio/isync/ptesync.
+  *
+- * These used to be no-ops, which x86-64 forgave -- its store order is total,
+- * so the ordering a guest asked for was already there. A weakly ordered host
+- * does not give it away. The gcm command buffer is the shape that breaks
+- * first: the SDK writes its command words, separates them with eieio or
+- * lwsync, then writes the FIFO put pointer, and with the barrier dropped the
+- * pointer can become visible before the words it publishes. Every lock-free
+- * handoff in a title has the same exposure.
++ * Cell PPE software must also retain StoreLoad ordering at lwsync. In
++ * particular, libsre's SPURS wake/sleep handshake publishes one byte before
++ * reading the peer's byte. An acquire/release fence emits no hardware fence
++ * on x86 and permits both peers to read zero, losing the wakeup. Cell's
++ * coherent-memory barrier behavior is also why RPCS3 lowers both sync and
++ * lwsync to seq_cst (PPUTranslator::SYNC explicitly cites libsre.sprx).
++ * Merely retaining x86's StoreStore order is insufficient for this protocol.
+  *
+  * The macro lives in the header so the lifted code, the boot scaffold and the
+  * smoke title all spell a fence the same way. On x86-64 the acquire, release
+  * and acq_rel forms emit no instruction at all and cost only the reordering
+  * the compiler no longer does; only seq_cst becomes a barrier instruction
+  * (mfence, or the locked op LLVM prefers to it). On arm64 they are one dmb
+- * each, around half a nanosecond. */
++ * each; their cost is host-dependent. */
+ #ifndef PPU_FENCE
+ #  ifdef __cplusplus
+ #    include <atomic>
+@@ -2881,9 +2881,8 @@ class PPULifter:
+         # The barriers are not hints. They are the ordering the guest asked
+         # for, and on a weakly ordered host nothing else supplies it; see
+         # PPU_FENCE in the header preamble for what a dropped one costs.
+-        # Each maps to the weakest host fence that still covers what the
+-        # PowerISA promises, so the ones a game emits most are also the ones
+-        # that cost least.
++        # This lifter targets the Cell PPE, including its coherent-memory
++        # lwsync behavior, not only the weaker generic PowerISA minimum.
+         if mn in ("sync", "ptesync"):
+             # Book II: sync (hwsync) orders every earlier access against every
+             # later one, StoreLoad included, which is what seq_cst is for.
+@@ -2891,9 +2890,10 @@ class PPULifter:
+             # ordering half of it is the same barrier.
+             return f"PPU_FENCE(seq_cst);   /* {mn}: full barrier, StoreLoad included */"
+         if mn == "lwsync":
+-            # Lightweight sync orders load-load, load-store and store-store
+-            # but not store-load. That is exactly acq_rel.
+-            return "PPU_FENCE(acq_rel);   /* lwsync: everything but StoreLoad */"
++            # libsre's two-byte wake/sleep handshake needs StoreLoad order.
++            # acq_rel becomes only a compiler barrier on x86, allowing both
++            # sides to miss the other's store and sleep indefinitely.
++            return "PPU_FENCE(seq_cst);   /* lwsync: Cell PPE coherent-memory barrier, StoreLoad included */"
+         if mn == "eieio":
+             # eieio orders storage accesses AHEAD of it against those after
+             # it, and a guest reaches for it to publish a buffer it has
+diff --git a/tools/test_ppu_lift.py b/tools/test_ppu_lift.py
+index 4c6d349..633ebfb 100644
+--- a/tools/test_ppu_lift.py
++++ b/tools/test_ppu_lift.py
+@@ -750,13 +750,14 @@ def check_decode_and_lift():
+ # passes every one of those checks. What says the ordering is really there is
+ # the text: WHICH fence each mnemonic emits, and that the three XO-598 forms
+ # are told apart before the lifter ever sees them. sync and lwsync are one bit
+-# apart in the encoding and a whole barrier apart in what they cost.
++# apart, but Cell PPE compatibility requires StoreLoad order for both. The
++# separate host store-buffering fixture checks why acq_rel is insufficient.
+ # ---------------------------------------------------------------------------
+ 
+ BARRIERS = [
+     # word,            mnemonic,  the fence it must lower to
+     (sync_form(0),     "sync",    "PPU_FENCE(seq_cst)"),
+-    (sync_form(1),     "lwsync",  "PPU_FENCE(acq_rel)"),
++    (sync_form(1),     "lwsync",  "PPU_FENCE(seq_cst)"),
+     (sync_form(2),     "ptesync", "PPU_FENCE(seq_cst)"),
+     (EIEIO_WORD,       "eieio",   "PPU_FENCE(release)"),
+     (ISYNC_WORD,       "isync",   "PPU_FENCE(acquire)"),

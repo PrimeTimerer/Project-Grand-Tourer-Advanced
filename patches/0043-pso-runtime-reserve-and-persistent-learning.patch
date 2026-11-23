@@ -1,0 +1,245 @@
+diff --git a/libs/video/rsx_pso_warmup.h b/libs/video/rsx_pso_warmup.h
+index 25a2361..803d7dc 100644
+--- a/libs/video/rsx_pso_warmup.h
++++ b/libs/video/rsx_pso_warmup.h
+@@ -17,8 +17,32 @@
+ #pragma comment(lib, "synchronization.lib")
+ #endif
+ 
+-#define LD_PW_LIMIT 16384u
+-#define LD_PW_HASH (LD_PW_LIMIT * 2u)
++/* Keep the startup driver-work budget unchanged. A learned catalog must not
++ * occupy the slots needed by exact pipelines first encountered during play. */
++#ifndef LD_PW_STARTUP_LIMIT
++#define LD_PW_STARTUP_LIMIT 16384u
++#endif
++#ifndef LD_PW_RUNTIME_RESERVE
++#define LD_PW_RUNTIME_RESERVE 4096u
++#endif
++#define LD_PW_LIMIT (LD_PW_STARTUP_LIMIT + LD_PW_RUNTIME_RESERVE)
++#ifndef LD_PW_HASH
++#define LD_PW_HASH 65536u
++#endif
++/* Recipe persistence has its own per-run quota. Filling the resident table
++ * must not prevent a successful ordinary draw from teaching the next run. */
++#ifndef LD_PW_MAX_NEW_RECORDS
++#define LD_PW_MAX_NEW_RECORDS 4096u
++#endif
++#if LD_PW_STARTUP_LIMIT == 0 || LD_PW_RUNTIME_RESERVE == 0 || LD_PW_LIMIT > 65535u
++#error Invalid PSO startup/runtime limits for the uint16_t index
++#endif
++#if LD_PW_HASH <= LD_PW_LIMIT || (LD_PW_HASH & (LD_PW_HASH - 1u)) != 0
++#error PSO hash capacity must be a power of two larger than the resident limit
++#endif
++#if LD_PW_MAX_NEW_RECORDS == 0 || LD_PW_MAX_NEW_RECORDS >= LD_PW_HASH
++#error Invalid independent PSO recipe-write quota
++#endif
+ #define LD_PW_MAGIC 0x31575047u /* GPW1 */
+ #define LD_PW_MAX_SHADER (4u * 1024u * 1024u)
+ #ifndef LD_PW_MAX_RETAINED
+@@ -91,6 +115,7 @@ static struct {
+     volatile LONG discovered, completed, completion_reported;
+     ULONGLONG start_tick;
+     uint64_t hits, waits, misses, collisions, skipped_records;
++    uint64_t runtime_submitted, runtime_full, record_quota_full;
+ } g_ld_pw;
+ 
+ static void ld_pw_progress(void)
+@@ -491,7 +516,7 @@ static void ld_pw_start(ID3D12Device* dev, ID3D12PipelineLibrary* lib,
+     WIN32_FIND_DATAA data; HANDLE find = FindFirstFileA(search, &data);
+     if (find != INVALID_HANDLE_VALUE) {
+         do {
+-            if (g_ld_pw.entry_count == LD_PW_LIMIT) break;
++            if (g_ld_pw.entry_count == LD_PW_STARTUP_LIMIT) break;
+             if (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+             if (strlen(data.cFileName) != 21 || strcmp(data.cFileName + 16, ".gpso")) continue;
+             char* end; const uint64_t key = _strtoui64(data.cFileName, &end, 16);
+@@ -508,8 +533,9 @@ static void ld_pw_start(ID3D12Device* dev, ID3D12PipelineLibrary* lib,
+         } while (FindNextFileA(find, &data));
+         FindClose(find);
+     }
+-    fprintf(stderr, "[pso-prewarm] queued %u exact recipes, %u workers, '%s'\n",
+-            g_ld_pw.entry_count, g_ld_pw.thread_count, g_ld_pw.dir);
++    fprintf(stderr, "[pso-prewarm] queued %u exact recipes, %u workers, '%s' resident_limit=%u runtime_reserve=%u\n",
++            g_ld_pw.entry_count, g_ld_pw.thread_count, g_ld_pw.dir,
++            (unsigned)LD_PW_LIMIT, (unsigned)LD_PW_RUNTIME_RESERVE);
+     InterlockedExchange(&g_ld_pw.discovered, 1); ld_pw_progress();
+ }
+ 
+@@ -554,16 +580,15 @@ static void ld_pw_remember(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, unsigne
+     ld_pw_identity id;
+     if (!g_ld_pw.active || !ld_pw_identity_make(&id, pd, root_kind)) return;
+     const uint64_t key = ld_pw_key(&id, pd);
+-    const int existing = ld_pw_find(key) != NULL;
+-    if (!existing && g_ld_pw.entry_count + g_ld_pw.new_records >= LD_PW_LIMIT) {
+-        g_ld_pw.skipped_records++; return;
+-    }
+     unsigned slot = (unsigned)(key ^ (key >> 32)) & (LD_PW_HASH - 1u);
+     for (unsigned n = 0; n < LD_PW_HASH; ++n) {
+         if (g_ld_pw.recorded[slot] == key) return;
+         if (!g_ld_pw.recorded[slot]) break;
+         slot = (slot + 1u) & (LD_PW_HASH - 1u);
+-        if (n + 1 == LD_PW_HASH) return;
++        if (n + 1 == LD_PW_HASH) { g_ld_pw.skipped_records++; return; }
++    }
++    if (g_ld_pw.new_records >= LD_PW_MAX_NEW_RECORDS) {
++        g_ld_pw.record_quota_full++; g_ld_pw.skipped_records++; return;
+     }
+     const size_t payload = pd->VS.BytecodeLength + pd->PS.BytecodeLength + pd->GS.BytecodeLength;
+     const size_t n = sizeof(ld_pw_record) + payload;
+@@ -582,7 +607,7 @@ static void ld_pw_remember(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, unsigne
+         if (pd->GS.BytecodeLength) memcpy(b, pd->GS.pShaderBytecode, pd->GS.BytecodeLength);
+         if (ld_pw_enqueue(NULL, r)) {
+             g_ld_pw.recorded[slot] = key;
+-            if (!existing) g_ld_pw.new_records++;
++            g_ld_pw.new_records++;
+             return;
+         }
+         free(r);
+@@ -601,7 +626,7 @@ static int ld_pw_submit(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+     if (!g_ld_pw.active || g_ld_pw.stop || !ld_pw_identity_make(&id, pd, root_kind)) return 0;
+     const uint64_t key = ld_pw_key(&id, pd);
+     if (ld_pw_find(key)) return 1;
+-    if (g_ld_pw.entry_count >= LD_PW_LIMIT) return 0;
++    if (g_ld_pw.entry_count >= LD_PW_LIMIT) { g_ld_pw.runtime_full++; return 0; }
+     const size_t payload = pd->VS.BytecodeLength + pd->PS.BytecodeLength + pd->GS.BytecodeLength;
+     const size_t n = sizeof(ld_pw_record) + payload;
+     AcquireSRWLockExclusive(&g_ld_pw.lock);
+@@ -632,6 +657,7 @@ static int ld_pw_submit(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+         InterlockedIncrement(&g_ld_pw.completed);
+         return 0;
+     }
++    g_ld_pw.runtime_submitted++;
+     ld_pw_remember(pd,root_kind,library_id);
+     return 1;
+ }
+@@ -653,6 +679,11 @@ static void ld_pw_stop(void)
+             (unsigned long long)g_ld_pw.deduplicated_bytes);
+     fprintf(stderr, "[pso-prewarm] rejection(file/budget/driver)=%ld/%ld/%ld cancelled=%ld\n",
+             g_ld_pw.rejected_file, g_ld_pw.rejected_budget, g_ld_pw.rejected_driver, g_ld_pw.cancelled);
++    fprintf(stderr, "[pso-prewarm] capacity startup=%u resident=%u/%u runtime_submitted=%llu runtime_full=%llu recorded=%u/%u quota_full=%llu\n",
++            (unsigned)LD_PW_STARTUP_LIMIT, g_ld_pw.entry_count, (unsigned)LD_PW_LIMIT,
++            (unsigned long long)g_ld_pw.runtime_submitted, (unsigned long long)g_ld_pw.runtime_full,
++            g_ld_pw.new_records, (unsigned)LD_PW_MAX_NEW_RECORDS,
++            (unsigned long long)g_ld_pw.record_quota_full);
+     for (unsigned i = 0; i < g_ld_pw.entry_count; ++i) {
+         if (g_ld_pw.entries[i].pso) g_ld_pw.entries[i].pso->lpVtbl->Release(g_ld_pw.entries[i].pso);
+         free(g_ld_pw.entries[i].pending);
+diff --git a/libs/video/tests/test_pso_warmup.c b/libs/video/tests/test_pso_warmup.c
+index 7760cbd..927be78 100644
+--- a/libs/video/tests/test_pso_warmup.c
++++ b/libs/video/tests/test_pso_warmup.c
+@@ -8,6 +8,12 @@
+ #include <dxgi1_4.h>
+ #include <d3dcompiler.h>
+ #include <stddef.h>
++/* Exercise saturation with real PSOs without thousands of driver creations.
++ * Production defaults remain 16384 startup + 4096 demand slots. */
++#define LD_PW_STARTUP_LIMIT 4u
++#define LD_PW_RUNTIME_RESERVE 2u
++#define LD_PW_MAX_NEW_RECORDS 4u
++#define LD_PW_HASH 16u
+ #include "../rsx_pso_warmup.h"
+ 
+ static unsigned checks;
+@@ -79,6 +85,92 @@ static void render(ID3D12Device* dev, ID3D12RootSignature* root, ID3D12PipelineS
+     rb->lpVtbl->Release(rb); rt->lpVtbl->Release(rt); l->lpVtbl->Release(l); a->lpVtbl->Release(a); q->lpVtbl->Release(q);
+ }
+ 
++static void check_capacity(ID3D12Device* dev, ID3D12RootSignature* root,
++    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* base, const char* fixture_root,
++    const unsigned char expected[64])
++{
++    char directory[MAX_PATH];
++    snprintf(directory, sizeof(directory), "%s\\capacity", fixture_root);
++    check(CreateDirectoryA(directory, NULL), "new capacity fixture directory");
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC variants[8];
++    for (unsigned i = 0; i < 8; ++i) {
++        variants[i] = *base;
++        /* Valid distinct pipeline states; z is disabled, so these same draws
++         * still have the same expected pixels. Exact desc keys remain distinct. */
++        variants[i].RasterizerState.DepthBias = (INT)(i + 1);
++    }
++    ld_prepare_set_paused(1);
++    ld_pw_start(dev, NULL, root, root, directory);
++    for (unsigned i = 0; i < LD_PW_STARTUP_LIMIT; ++i)
++        ld_pw_remember(&variants[i], 0, 200u + i);
++    check(g_ld_pw.new_records == LD_PW_STARTUP_LIMIT, "seed recipes have independent bounded write quota");
++    ld_pw_stop();
++    ld_pw_start(dev, NULL, root, root, directory);
++    check(g_ld_pw.entry_count == LD_PW_STARTUP_LIMIT && !g_ld_pw.ready,
++          "full startup catalog does not consume runtime reserve or start paused driver jobs");
++    check(ld_pw_submit(&variants[4], 0, 204), "full startup table accepts first exact future PSO");
++    check(g_ld_pw.entry_count == LD_PW_STARTUP_LIMIT + 1 && g_ld_pw.runtime_submitted == 1,
++          "future pipeline occupies reserved runtime slot");
++    check(ld_pw_submit(&variants[4], 0, 204) && g_ld_pw.entry_count == LD_PW_STARTUP_LIMIT + 1,
++          "future duplicate does not consume reserve");
++    check(ld_pw_take_ex(&variants[4], 0, 0) == NULL, "reserved queued prediction stays nonblocking");
++    ID3D12PipelineState* pso = ld_pw_take(&variants[4], 0);
++    check(pso != NULL, "real use promotes exact reserved prediction while workers paused");
++    unsigned char got[64]; render(dev, root, pso, got);
++    check(!memcmp(got, expected, sizeof(got)), "reserved future PSO preserves rendered pixels");
++    pso->lpVtbl->Release(pso);
++    check(ld_pw_submit(&variants[5], 0, 205) && g_ld_pw.entry_count == LD_PW_LIMIT,
++          "last runtime slot is bounded and available");
++    check(!ld_pw_submit(&variants[6], 0, 206) && g_ld_pw.runtime_full == 1,
++          "resident overflow retains ordinary fallback");
++    check(ld_pw_take(&variants[6], 0) == NULL, "overflow does not publish a wrong pipeline");
++    ld_pw_remember(&variants[6], 0, 206);
++    check(g_ld_pw.new_records == 3, "full resident table still persists ordinary successful pipeline recipe");
++    ld_pw_remember(&variants[6], 0, 206);
++    check(g_ld_pw.new_records == 3, "repeated remember does not consume recipe quota");
++    ld_pw_remember(&variants[7], 0, 207);
++    check(g_ld_pw.new_records == LD_PW_MAX_NEW_RECORDS, "write quota is independent of resident occupancy");
++    ld_pw_remember(&variants[0], 0, 200);
++    check(g_ld_pw.new_records == LD_PW_MAX_NEW_RECORDS && g_ld_pw.record_quota_full == 1,
++          "independent write quota bounds more unique records");
++    ld_pw_stop();
++    check(!g_ld_pw.active && !g_ld_pw.queued_bytes && !g_ld_prepare_in_flight,
++          "saturated stop joins workers, drains writes and releases cancelled memory recipe");
++    ld_pw_start(dev, NULL, root, root, directory);
++    check(g_ld_pw.entry_count == LD_PW_STARTUP_LIMIT,
++          "restart retains unchanged startup work bound despite larger on-disk catalog");
++    ld_pw_stop();
++    /* Open the exact saved ordinary-fallback recipe in a new one-entry cache.
++     * Do not assume FindFirstFile order includes it in the bounded startup set. */
++    ld_pw_identity id; check(ld_pw_identity_make(&id, &variants[6], 0), "overflow recipe identity");
++    char saved[MAX_PATH], replay[MAX_PATH], replay_pipelines[MAX_PATH], copied[MAX_PATH];
++    snprintf(saved, sizeof(saved), "%s\\pipelines_v1\\%016llX.gpso", directory,
++             (unsigned long long)ld_pw_key(&id, &variants[6]));
++    snprintf(replay, sizeof(replay), "%s\\capacity_replay", fixture_root);
++    snprintf(replay_pipelines, sizeof(replay_pipelines), "%s\\pipelines_v1", replay);
++    check(CreateDirectoryA(replay, NULL) && CreateDirectoryA(replay_pipelines, NULL),
++          "new exact replay fixture directories");
++    snprintf(copied, sizeof(copied), "%s\\%016llX.gpso", replay_pipelines,
++             (unsigned long long)ld_pw_key(&id, &variants[6]));
++    check(CopyFileA(saved, copied, TRUE), "overflow recipe persisted atomically after saturated run");
++    ld_prepare_set_paused(0);
++    ld_pw_start(dev, NULL, root, root, replay);
++    check(g_ld_pw.entry_count == 1, "next run discovers the saved overflow recipe");
++    pso = ld_pw_take(&variants[6], 0);
++    check(pso != NULL, "saved overflow recipe loads with exact descriptor and DXBC");
++    render(dev, root, pso, got);
++    check(!memcmp(got, expected, sizeof(got)), "restarted overflow recipe preserves rendered pixels");
++    pso->lpVtbl->Release(pso);
++    /* Saturate only the fixture's write de-dup table. Its bounded probe must
++     * terminate without allocation or writing even if the quota has room. */
++    for (unsigned i = 0; i < LD_PW_HASH; ++i) g_ld_pw.recorded[i] = i + 1u;
++    const uint64_t skipped = g_ld_pw.skipped_records;
++    ld_pw_remember(&variants[7], 0, 207);
++    check(g_ld_pw.new_records == 0 && g_ld_pw.skipped_records == skipped + 1,
++          "full record hash remains bounded without overwriting an occupied slot");
++    ld_pw_stop();
++}
++
+ int main(int argc, char** argv)
+ {
+     check(argc == 2, "provide new fixture directory");
+@@ -220,6 +312,7 @@ int main(int argc, char** argv)
+     ld_pw_start(dev, NULL, root, root, argv[1]);
+     warmed = ld_pw_take(&pd, 0); check(warmed != NULL, "ordinary successful build repairs invalid recipe");
+     warmed->lpVtbl->Release(warmed); ld_pw_stop();
++    check_capacity(dev, root, &pd, argv[1], expected);
+     _putenv_s("LD_PSO_PREWARM", "0"); ld_pw_start(dev, NULL, root, root, argv[1]);
+     check(!g_ld_pw.active && ld_pw_take(&pd, 0) == NULL, "rollback leaves ordinary path active");
+     library->lpVtbl->Release(library); dev1->lpVtbl->Release(dev1);

@@ -1,0 +1,2550 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index f6bf7fe..3581245 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -137,6 +137,7 @@ typedef struct {
+     u64                  port_addr;      /* guest-visible buffer address */
+     u64                  read_idx_addr;  /* guest-visible read index address */
+     u32                  hold_count;     /* consecutive periods held for a late producer */
++    u32                  clock_ready;    /* consumed at least once since PortStart */
+ } AudioPortSlot;
+ 
+ /* Optional per-title producer check (see audio_mix_one_block): nonzero when the
+@@ -173,6 +174,75 @@ static int           s_mix_thread_live = 0;
+ #endif
+ static mutex_t       s_audio_mutex;
+ 
++/* Movie synchronization observes a permanent host snapshot, never a guest
++ * pointer or s_audio_mutex whose lifetime ends at Quit. Writers already own
++ * s_audio_mutex, except the mixer-only device observation below. */
++#ifdef _WIN32
++static SRWLOCK s_clock_snapshot_lock = SRWLOCK_INIT;
++#define clock_snapshot_lock() AcquireSRWLockExclusive(&s_clock_snapshot_lock)
++#define clock_snapshot_unlock() ReleaseSRWLockExclusive(&s_clock_snapshot_lock)
++#else
++static pthread_mutex_t s_clock_snapshot_lock = PTHREAD_MUTEX_INITIALIZER;
++#define clock_snapshot_lock() pthread_mutex_lock(&s_clock_snapshot_lock)
++#define clock_snapshot_unlock() pthread_mutex_unlock(&s_clock_snapshot_lock)
++#endif
++static CellAudioClockSnapshot s_clock_snapshots[CELL_AUDIO_PORT_MAX];
++static u64 s_clock_generation;
++static u64 s_clock_device_position, s_clock_device_frequency, s_clock_device_qpc;
++static u32 s_clock_device_valid, s_clock_device_padding, s_clock_device_capacity;
++static void audio_clock_publish_locked(u32 port_num, int new_generation)
++{
++    const AudioPortSlot* port = &s_ports[port_num];
++    clock_snapshot_lock();
++    CellAudioClockSnapshot* out = &s_clock_snapshots[port_num];
++    if (new_generation) {
++        out->generation = ++s_clock_generation;
++        out->generation_start_us = ppu_system_time_us();
++    }
++    out->read_index = port->read_index;
++    out->presentation_us = port->timestamp_us;
++    out->sampled_guest_us = ppu_system_time_us();
++    out->running = port->in_use && port->running;
++    out->ready = out->running && port->clock_ready;
++    out->channels = (u32)port->param.nChannel;
++    out->blocks = (u32)port->param.nBlock;
++    out->port_addr = (u32)port->port_addr;
++    out->read_index_addr = (u32)port->read_idx_addr;
++    clock_snapshot_unlock();
++}
++static void audio_clock_observe_device(int valid, u64 position, u64 frequency, u64 qpc, u32 padding, u32 capacity)
++{
++    clock_snapshot_lock();
++    s_clock_device_valid = valid;
++    s_clock_device_position = position;
++    s_clock_device_frequency = frequency;
++    s_clock_device_qpc = qpc;
++    s_clock_device_padding = padding;
++    s_clock_device_capacity = capacity;
++    clock_snapshot_unlock();
++}
++s32 ps3_audio_get_clock_snapshot(u32 port_num, CellAudioClockSnapshot* out)
++{
++    if (!out || port_num >= CELL_AUDIO_PORT_MAX) return CELL_AUDIO_ERROR_PARAM;
++    clock_snapshot_lock();
++    *out = s_clock_snapshots[port_num];
++    out->device_valid = s_clock_device_valid;
++    out->device_position = s_clock_device_position;
++    out->device_frequency = s_clock_device_frequency;
++    out->device_qpc_100ns = s_clock_device_qpc;
++    out->padding_frames = s_clock_device_padding;
++    out->device_capacity_frames = s_clock_device_capacity;
++    out->query_guest_us = ppu_system_time_us();
++#ifdef _WIN32
++    LARGE_INTEGER qpc, frequency;
++    QueryPerformanceCounter(&qpc); QueryPerformanceFrequency(&frequency);
++    out->query_qpc_100ns = (u64)qpc.QuadPart / frequency.QuadPart * 10000000ull +
++        (u64)qpc.QuadPart % frequency.QuadPart * 10000000ull / frequency.QuadPart;
++#endif
++    clock_snapshot_unlock();
++    return CELL_OK;
++}
++
+ /* Only the GT6 CB59E8 before/after adapter can claim this queue. A permanent
+  * lock permits an old completion to be rejected after cellAudioQuit destroys
+  * s_audio_mutex. Lock order is audio mutex -> SGX lock; adapter APIs never take
+@@ -719,7 +789,7 @@ static void audio_clock_diag_locked(const char* event, u32 port_num, u64 tag, u6
+ 
+ /* AUDIO_FLOW_TRACE=<new file>: bounded producer/consumer evidence, not an A/V
+  * synchronization measurement. _AFTER_MS is relative to cellAudioInit and
+- * _DURATION_MS defaults to 10000 (maximum 30000); _PORT defaults to 0.
++ * _DURATION_MS defaults to 10000 (maximum 60000); _PORT defaults to 0.
+  * PCM hashes and records stay in bounded memory during the selected window.
+  * The file is reserved exclusively, then written after recording ends. */
+ int g_cell_audio_flow_trace_on;
+@@ -733,7 +803,7 @@ enum { AUDIO_FLOW_ZERO = 1, AUDIO_FLOW_REPEAT = 2, AUDIO_FLOW_CHANGED = 4,
+        AUDIO_FLOW_BAD_DEST = 8, AUDIO_FLOW_NO_SEQUENCE = 16,
+        AUDIO_FLOW_SGX_FIFO = 32, AUDIO_FLOW_FIFO_UNDERFLOW = 64 };
+ #ifdef _WIN32
+-enum { AUDIO_FLOW_CAP = 16384 };
++enum { AUDIO_FLOW_CAP = 32768 };
+ static int s_flow_state, s_flow_initialized;
+ static AudioFlowRecord* s_flow_records;
+ static u32 s_flow_count, s_flow_dropped, s_flow_port;
+@@ -823,7 +893,7 @@ static void audio_flow_init(void)
+     u32 after, duration;
+     if (strlen(path) >= sizeof s_flow_path ||
+         !audio_flow_env("AUDIO_FLOW_TRACE_AFTER_MS", 0, 86400000, &after) ||
+-        !audio_flow_env("AUDIO_FLOW_TRACE_DURATION_MS", 10000, 30000, &duration) || !duration ||
++        !audio_flow_env("AUDIO_FLOW_TRACE_DURATION_MS", 10000, 60000, &duration) || !duration ||
+         !audio_flow_env("AUDIO_FLOW_TRACE_PORT", 0, CELL_AUDIO_PORT_MAX-1, &s_flow_port)) {
+         fprintf(stderr, "[audio-flow] invalid path/window/port; disabled\n"); return;
+     }
+@@ -1129,6 +1199,8 @@ static void audio_mix_one_block(void)
+         port->read_index++;
+         port->timestamp_us = s_mix_present_us +
+             (u64)CELL_AUDIO_BLOCK_SAMPLES * 1000000ULL / CELL_AUDIO_SAMPLE_RATE;
++        port->clock_ready = 1;
++        audio_clock_publish_locked((u32)p, 0);
+         if (port->read_index == 1)
+             audio_clock_diag_locked("first_consume", p, 0, s_mix_present_us, 0);
+         if (port->read_idx_addr)
+@@ -1348,6 +1420,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+ #endif
+         blocks++;
+         /* Mix and submit one block */
++#if AUDIO_BACKEND_WASAPI
++        audio_clock_observe_device(clock_valid, position, s_wasapi_clock_frequency,
++                                   position_qpc, s_wasapi_padding, s_wasapi_buf_frames);
++#endif
+         audio_flow_begin_block();
+         audio_mix_one_block();
+ #if AUDIO_BACKEND_WASAPI
+@@ -1505,6 +1581,9 @@ s32 cellAudioInit(void)
+         return CELL_AUDIO_ERROR_ALREADY_INIT;
+ 
+     memset(s_ports, 0, sizeof(s_ports));
++    for (u32 i = 0; i < CELL_AUDIO_PORT_MAX; ++i)
++        audio_clock_publish_locked(i, 1);
++    audio_clock_observe_device(0, 0, 0, 0, 0, 0);
+     memset(s_notify_queues, 0, sizeof(s_notify_queues));
+     mutex_init(&s_audio_mutex);
+     audio_sgx_port_changed(0, 1);
+@@ -1548,6 +1627,8 @@ s32 cellAudioQuit(void)
+         s_ports[i].buffer = NULL;
+         s_ports[i].in_use = 0;
+         s_ports[i].running = 0;
++        s_ports[i].clock_ready = 0;
++        audio_clock_publish_locked((u32)i, 1);
+     }
+     audio_sgx_port_changed(0, 1);
+ 
+@@ -1612,6 +1693,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
+     port->write_index = 0;
+     port->timestamp_us = ppu_system_time_us();
+     port->hold_count = 0;
++    port->clock_ready = 0;
+ 
+     /* Allocate the audio buffer in GUEST memory so portAddr/readIndexAddr are
+      * real guest addresses (the game's mixer -- FMOD here -- writes PCM there
+@@ -1638,6 +1720,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
+ 
+     port->port_addr     = guest_buf;
+     port->read_idx_addr = guest_ridx;
++    audio_clock_publish_locked((u32)found, 1);
+     audio_sgx_port_changed((u32)found, 1);
+ 
+     vm_write32(portNum_ea, (u32)found);   /* guest out-param */
+@@ -1670,6 +1753,8 @@ s32 cellAudioPortClose(u32 portNum)
+ 
+     s_ports[portNum].in_use  = 0;
+     s_ports[portNum].running = 0;
++    s_ports[portNum].clock_ready = 0;
++    audio_clock_publish_locked(portNum, 1);
+     audio_sgx_port_changed(portNum, 1);
+ 
+     mutex_unlock(&s_audio_mutex);
+@@ -1692,6 +1777,8 @@ s32 cellAudioPortStart(u32 portNum)
+     mutex_lock(&s_audio_mutex);
+     s_ports[portNum].timestamp_us = ppu_system_time_us();
+     s_ports[portNum].running = 1;
++    s_ports[portNum].clock_ready = 0;
++    audio_clock_publish_locked(portNum, 1);
+     audio_clock_diag_locked("start", portNum, s_ports[portNum].read_index, s_ports[portNum].timestamp_us, UINT64_MAX);
+     audio_sgx_port_changed(portNum, 0);
+     mutex_unlock(&s_audio_mutex);
+@@ -1714,6 +1801,8 @@ s32 cellAudioPortStop(u32 portNum)
+ 
+     mutex_lock(&s_audio_mutex);
+     s_ports[portNum].running = 0;
++    s_ports[portNum].clock_ready = 0;
++    audio_clock_publish_locked(portNum, 1);
+     audio_sgx_port_changed(portNum, 0);
+     mutex_unlock(&s_audio_mutex);
+ 
+diff --git a/libs/audio/cellAudio.h b/libs/audio/cellAudio.h
+index a7a39c3..86f9136 100644
+--- a/libs/audio/cellAudio.h
++++ b/libs/audio/cellAudio.h
+@@ -109,6 +109,19 @@ s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
+ /* NID: 0x4109D08C */
+ s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp);
+ 
++/* Host-only observation, not a guest SDK export. The generation changes at
++ * Open/Start/Stop/Close. presentation_us is the device time of read_index
++ * (the end of the last consumed block), in the guest system-time epoch.
++ * The persistent snapshot lock remains valid after cellAudioQuit. */
++typedef struct CellAudioClockSnapshot {
++    u64 generation, generation_start_us, read_index, presentation_us, sampled_guest_us;
++    u64 query_guest_us, query_qpc_100ns;
++    u64 device_position, device_frequency, device_qpc_100ns;
++    u32 running, ready, channels, blocks;
++    u32 port_addr, read_index_addr, padding_frames, device_valid, device_capacity_frames;
++} CellAudioClockSnapshot;
++s32 ps3_audio_get_clock_snapshot(u32 portNum, CellAudioClockSnapshot* snapshot);
++
+ /* NID: 0x56DFE179; the HLE context adapter reads level from PPU f1. */
+ s32 cellAudioSetPortLevel(u32 portNum, float level);
+ 
+diff --git a/libs/audio/tests/test_audio_clock_snapshot.c b/libs/audio/tests/test_audio_clock_snapshot.c
+new file mode 100644
+index 0000000..dcab7bb
+--- /dev/null
++++ b/libs/audio/tests/test_audio_clock_snapshot.c
+@@ -0,0 +1,62 @@
++/* Permanent snapshot lifetime and per-port generation, with the real mixer.
++ * Only synthetic guest VM is used. No backend, device, game or HDD is opened. */
++#define main unused_audio_ring_main
++#include "test_audio_ring.c"
++#undef main
++
++int main(void)
++{
++    vm_base = VirtualAlloc(NULL, VM_TOTAL_SIZE, MEM_RESERVE, PAGE_NOACCESS);
++    assert(vm_base && vm_commit(0, 0x10000) == CELL_OK);
++    mutex_init(&s_audio_mutex);
++    s_audio_initialized = 1;
++    vm_write64(0x100, 2); vm_write64(0x108, 8);
++    vm_write64(0x110, 0);
++    CellAudioClockSnapshot first, active, stopped, restarted, closed, reused;
++    assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_OK);
++    assert(ps3_audio_get_clock_snapshot(0, &first) == CELL_OK);
++    assert(first.generation && !first.running && !first.ready && first.read_index == 0);
++    assert(first.channels == 2 && first.blocks == 8);
++    assert(cellAudioPortStart(0) == CELL_OK);
++    assert(ps3_audio_get_clock_snapshot(0, &active) == CELL_OK);
++    assert(active.generation != first.generation && active.running && !active.ready);
++    audio_clock_observe_device(1, 96000, 48000, 20000000, 1920, 2560);
++    s_mix_present_us = test_clock_us + 40000;
++    audio_mix_one_block();
++    assert(ps3_audio_get_clock_snapshot(0, &active) == CELL_OK);
++    assert(active.ready && active.read_index == 1);
++    assert(active.presentation_us == test_clock_us + 40000 + 256000000 / 48000);
++    assert(active.device_valid && active.device_position == 96000);
++    assert(active.device_frequency == 48000 && active.device_qpc_100ns == 20000000);
++    assert(active.query_guest_us == test_clock_us && active.padding_frames == 1920);
++    assert(active.device_capacity_frames == 2560 && active.generation_start_us == test_clock_us);
++    assert(cellAudioPortStop(0) == CELL_OK);
++    assert(ps3_audio_get_clock_snapshot(0, &stopped) == CELL_OK);
++    assert(!stopped.running && !stopped.ready && stopped.generation != active.generation);
++    test_clock_us += 10000000;
++    assert(cellAudioPortStart(0) == CELL_OK);
++    assert(ps3_audio_get_clock_snapshot(0, &restarted) == CELL_OK);
++    assert(restarted.generation != stopped.generation && !restarted.ready);
++    assert(restarted.generation_start_us == test_clock_us);
++    assert(restarted.read_index == 1); /* count is not reset by a restart */
++    s_mix_present_us = test_clock_us + 21333;
++    audio_mix_one_block();
++    assert(ps3_audio_get_clock_snapshot(0, &restarted) == CELL_OK);
++    assert(restarted.ready && restarted.read_index == 2);
++    assert(restarted.presentation_us == s_mix_present_us + 256000000 / 48000);
++    assert(cellAudioPortClose(0) == CELL_OK);
++    assert(ps3_audio_get_clock_snapshot(0, &closed) == CELL_OK);
++    assert(!closed.running && !closed.ready && closed.generation != restarted.generation);
++    assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_OK);
++    assert(ps3_audio_get_clock_snapshot(0, &reused) == CELL_OK);
++    assert(reused.generation != closed.generation && reused.read_index == 0 && !reused.ready);
++    assert(reused.port_addr == first.port_addr); /* same EA does not mean same lifetime */
++    assert(cellAudioQuit() == CELL_OK);
++    assert(ps3_audio_get_clock_snapshot(0, &closed) == CELL_OK);
++    assert(!closed.running && !closed.ready && closed.generation != reused.generation);
++    assert(ps3_audio_get_clock_snapshot(CELL_AUDIO_PORT_MAX, &closed) == CELL_AUDIO_ERROR_PARAM);
++    assert(ps3_audio_get_clock_snapshot(0, NULL) == CELL_AUDIO_ERROR_PARAM);
++    VirtualFree(vm_base, 0, MEM_RELEASE);
++    puts("movie clock snapshot: actual consume, device fields, Stop/Start, reused EA, and post-Quit lifetime passed");
++    return 0;
++}
+diff --git a/libs/audio/tests/test_audio_flow_window.c b/libs/audio/tests/test_audio_flow_window.c
+new file mode 100644
+index 0000000..665a39e
+--- /dev/null
++++ b/libs/audio/tests/test_audio_flow_window.c
+@@ -0,0 +1,84 @@
++/* Real cellAudio diagnostic lifecycle on synthetic guest VM. No audio backend,
++ * mix thread, game or HDD is opened. Only the diagnostic file writer is used. */
++#define main unused_audio_ring_main
++#include "test_audio_ring.c"
++#undef main
++
++static void reset_flow_fixture(void)
++{
++    assert(!s_flow_state && !s_flow_records && !s_flow_file && !s_flow_writer);
++    s_flow_initialized = 0; s_flow_count = s_flow_dropped = 0;
++    s_flow_mix_frame = s_flow_next_frame = 0;
++    s_flow_wav_qpc = s_flow_wav_mix_frame = s_flow_wav_frames = 0;
++    s_flow_wav_short_writes = 0;
++    memset(s_flow_previous_valid, 0, sizeof s_flow_previous_valid);
++}
++static void check_saved(const char* path, const char* reason, unsigned expected)
++{
++    FILE* file = fopen(path, "rb"); assert(file);
++    char line[2048], expected_end[128]; unsigned records = 0, footer = 0;
++    snprintf(expected_end, sizeof expected_end, "# end reason=%s records=%u dropped=0", reason, expected);
++    while (fgets(line, sizeof line, file)) {
++        if (line[0] == 'P' || line[0] == 'C') ++records;
++        if (strstr(line, expected_end)) ++footer;
++    }
++    assert(!ferror(file) && !fclose(file));
++    assert(records == expected && footer == 1);
++}
++int main(int argc, char** argv)
++{
++    assert(argc == 2); // caller-selected disposable output directory
++    vm_base = VirtualAlloc(NULL, VM_TOTAL_SIZE, MEM_RESERVE, PAGE_NOACCESS);
++    assert(vm_base && vm_commit(0, 0x10000) == CELL_OK);
++    mutex_init(&s_audio_mutex); s_audio_initialized = 1;
++    vm_write64(0x100, 2); vm_write64(0x108, 8); vm_write64(0x110, 0);
++    assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_OK);
++    assert(cellAudioPortStart(0) == CELL_OK);
++    char deadline_path[1024], quit_path[1024];
++    snprintf(deadline_path, sizeof deadline_path, "%s/flow_%lu_%llu_deadline.txt", argv[1], (unsigned long)GetCurrentProcessId(), (unsigned long long)GetTickCount64());
++    snprintf(quit_path, sizeof quit_path, "%s/flow_%lu_%llu_quit.txt", argv[1], (unsigned long)GetCurrentProcessId(), (unsigned long long)GetTickCount64());
++    assert(!_putenv_s("AUDIO_FLOW_TRACE", deadline_path));
++    assert(!_putenv_s("AUDIO_FLOW_TRACE_AFTER_MS", "0"));
++    assert(!_putenv_s("AUDIO_FLOW_TRACE_PORT", "0"));
++    assert(!_putenv_s("AUDIO_FLOW_TRACE_DURATION_MS", "60001"));
++    audio_flow_init();
++    assert(!s_flow_state && !s_flow_file && !s_flow_records);
++    assert(GetFileAttributesA(deadline_path) == INVALID_FILE_ATTRIBUTES);
++
++    reset_flow_fixture();
++    assert(!_putenv_s("AUDIO_FLOW_TRACE_DURATION_MS", "40000"));
++    audio_flow_init();
++    assert(s_flow_state && s_flow_file && s_flow_records);
++    assert(s_flow_end - s_flow_start == s_flow_freq * 40);
++    assert(AUDIO_FLOW_CAP == 32768);
++    // Sixty seconds at 48k/256 produces 11,250 producer+consumer pairs.
++    // Drive the actual record/mixer paths quickly; this is not a cadence test.
++    for (unsigned i = 0; i < 11250; ++i) {
++        audio_flow_begin_block();
++        const u32 slot = (u32)(s_ports[0].read_index % 8);
++        cellAudio_trace_producer((u32)s_ports[0].port_addr + slot * 2048, slot, i, 1);
++        s_mix_present_us = test_clock_us;
++        audio_mix_one_block();
++        audio_flow_note_wav(256);
++    }
++    assert(s_flow_count == 22500 && !s_flow_dropped);
++    s_flow_end = audio_flow_qpc() - 1; // deterministic expiry, no 40-second sleep
++    audio_flow_begin_block(); audio_flow_quit();
++    assert(!g_cell_audio_flow_trace_on && !s_flow_state && !s_flow_records && !s_flow_file && !s_flow_writer);
++    check_saved(deadline_path, "deadline", 22500);
++
++    reset_flow_fixture();
++    assert(!_putenv_s("AUDIO_FLOW_TRACE", quit_path));
++    assert(!_putenv_s("AUDIO_FLOW_TRACE_DURATION_MS", "60000"));
++    audio_flow_init(); assert(s_flow_end - s_flow_start == s_flow_freq * 60);
++    audio_flow_begin_block(); audio_mix_one_block(); audio_flow_note_wav(256);
++    assert(s_flow_count == 1 && !s_flow_dropped);
++    assert(cellAudioQuit() == CELL_OK);
++    assert(!g_cell_audio_flow_trace_on && !s_flow_state && !s_flow_records && !s_flow_file && !s_flow_writer);
++    // Disabled late probes must not touch the now-destroyed audio mutex.
++    cellAudio_trace_producer(0, 0, 0, 0); audio_flow_begin_block(); audio_flow_quit();
++    check_saved(quit_path, "audio_quit_before_deadline", 1);
++    VirtualFree(vm_base, 0, MEM_RELEASE);
++    puts("audio FLOW: 40000/60000 admitted, 60001 rejected; 22500 records fit, no drops; deadline/quit flush and late-probe lifetime passed");
++    return 0;
++}
+diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
+index a36e33c..26c9d0f 100644
+--- a/libs/codec/cellVdec.c
++++ b/libs/codec/cellVdec.c
+@@ -13,6 +13,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <stdatomic.h>
+ #include "vdec_ffmpeg.h"
+ #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
+ #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
+@@ -87,6 +88,16 @@ typedef struct {
+ static VdecSlot s_vdec[MAX_VDEC];
+ static CodecCallbackOwner s_vdec_callbacks[MAX_VDEC];
+ 
++/* Host scheduling observation only: no guest export or callback. The renderer
++ * must not acquire the decoder lock while it is doing GPU work, since a decode
++ * can hold that lock across a device call. Keep the successful Open/Close
++ * lifetime in a separate atomic mask, including EndSeq's queued pictures. */
++static atomic_uint s_vdec_host_open_mask;
++int ps3_vdec_has_open_decoder(void)
++{
++    return atomic_load_explicit(&s_vdec_host_open_mask, memory_order_acquire) != 0;
++}
++
+ /* The handle the guest sees is the slot index plus one, never 0: some
+  * titles treat a 0 handle as "no decoder open".
+  * Killzone 2's movie player keeps the handle as its "decoder open" flag and
+@@ -297,6 +308,7 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
+             if (!s_vdec[i].cbGeneration) {
+                 s_vdec[i].in_use = 0; VDEC_UNLOCK(); return (s32)CELL_VDEC_ERROR_FATAL;
+             }
++            atomic_fetch_or_explicit(&s_vdec_host_open_mask, 1u << i, memory_order_release);
+             s_vdec[i].ff = vdec_ff_open(codec_type);
+             VDEC_UNLOCK();
+             vm_write32((u32)(uintptr_t)handle, (u32)VDEC_HANDLE_OF(i));
+@@ -343,6 +355,7 @@ s32 cellVdecClose(CellVdecHandle handle)
+         s_vdec[handle].ff = NULL;
+     }
+     s_vdec[handle].in_use = 0;
++    atomic_fetch_and_explicit(&s_vdec_host_open_mask, ~(1u << handle), memory_order_release);
+     VDEC_UNLOCK();
+     return CELL_OK;
+ }
+diff --git a/libs/codec/cellVdec.h b/libs/codec/cellVdec.h
+index 8137f58..207eae3 100644
+--- a/libs/codec/cellVdec.h
++++ b/libs/codec/cellVdec.h
+@@ -119,6 +119,10 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem);
+ 
+ s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode);
+ 
++/* Host-only, lock-free scheduling hint. Remains true through EndSeq until all
++ * opened decoders close; does not modify playback or expose a guest HLE NID. */
++int ps3_vdec_has_open_decoder(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libs/codec/tests/test_vdec_callbacks.c b/libs/codec/tests/test_vdec_callbacks.c
+index 23ea266..a244ac6 100644
+--- a/libs/codec/tests/test_vdec_callbacks.c
++++ b/libs/codec/tests/test_vdec_callbacks.c
+@@ -55,7 +55,11 @@ int main(void)
+ {
+     _putenv_s("VDEC_IDLE_DRAIN_MS","0");vm_base=(u8*)calloc(1,32u*1024u*1024u);ppu_vm_size=32u*1024u*1024u;CHECK(vm_base);
+     vm_write32(0x1100,1);vm_write32(0x1120,0x1000);vm_write32(0x1124,0x1234);vm_write32(0x1500,3);
++    CHECK(!ps3_vdec_has_open_decoder());
++    CHECK(cellVdecOpen(0,0,0,(u32*)0x1140)==(s32)CELL_VDEC_ERROR_ARG);
++    CHECK(!ps3_vdec_has_open_decoder());
+     CHECK(cellVdecOpen((CellVdecType*)0x1100,0,(CellVdecCb*)0x1120,(u32*)0x1140)==0&&vm_read32(0x1140)==1);
++    CHECK(ps3_vdec_has_open_decoder());
+     for(u32 seq=0;seq<2;seq++) {
+         CHECK(cellVdecStartSeq(1)==0);picture_in_sequence=0;
+         for(u32 i=0;i<100;i++) {
+@@ -66,11 +70,18 @@ int main(void)
+             wait_for(&pictures,(LONG)(seq*100+i+1));
+         }
+         CHECK(cellVdecEndSeq(1)==0);wait_for(&seqdone,seq+1);
++        CHECK(ps3_vdec_has_open_decoder()); /* drain/end must not release scheduling */
+     }
+     CHECK(cellVdecStartSeq(1)==0);fail_decode=1;
+     CHECK(cellVdecDecodeAu(1,0,(CellVdecAuInfo*)0x1200)==(s32)CELL_VDEC_ERROR_FATAL);wait_for(&errors,1);
+     CHECK(audone==200&&pictures==200);
+     CHECK(cellVdecDecodeAu(1,0,(CellVdecAuInfo*)0x1200)==(s32)CELL_VDEC_ERROR_SEQ);
+-    CHECK(cellVdecClose(1)==0);free(vm_base);
+-    puts("PASS cellVdec DecodeAu guest-mutex reentry, GetPicItem/GetPicture callback reentry, ordered AU/PIC/SEQ, restart");return 0;
++    CHECK(cellVdecOpenEx((CellVdecType*)0x1100,0,0,(u32*)0x1144)==0&&vm_read32(0x1144)==2);
++    CHECK(cellVdecClose(1)==0&&ps3_vdec_has_open_decoder());
++    CHECK(cellVdecClose(1)==(s32)CELL_VDEC_ERROR_ARG&&ps3_vdec_has_open_decoder());
++    CHECK(cellVdecClose(2)==0&&!ps3_vdec_has_open_decoder());
++    CHECK(cellVdecOpen((CellVdecType*)0x1100,0,0,(u32*)0x1140)==0&&vm_read32(0x1140)==1);
++    CHECK(ps3_vdec_has_open_decoder());
++    CHECK(cellVdecClose(1)==0&&!ps3_vdec_has_open_decoder());free(vm_base);
++    puts("PASS cellVdec callback reentry, ordered AU/PIC/SEQ, restart, host lifetime across invalid calls/EndSeq/multiple decoders/slot reuse");return 0;
+ }
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index d5dd703..39d652f 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -38,6 +38,8 @@ void rsx_live_draw_set_display_buffer(
+ { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
+ void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
+ void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
++void rsx_live_draw_set_preparation_paused(int paused) { (void)paused; }
++void rsx_live_draw_set_video_active(int active) { (void)active; }
+ void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
+ { (void)d; (void)o; (void)v; }
+ int  rsx_live_draw_blit(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u32 h)
+@@ -121,7 +123,11 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ #include "rsx_present_copy.h"
+ #include "rsx_vertex_formats.h"
+ #include "rsx_vertex_pull.h"
++#include "rsx_shader_prepare.h"
+ #include "rsx_texture_typed.h"
++#include "rsx_sampler_key_index.h"
++#include "rsx_surface_key_index.h"
++#include "rsx_texture_watch_policy.h"
+ #include "rsx_live_texture_metadata.h"
+ #include <sys/stat.h>
+ 
+@@ -203,6 +209,7 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ 
+ #define SMP_DEFAULT      0
+ #define SMP_CACHE_SLOTS  MAX_SAMPLERS
++_Static_assert(SMP_CACHE_SLOTS <= RSX_SAMPLER_KEY_CAPACITY, "sampler key index capacity");
+ #define SMP_TABLE_SIZE   16
+ /* A shader-visible SAMPLER heap is hard-capped at 2048 descriptors by D3D12
+  * (D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE). SMP_RING_TABLES*SMP_TABLE_SIZE
+@@ -311,6 +318,7 @@ typedef struct {
+     u64 last_use_serial;
+     u32 ww_gen;               /* write-watch generation of the last hash, 0 = unknown (ld_ww_*) */
+     u32 ww_skips;             /* hashes skipped since the last full hash (safety net at 128) */
++    rsx_texture_watch_policy watch_policy; /* per-descriptor admission; reset with the entry */
+     u32 volume;               /* depth of a 3D texture, 0 = not one [GT6 0036] */
+ } texcache_t;
+ typedef struct {
+@@ -345,6 +353,7 @@ typedef struct {
+ typedef struct {
+     int              enabled;    /* RSX_DRAW resolved                     */
+     int              ready;      /* device + resources up                    */
++    int              video_active; /* owner-thread decoder lifetime; default admissions only */
+ 
+     ID3D12Device*              dev;
+     ID3D12CommandQueue*        queue;
+@@ -362,6 +371,8 @@ typedef struct {
+ 
+     surface_t                  surfaces[MAX_SURFACES];
+     u32                        n_surfaces;
++    rsx_surface_key_index      surface_keys;
++    int                        surface_key_index_failed;
+     display_buffer_t           display_buffers[8];
+ 
+     ID3D12DescriptorHeap*      dsv_heap;
+@@ -376,6 +387,10 @@ typedef struct {
+     u32                        srv_step, srv_ring_used;
+     ID3D12Resource*            white_tex;
+     texcache_t                 textures[MAX_TEXTURES];
++    struct {
++        u32 active, report_frame;
++        u64 entered, returned, reset, direct_hashes;
++    } texture_watch;
+     u32                        n_textures;
+     vtexcache_t                vtex[MAX_VTEX];
+     u32                        n_vtex;
+@@ -403,6 +418,7 @@ typedef struct {
+     u32                        smp_ring_slots[SMP_RING_TABLES][SMP_TABLE_SIZE];
+     u64                        smp_keys[SMP_CACHE_SLOTS];
+     u32                        n_samplers;
++    rsx_sampler_key_index      smp_key_index;
+ 
+     ID3D12RootSignature*       rootsig_x;
+     ID3D12RootSignature*       depth_snapshot_rootsig;
+@@ -1950,8 +1966,10 @@ static D3D12_GPU_DESCRIPTOR_HANDLE srv_table(const u32 slots[SRV_TABLE_SIZE])
+     const UINT dst_size = SRV_TABLE_SIZE;
+     g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &dst);
+     dst.ptr += (size_t)base * g.srv_step;
++    /* One immutable heap base for this copy; slot selection is unchanged. */
++    const D3D12_CPU_DESCRIPTOR_HANDLE src_base = srv_cpu(0);
+     for (u32 i = 0; i < SRV_TABLE_SIZE; i++)
+-        src[i] = srv_cpu(slots[i]);
++        src[i].ptr = src_base.ptr + (size_t)slots[i] * g.srv_step;
+     g.dev->lpVtbl->CopyDescriptors(
+         g.dev, 1, &dst, &dst_size, SRV_TABLE_SIZE, src, NULL,
+         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+@@ -1997,8 +2015,9 @@ static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
+ }
+ static u32 sampler_slot(const rsx_dsp_texture* t, u64 key)
+ {
+-    for (u32 i = 0; i < g.n_samplers; i++)
+-        if (g.smp_keys[i] == key) return 1 + i;
++    const u32 cached = rsx_sampler_key_find(
++        &g.smp_key_index, g.smp_keys, g.n_samplers, key);
++    if (cached != RSX_SAMPLER_KEY_NOT_FOUND) return 1u + cached;
+     if (g.n_samplers >= SMP_CACHE_SLOTS) return SMP_DEFAULT;
+     D3D12_SAMPLER_DESC sd = decode_sampler(t);
+     const u32 slot = 1 + g.n_samplers;
+@@ -2066,8 +2085,9 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
+     const UINT dst_size = SMP_TABLE_SIZE;
+     g.smp_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.smp_heap, &dst);
+     dst.ptr += (size_t)base * g.smp_step;
++    const D3D12_CPU_DESCRIPTOR_HANDLE src_base = smp_cpu(0);
+     for (u32 i = 0; i < SMP_TABLE_SIZE; i++)
+-        src[i] = smp_cpu(slots[i]);
++        src[i].ptr = src_base.ptr + (size_t)slots[i] * g.smp_step;
+     g.dev->lpVtbl->CopyDescriptors(
+         g.dev, 1, &dst, &dst_size, SMP_TABLE_SIZE, src, NULL,
+         D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+@@ -3786,6 +3806,61 @@ static void tex_hash_link(u32 index)
+     g_tex_hash_linked[index] = 1;
+ }
+ 
++/* Frequently changing textures pay for a full hash after every watch anyway.
++ * Four successful dirty refreshes select direct hashing; two unchanged hashes
++ * return to the watch. Only admission changes, never hashing or GPU decoding.
++ * A direct-hash entry has no valid watch generation: resuming requires a new
++ * harvest BEFORE a full hash, even if another consumer harvested its pages. */
++static int ld_tex_ww_adaptive_on(void)
++{
++    static int mode = -2; /* -1: decoder lifetime, 0/1: explicit global override */
++    if (mode == -2) {
++        const char* e = getenv("LD_TEX_WW_ADAPTIVE");
++        mode = e && e[0] == '0' && !e[1] ? 0 :
++               e && e[0] == '1' && !e[1] ? 1 : -1;
++        fprintf(stderr, "[tex-watch-adapt] %s (4 dirty refreshes -> hash; 2 unchanged -> watch; LD_TEX_WW_ADAPTIVE=0/1 forces global off/on)\n",
++                mode < 0 ? "movie-only default" : mode ? "global on" : "global off");
++    }
++    return mode < 0 ? g.video_active : mode;
++}
++
++static void ld_tex_ww_adaptive_note(texcache_t* entry,
++                                   rsx_texture_watch_result result,
++                                   int watched_dirty)
++{
++    const int transition = rsx_texture_watch_observe(
++        &entry->watch_policy, result, watched_dirty);
++    /* Never label an unharvested interval clean. Failures also retain the old
++     * resource and force another hash/refresh attempt on the next frame. */
++    if (entry->watch_policy.direct_hash || transition < 0 ||
++        result == RSX_TEX_WATCH_FAILED)
++        entry->ww_gen = 0;
++    if (transition > 0) {
++        g.texture_watch.active++;
++        g.texture_watch.entered++;
++    } else if (transition < 0) {
++        if (g.texture_watch.active) g.texture_watch.active--;
++        if (result == RSX_TEX_WATCH_UNCHANGED) g.texture_watch.returned++;
++        else g.texture_watch.reset++;
++    }
++    const u64 transitions = g.texture_watch.entered +
++        g.texture_watch.returned + g.texture_watch.reset;
++    if ((transition && transitions <= 8u) ||
++        (g.texture_watch.direct_hashes &&
++         (u32)(g_ld_frames - g.texture_watch.report_frame) >= 300u)) {
++        fprintf(stderr, "[tex-watch-adapt] frame=%u active=%u entered=%llu returned=%llu reset=%llu direct-hash=%llu src=%u:0x%08X fmt=0x%02X %ux%u mode=%s\n",
++                g_ld_frames, g.texture_watch.active,
++                (unsigned long long)g.texture_watch.entered,
++                (unsigned long long)g.texture_watch.returned,
++                (unsigned long long)g.texture_watch.reset,
++                (unsigned long long)g.texture_watch.direct_hashes,
++                entry->location, entry->offset, entry->format,
++                entry->width, entry->height,
++                entry->watch_policy.direct_hash ? "hash" : "watch");
++        g.texture_watch.report_frame = g_ld_frames;
++    }
++}
++
+ /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
+  * descriptor-only cache, re-hash the source once per frame and refresh the
+  * D3D resource when the game rewrites the same guest address. */
+@@ -3823,7 +3898,14 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+              * texture's pages were written since its last hash. */
+             u32 ww_now = 0;
+             int ww_clean = 0;
+-            if (ld_ww_enabled()) {
++            const int ww_enabled = ld_ww_enabled();
++            const int adaptive = ww_enabled && ld_tex_ww_adaptive_on();
++            const int direct_hash = adaptive && entry->watch_policy.direct_hash;
++            if (direct_hash) {
++                entry->ww_gen = 0;
++                g.texture_watch.direct_hashes++;
++            }
++            if (ww_enabled && !direct_hash) {
+                 const u32 span = texture_source_span(t);
+                 const u8* src = span ? guest_ptr(t->location, t->offset, span) : NULL;
+                 if (src && (ww_now = ld_ww_harvest(src, span)) != 0)
+@@ -3832,6 +3914,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+                 ld_ww_stats();
+             }
+             if (ww_clean && entry->ww_skips < 128u) {
++                if (adaptive) ld_tex_ww_adaptive_note(entry, RSX_TEX_WATCH_CLEAN, 0);
+                 entry->ww_skips++;
+                 g_ww_skips++;
+                 entry->last_hash_frame = g_ld_frames;
+@@ -3841,6 +3924,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+             entry->ww_skips = 0;
+             int readable = 0;
+             const u64 hash = texture_content_hash(t, &readable);
++            const int changed = readable && hash != entry->content_hash;
++            int refresh_succeeded = !changed;
+             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
+              * reads are microseconds apart, so they can only disagree if a
+              * guest thread is writing this texture right now -- i.e. we are
+@@ -3904,6 +3989,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+                     decode_guest_texture_profiled(t, remap);
+                 g_tex_reuse = NULL;
+                 if (replacement && replacement == entry->tex) {
++                    refresh_succeeded = 1;
+                     entry->content_hash = hash;
+                     static u32 refresh_inplace = 0;
+                     refresh_inplace++;
+@@ -3912,6 +3998,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+                                 refresh_inplace, g_ld_frames, t->location, t->offset, t->format, t->width, t->height);
+                 } else
+                 if (replacement) {
++                    refresh_succeeded = 1;
+                     ID3D12Resource* old = entry->tex;
+                     entry->tex = replacement;
+                     entry->content_hash = hash;
+@@ -3927,6 +4014,13 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+                                 t->format, t->width, t->height);
+                 }
+             }
++            if (adaptive) {
++                const rsx_texture_watch_result result =
++                    !readable || !refresh_succeeded || (!direct_hash && !ww_now)
++                        ? RSX_TEX_WATCH_FAILED
++                        : changed ? RSX_TEX_WATCH_UPDATED : RSX_TEX_WATCH_UNCHANGED;
++                ld_tex_ww_adaptive_note(entry, result, ww_now != 0 && !ww_clean);
++            }
+         }
+         entry->last_use_serial = ++g_ld_texture_use_serial;
+         return entry->tex ? SRV_TEXTURE_BASE + i : SRV_WHITE;
+@@ -3995,6 +4089,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+         if (evicted)
+             retire_texture(evicted);
+         tex_hash_unlink(index);
++        if (entry->watch_policy.direct_hash)
++            ld_tex_ww_adaptive_note(entry, RSX_TEX_WATCH_FAILED, 0);
+         *entry = replacement;
+         tex_hash_link(index);
+         write_texture_srv(index, entry);
+@@ -4237,6 +4333,53 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
+ /* fp constants are stored as raw bits; the shader reads them as floats. */
+ static float ld_c2f(u32 bits) { float f; memcpy(&f, &bits, sizeof f); return f; }
+ 
++/* Candidate membership only: every call still evaluates live dimensions,
++ * formats, self-target rules and draw generations in the original slot order. */
++_Static_assert(MAX_SURFACES == RSX_SURFACE_KEY_CAPACITY, "surface key index capacity");
++
++static int ld_surface_key_index_on(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char* e = getenv("LD_SURFACE_KEY_INDEX");
++        on = !(e && e[0] == '0' && !e[1]);
++        fprintf(stderr, "[surface-index] %s (LD_SURFACE_KEY_INDEX=0 restores linear candidates)\n",
++                on ? "exact-address candidates" : "linear candidates");
++    }
++    return on;
++}
++
++static int ld_fragment_surface_find(const rsx_dsp_texture* t, u32 target, u32 tb_want, int by_fmt, int self_exact)
++{
++    int sampled = -1;
++    if (self_exact) return sampled;
++    const int indexed = ld_surface_key_index_on() && !g.surface_key_index_failed;
++    const u32 first = indexed
++        ? rsx_surface_key_first(&g.surface_keys, t->location, t->offset) : 0u;
++    for (int pass = by_fmt ? 0 : 1; pass < 2 && sampled < 0 && !self_exact; pass++) {
++        u32 best_gen = 0;
++        for (u32 i = first; i < g.n_surfaces;
++             i = indexed ? rsx_surface_key_next(&g.surface_keys, i) : i + 1u) {
++            const surface_t* sf_i = &g.surfaces[i];
++            if (sf_i->location != t->location || sf_i->offset != t->offset ||
++                i == target)
++                continue;
++            if (pass == 0 && (sf_i->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u) != tb_want)
++                continue;
++            if (sf_i->w == t->width && sf_i->h == t->height) { sampled = (int)i; break; }
++            if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
++                sampled = (int)i;
++                best_gen = sf_i->last_draw_generation;
++            }
++        }
++        if (pass == 0 && sampled < 0 && g.surfaces[target].location == t->location &&
++            g.surfaces[target].offset == t->offset &&
++            (g.surfaces[target].fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u) == tb_want)
++            break;                                    /* the target is the surface of that kind */
++    }
++    return sampled;
++}
++
+ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+                        DXGI_FORMAT want_fmt)
+ {
+@@ -4341,6 +4484,10 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+     ld_mirror_drop_surface(s);              /* pixels of the old resource that guest memory never got */
+     s->tex = replacement;
+     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
++    /* The sole surface-address mutation site. Failed allocations leave both
++     * surface membership and this index unchanged; g's reset clears both. */
++    if (!rsx_surface_key_set(&g.surface_keys, slot, location, offset))
++        g.surface_key_index_failed = 1; /* capacity mismatch: preserve linear correctness */
+     s->fmt = want_fmt;
+ #if !defined(YZ_PERF_CLEAN)
+     s->resource_serial = ++g_ld_surface_resource_serial;
+@@ -6568,6 +6715,51 @@ static int sampler_table_needs_flush(const u32 slots[SMP_TABLE_SIZE])
+     return sampler_table_find(slots) < 0;
+ }
+ 
++void rsx_live_draw_set_preparation_paused(int paused)
++{
++    if (ld_prepare_set_paused(paused))
++        fprintf(stderr, "[preparation-control] paused=%d in_flight=%ld\n", paused != 0,
++                InterlockedCompareExchange(&g_ld_prepare_in_flight, 0, 0));
++}
++
++/* Decoder lifetime is independent of host-owned movie rendering and of a
++ * manual preparation pause. The host calls this on the renderer owner thread.
++ * Closing the decoder invalidates every direct-hash watch baseline, even for
++ * a global override: the next bind harvests before hashing, then may retrain. */
++void rsx_live_draw_set_video_active(int active)
++{
++    const int on = active != 0;
++    if (g.video_active != on) {
++        g.video_active = on;
++        u32 reset = 0;
++        if (!on) {
++            for (u32 i = 0; i < g.n_textures; i++) {
++                texcache_t* entry = &g.textures[i];
++                if (entry->watch_policy.direct_hash) {
++                    ld_tex_ww_adaptive_note(entry, RSX_TEX_WATCH_FAILED, 0);
++                    entry->ww_skips = 0;
++                    entry->last_hash_frame = g_ld_frames - 1u;
++                    reset++;
++                } else {
++                    rsx_texture_watch_reset(&entry->watch_policy);
++                }
++            }
++        }
++        fprintf(stderr, "[video-admission] active=%d reset-direct=%u (default policies follow decoder lifetime)\n", on, reset);
++    }
++    rsx_live_draw_set_preparation_paused(on);
++}
++
++static UINT ld_vs_compile_flags(void)
++{
++    static UINT flags = ~0u;
++    if (flags == ~0u) {
++        const char* e = getenv("RSX_VS_COMPILE_OPT");
++        flags = (e && *e == '1') ? 0u : D3DCOMPILE_SKIP_OPTIMIZATION;
++    }
++    return flags;
++}
++
+ static u32 shader_disk_cache_stage_index(u32 stage)
+ {
+     return stage == 'V' ? 0u : 1u;
+@@ -6648,6 +6840,13 @@ static ID3DBlob* shader_disk_cache_load(
+ {
+     char path[MAX_PATH];
+     const u32 stage_index = shader_disk_cache_stage_index(stage);
++    if (stage == 'V') {
++        ID3DBlob* prepared = ld_sp_take(source, source_length, hash);
++        if (prepared) {
++            shader_disk_cache_progress(++g_ld_shader_disk_hits[stage_index]);
++            return prepared;
++        }
++    }
+     if (!shader_disk_cache_path(path, stage, hash, source_length))
+         return NULL;
+ 
+@@ -6664,6 +6863,7 @@ static ID3DBlob* shader_disk_cache_load(
+         header.magic == SHADER_DISK_CACHE_MAGIC &&
+         header.version == SHADER_DISK_CACHE_VERSION &&
+         header.stage == stage && header.source_hash == hash &&
++        (stage != 'V' || !header.reserved || header.reserved == ld_sp_cache_flags(ld_vs_compile_flags())) &&
+         header.source_length == source_length && source_length <= 256u * 1024u &&
+         header.blob_length > 0 &&
+         header.blob_length <= SHADER_DISK_CACHE_MAX_BLOB;
+@@ -6724,6 +6924,7 @@ static void shader_disk_cache_store(
+     header.stage = stage;
+     header.source_length = source_length;
+     header.blob_length = (u32)blob_length;
++    if (stage == 'V') header.reserved = ld_sp_cache_flags(ld_vs_compile_flags());
+     header.source_hash = hash;
+ 
+     FILE* file = fopen(temporary, "wb");
+@@ -7247,11 +7448,7 @@ static ID3D12PipelineState* build_pso(
+              * and a new scene brings dozens, all on the draw path). Skipping
+              * FXC's optimiser halves that; the driver optimises the DXBC
+              * again anyway. RSX_VS_COMPILE_OPT=1 restores the default. */
+-            static UINT vs_flags = ~0u;
+-            if (vs_flags == ~0u) {
+-                const char* e = getenv("RSX_VS_COMPILE_OPT");
+-                vs_flags = (e && *e == '1') ? 0u : D3DCOMPILE_SKIP_OPTIMIZATION;
+-            }
++            const UINT vs_flags = ld_vs_compile_flags();
+             const LONGLONG slow_vs = ld_slow_qpc();
+             vs_hr = D3DCompile(
+                 vs_hlsl, vs_length, "xvs", NULL, NULL, "main",
+@@ -8479,6 +8676,7 @@ static int ld_upload_pixel_constants(u32* out_offset)
+  * -----------------------------------------------------------------------*/
+ typedef struct { float a[16][4]; } vtx_t;
+ #include "rsx_draw_batches.h"
++#include "rsx_vertex_cache_admission.h"
+ typedef rsx_draw_batch batch_t;
+ 
+ typedef struct {
+@@ -8524,6 +8722,45 @@ static void dc_reset(void)
+     dc.fetch_ok = 1;
+     dc.inl = NULL; dc.inl_bytes = dc.inl_stride = 0;
+ }
++/* Keep tiny nonindexed arrays on the existing fresh-fetch path. The movie
++ * quad's changing source has no cache hits, but validating it can harvest a
++ * whole write-watch block. No texture freshness or vertex conversion changes.
++ * LD_VTX_CACHE_MIN_REFS=0 restores the original cache admission. */
++static int ld_vc_bypass_small_arrays(u32 prim)
++{
++    static int initialized, global_override;
++    static u32 limit = 32u, report_frame;
++    static u64 draws, references;
++    if (dc.n_idx || dc.inl || !dc.n_arr) return 0;
++    if (!initialized) {
++        initialized = 1;
++        const char* e = getenv("LD_VTX_CACHE_MIN_REFS");
++        if (e && *e) {
++            char* end = NULL;
++            const u64 parsed = strtoull(e, &end, 10);
++            if (end != e && !*end && parsed <= UINT32_MAX) {
++                limit = (u32)parsed;
++                global_override = 1;
++            }
++        }
++        fprintf(stderr, "[vcache-small] %s: fresh arrays up to %u refs (LD_VTX_CACHE_MIN_REFS=<n> is global; 0 restores admission)\n",
++                global_override ? "global override" : "movie-only default", limit);
++    }
++    if (!global_override && !g.video_active) return 0;
++    const u32 refs = rsx_vertex_cache_small_array_refs(
++        dc.arr, dc.n_arr, dc.n_idx, dc.inl != NULL, limit);
++    if (!refs) return 0;
++    draws++; references += refs;
++    if (draws <= 4u || g_ld_frames >= report_frame) {
++        fprintf(stderr, "[vcache-small] frame=%u bypass=%llu refs=%llu shape{prim=%u arrays=%u refs=%u first=%u+%u indexed=%u inline=%u}\n",
++            g_ld_frames, (unsigned long long)draws, (unsigned long long)references,
++            prim, dc.n_arr, refs, dc.arr[0].first, dc.arr[0].count,
++            dc.n_idx, dc.inl != NULL);
++        report_frame = g_ld_frames + 300u;
++    }
++    return 1;
++}
++
+ static void push_vert(const vtx_t* v)
+ {
+     if (dc.n_verts >= dc.cap_verts) {
+@@ -12374,7 +12611,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             if (!vertex_pull && !ld_vs_direct_fetch(&used_layout, &vs)) vs_on = 0;
+         }
+     }
+-    if (!vs_on && ld_vertex_compact_payload() && !dc.inl && ld_vc_on())
++    if (!vs_on && ld_vertex_compact_payload() && !dc.inl && ld_vc_on() &&
++        !ld_vc_bypass_small_arrays(prim))
+         vc = ld_vc_lookup(&used_layout, prim, &vc_store, &vc_verify);
+     g_vs_plan_ready = 0;
+     if (vc || vs_on) {
+@@ -12864,26 +13102,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+               g.surfaces[target].location == t.location && g.surfaces[target].offset == t.offset &&
+               g.surfaces[target].w == t.width && g.surfaces[target].h == t.height &&
+               (g.surfaces[target].fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u) == tb_want;
+-          for (int pass = by_fmt ? 0 : 1; pass < 2 && sampled < 0 && !self_exact; pass++) {
+-              u32 best_gen = 0;
+-              for (u32 i = 0; i < g.n_surfaces; i++) {
+-                  const surface_t* sf_i = &g.surfaces[i];
+-                  if (sf_i->location != t.location || sf_i->offset != t.offset ||
+-                      i == target)
+-                      continue;
+-                  if (pass == 0 && (sf_i->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u) != tb_want)
+-                      continue;
+-                  if (sf_i->w == t.width && sf_i->h == t.height) { sampled = (int)i; break; }
+-                  if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
+-                      sampled = (int)i;
+-                      best_gen = sf_i->last_draw_generation;
+-                  }
+-              }
+-              if (pass == 0 && sampled < 0 && g.surfaces[target].location == t.location &&
+-                  g.surfaces[target].offset == t.offset &&
+-                  (g.surfaces[target].fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u) == tb_want)
+-                  break;                                    /* the target is the surface of that kind */
+-          } }
++          sampled = ld_fragment_surface_find(&t, target, tb_want, by_fmt, self_exact);
++        }
+         /* LD_UVDBG=1: the texture coordinates of the draw that samples the PS1
+          * framebuffer. Placed here rather than in fetch_batches because that
+          * function is not on this draw's path -- probing it printed nothing at
+@@ -14361,6 +14581,9 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     if (shader_disk_cache_prepare()) {
+         ld_pso_library_init();
+         ld_pw_start(g.dev, g_pso_lib, g.rootsig_x, g_ld_point_rootsig, g_ld_shader_disk_dir);
++        if (ld_vertex_pull_on())
++            ld_sp_start(g_ld_shader_disk_dir, rsx_vertex_pull_hlsl,
++                        SHADER_DISK_CACHE_MAGIC, SHADER_DISK_CACHE_VERSION, ld_vs_compile_flags());
+     }
+     return 0;
+ }
+@@ -16256,8 +16479,13 @@ void rsx_live_draw_present(u32 buffer_id)
+ 
+ void rsx_live_draw_shutdown(void)
+ {
+-    if (!g.ready) return;
++    if (!g.ready) {
++        rsx_live_draw_set_video_active(0);
++        return;
++    }
++    ld_sp_stop();
+     ld_pw_stop();
++    rsx_live_draw_set_video_active(0);
+     ld_pso_library_save(1);
+     ld_vertex_diag_emit("shutdown", 1);
+     ld_present_measure_dump();
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 40cd0cc..cb7a5ab 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -55,6 +55,18 @@ int  rsx_live_draw_enabled(void);
+ int  rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+                         rsx_live_guest_ptr_fn guest_ptr, void* guest_user);
+ 
++/* Owner/render-thread playback control, safe before init. Pause only new
++ * background shader/PSO jobs; in-flight work completes and queued recipes
++ * remain available. Real draw requests keep the complete foreground path. */
++void rsx_live_draw_set_preparation_paused(int paused);
++
++/* Owner/render-thread decoder lifetime, safe before init. Default small-array
++ * and adaptive-texture admissions run only while active; explicit environment
++ * overrides remain global. Also pauses/resumes background preparation. This
++ * does not enable host movie mode or suppress guest rendering. Closing resets
++ * direct texture watch baselines before their next bind. */
++void rsx_live_draw_set_video_active(int active);
++
+ /* Seed the dispatcher's register file / transform program from a captured or
+  * live initial context (optional; the live path can also just stream). */
+ void rsx_live_draw_seed_registers(const u32* regs, u32 count);
+diff --git a/libs/video/rsx_prepare_control.h b/libs/video/rsx_prepare_control.h
+new file mode 100644
+index 0000000..9ec898e
+--- /dev/null
++++ b/libs/video/rsx_prepare_control.h
+@@ -0,0 +1,40 @@
++/* Shared worker admission gate. The renderer owner changes this using actual
++ * playback state; no guessed startup delay or guest-clock change is involved.
++ * A pause waits only for the tiny admission lock, never for driver/FXC work. */
++#ifndef RSX_PREPARE_CONTROL_H
++#define RSX_PREPARE_CONTROL_H
++#include <windows.h>
++static SRWLOCK g_ld_prepare_control_lock;
++static volatile LONG g_ld_prepare_paused;
++static volatile LONG g_ld_prepare_in_flight;
++
++static int ld_prepare_set_paused(int paused)
++{
++    AcquireSRWLockExclusive(&g_ld_prepare_control_lock);
++    const LONG old = InterlockedExchange(&g_ld_prepare_paused, paused != 0);
++    ReleaseSRWLockExclusive(&g_ld_prepare_control_lock);
++    WakeByAddressAll((PVOID)&g_ld_prepare_paused);
++    return old != (paused != 0);
++}
++static void ld_prepare_wake(void)
++{
++    WakeByAddressAll((PVOID)&g_ld_prepare_paused);
++}
++static int ld_prepare_enter(volatile LONG* stop)
++{
++    for (;;) {
++        AcquireSRWLockShared(&g_ld_prepare_control_lock);
++        const int stopped = InterlockedCompareExchange(stop, 0, 0) != 0;
++        const LONG paused = InterlockedCompareExchange(&g_ld_prepare_paused, 0, 0);
++        if (!stopped && !paused) InterlockedIncrement(&g_ld_prepare_in_flight);
++        ReleaseSRWLockShared(&g_ld_prepare_control_lock);
++        if (stopped) return 0;
++        if (!paused) return 1;
++        WaitOnAddress(&g_ld_prepare_paused, (PVOID)&paused, sizeof(paused), 1000);
++    }
++}
++static void ld_prepare_leave(void)
++{
++    InterlockedDecrement(&g_ld_prepare_in_flight);
++}
++#endif
+diff --git a/libs/video/rsx_pso_warmup.h b/libs/video/rsx_pso_warmup.h
+index 68b55d2..bb8c00f 100644
+--- a/libs/video/rsx_pso_warmup.h
++++ b/libs/video/rsx_pso_warmup.h
+@@ -6,20 +6,24 @@
+ #ifndef RSX_PSO_WARMUP_H
+ #define RSX_PSO_WARMUP_H
+ #include <stdint.h>
++#include <stddef.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <windows.h>
+ #include <d3d12.h>
++#include "rsx_prepare_control.h"
+ #if defined(_MSC_VER)
+ #pragma comment(lib, "synchronization.lib")
+ #endif
+ 
+-#define LD_PW_LIMIT 8192u
++#define LD_PW_LIMIT 16384u
+ #define LD_PW_HASH (LD_PW_LIMIT * 2u)
+ #define LD_PW_MAGIC 0x31575047u /* GPW1 */
+ #define LD_PW_MAX_SHADER (4u * 1024u * 1024u)
++#ifndef LD_PW_MAX_RETAINED
+ #define LD_PW_MAX_RETAINED (256ull * 1024u * 1024u)
++#endif
+ #define LD_PW_MAX_QUEUED (32u * 1024u * 1024u)
+ 
+ typedef struct ld_pw_identity {
+@@ -37,10 +41,22 @@ typedef struct ld_pw_record {
+     /* VS, PS, GS bytes follow; all pointers in identity are NULL. */
+ } ld_pw_record;
+ 
++/* Many states share exactly the same DXBC. Retaining a full copy per recipe
++ * exhausted 256 MiB on GT6's 6,782 recipes, rejecting later known pipelines.
++ * Intern only byte-identical programs; hashes never establish equivalence. */
++typedef struct ld_pw_blob {
++    struct ld_pw_blob* next;
++    uint64_t hash;
++    size_t size;
++    unsigned refs;
++    unsigned char bytes[1];
++} ld_pw_blob;
++
+ typedef struct ld_pw_entry {
+     uint64_t key;
+     volatile LONG state; /* 0 queued, 1 building, 2 ready, 3 rejected */
+-    ld_pw_record* record;
++    ld_pw_record* record; /* header only; payload is shared in shaders[] */
++    ld_pw_blob* shaders[3];
+     ID3D12PipelineState* pso;
+ } ld_pw_entry;
+ 
+@@ -60,15 +76,33 @@ static struct {
+     HANDLE threads[4];
+     unsigned thread_count, entry_count, new_records;
+     ld_pw_entry entries[LD_PW_LIMIT];
++    ld_pw_blob* blobs[LD_PW_HASH];
+     uint16_t index[LD_PW_HASH];
+     uint64_t recorded[LD_PW_HASH];
+     SRWLOCK lock;
+     CONDITION_VARIABLE wake;
+     ld_pw_job *head, *tail;
+     uint64_t retained, queued_bytes;
++    unsigned unique_blobs;
++    uint64_t payload_bytes, deduplicated_bytes;
+     volatile LONG ready, rejected, saved, failed_writes, library_hits, driver_builds;
++    volatile LONG rejected_file, rejected_budget, rejected_driver, cancelled;
++    volatile LONG discovered, completed, completion_reported;
++    ULONGLONG start_tick;
+     uint64_t hits, waits, misses, collisions, skipped_records;
+ } g_ld_pw;
++
++static void ld_pw_progress(void)
++{
++    if (!InterlockedCompareExchange(&g_ld_pw.discovered, 0, 0) ||
++        (unsigned)InterlockedCompareExchange(&g_ld_pw.completed, 0, 0) < g_ld_pw.entry_count ||
++        InterlockedCompareExchange(&g_ld_pw.completion_reported, 1, 0)) return;
++    fprintf(stderr, "[pso-prewarm] complete elapsed_ms=%llu ready=%ld/%u rejected=%ld cancelled=%ld library=%ld builds=%ld unique_dxbc=%u retained=%llu\n",
++        (unsigned long long)(GetTickCount64() - g_ld_pw.start_tick),
++        g_ld_pw.ready, g_ld_pw.entry_count, g_ld_pw.rejected, g_ld_pw.cancelled,
++        g_ld_pw.library_hits, g_ld_pw.driver_builds, g_ld_pw.unique_blobs,
++        (unsigned long long)g_ld_pw.retained);
++}
+ /* Microsoft documents that concurrent loads of the same library entry need
+  * caller synchronization. Both ordinary loads and prewarming use this lock. */
+ /* Lock only a small name bucket, rather than blocking a requested pipeline
+@@ -95,6 +129,83 @@ static uint64_t ld_pw_hash(const void* data, size_t n, uint64_t h)
+     return h;
+ }
+ 
++/* g_ld_pw.lock is held. Published entries keep their references until stop;
++ * readers need no lock because a ready entry is immutable. */
++static void ld_pw_blob_release_locked(ld_pw_blob* blob)
++{
++    if (!blob || --blob->refs) return;
++    const unsigned bucket = (unsigned)(blob->hash ^ (blob->hash >> 32)) & (LD_PW_HASH - 1u);
++    ld_pw_blob** link = &g_ld_pw.blobs[bucket];
++    while (*link && *link != blob) link = &(*link)->next;
++    if (*link) *link = blob->next;
++    g_ld_pw.retained -= offsetof(ld_pw_blob, bytes) + blob->size;
++    g_ld_pw.unique_blobs--;
++    free(blob);
++}
++
++static void ld_pw_release_payload(ld_pw_entry* entry)
++{
++    AcquireSRWLockExclusive(&g_ld_pw.lock);
++    for (unsigned i = 0; i < 3; ++i) {
++        ld_pw_blob_release_locked(entry->shaders[i]);
++        entry->shaders[i] = NULL;
++    }
++    if (entry->record) {
++        g_ld_pw.retained -= sizeof(*entry->record);
++        free(entry->record); entry->record = NULL;
++    }
++    ReleaseSRWLockExclusive(&g_ld_pw.lock);
++}
++
++/* The validated disk record remains alive until this completes. On failure
++ * undo every acquired reference, including newly interned blobs. The caller
++ * then uses the ordinary build, without publishing a partial entry. */
++static int ld_pw_retain_payload(ld_pw_entry* entry, const ld_pw_record* record,
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
++{
++    const D3D12_SHADER_BYTECODE stages[3] = {pd->VS, pd->PS, pd->GS};
++    int ok = 1;
++    AcquireSRWLockExclusive(&g_ld_pw.lock);
++    if (g_ld_pw.retained + sizeof(*record) > LD_PW_MAX_RETAINED ||
++        !(entry->record = (ld_pw_record*)malloc(sizeof(*record)))) ok = 0;
++    if (ok) {
++        memcpy(entry->record, record, sizeof(*record));
++        g_ld_pw.retained += sizeof(*record);
++    }
++    uint64_t saved = 0;
++    for (unsigned i = 0; ok && i < 3; ++i) {
++        const size_t size = stages[i].BytecodeLength;
++        if (!size) continue;
++        const uint64_t hash = ld_pw_hash(stages[i].pShaderBytecode, size, 1469598103934665603ull);
++        const unsigned bucket = (unsigned)(hash ^ (hash >> 32)) & (LD_PW_HASH - 1u);
++        ld_pw_blob* blob = g_ld_pw.blobs[bucket];
++        for (; blob; blob = blob->next)
++            if (blob->hash == hash && blob->size == size &&
++                !memcmp(blob->bytes, stages[i].pShaderBytecode, size)) break;
++        if (blob) { blob->refs++; saved += size; }
++        else {
++            const size_t bytes = offsetof(ld_pw_blob, bytes) + size;
++            if (g_ld_pw.retained + bytes > LD_PW_MAX_RETAINED ||
++                !(blob = (ld_pw_blob*)malloc(bytes))) { ok = 0; break; }
++            blob->hash = hash; blob->size = size; blob->refs = 1;
++            memcpy(blob->bytes, stages[i].pShaderBytecode, size);
++            blob->next = g_ld_pw.blobs[bucket]; g_ld_pw.blobs[bucket] = blob;
++            g_ld_pw.retained += bytes; g_ld_pw.unique_blobs++;
++        }
++        entry->shaders[i] = blob;
++    }
++    if (ok) {
++        g_ld_pw.payload_bytes += record->payload_size;
++        g_ld_pw.deduplicated_bytes += saved;
++    }
++    ReleaseSRWLockExclusive(&g_ld_pw.lock);
++    if (!ok) { ld_pw_release_payload(entry); return 0; }
++    pd->VS.pShaderBytecode = entry->shaders[0]->bytes;
++    pd->PS.pShaderBytecode = entry->shaders[1]->bytes;
++    pd->GS.pShaderBytecode = entry->shaders[2] ? entry->shaders[2]->bytes : NULL;
++    return 1;
++}
++
+ static int ld_pw_identity_make(ld_pw_identity* out,
+     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, unsigned root_kind)
+ {
+@@ -232,21 +343,21 @@ static void ld_pw_prepare(ld_pw_entry* e)
+     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+     D3D12_INPUT_ELEMENT_DESC il[16];
+     ID3D12PipelineState* pso = NULL;
+-    size_t n = 0; int reserved = 0;
++    size_t n = 0;
++    unsigned reject_kind = 0;
++    if (InterlockedCompareExchange(&g_ld_pw.stop, 0, 0)) { reject_kind = 3; goto done; }
+     if (!ld_pw_path(path, sizeof(path), e->key) || !(f = fopen(path, "rb"))) goto done;
+     if (fseek(f, 0, SEEK_END)) goto done;
+     const long bytes = ftell(f);
+     if (bytes < (long)sizeof(*r) || bytes > (long)(sizeof(*r) + 3u * LD_PW_MAX_SHADER)) goto done;
+     n = (size_t)bytes;
+-    AcquireSRWLockExclusive(&g_ld_pw.lock);
+-    const int room = g_ld_pw.retained + n <= LD_PW_MAX_RETAINED;
+-    if (room) { g_ld_pw.retained += n; reserved = 1; }
+-    ReleaseSRWLockExclusive(&g_ld_pw.lock);
+-    if (!room) goto done;
+     r = (ld_pw_record*)malloc(n);
+     if (!r) goto done;
+     rewind(f);
+     if (fread(r, 1, n, f) != n || r->key != e->key || !ld_pw_unpack(r, n, &pd, il)) goto done;
++    if (InterlockedCompareExchange(&g_ld_pw.stop, 0, 0)) { reject_kind = 3; goto done; }
++    if (!ld_pw_retain_payload(e, r, &pd)) { reject_kind = 1; goto done; }
++    reject_kind = 2;
+     if (g_ld_pw.library) {
+         WCHAR name[40]; swprintf(name, 40, L"p%016llX", (unsigned long long)r->library_id);
+         if (SUCCEEDED(ld_pw_library_load(g_ld_pw.library, name, &pd, &pso)))
+@@ -260,18 +371,20 @@ static void ld_pw_prepare(ld_pw_entry* e)
+ done:
+     if (f) fclose(f);
+     if (pso) {
+-        e->record = r; e->pso = pso;
++        e->pso = pso;
+         InterlockedIncrement(&g_ld_pw.ready);
+         InterlockedExchange(&e->state, 2);
+     } else {
+-        free(r);
+-        if (reserved) {
+-            AcquireSRWLockExclusive(&g_ld_pw.lock); g_ld_pw.retained -= n; ReleaseSRWLockExclusive(&g_ld_pw.lock);
+-        }
++        ld_pw_release_payload(e);
+         InterlockedIncrement(&g_ld_pw.rejected);
++        InterlockedIncrement(reject_kind == 3 ? &g_ld_pw.cancelled :
++            reject_kind == 2 ? &g_ld_pw.rejected_driver :
++            reject_kind == 1 ? &g_ld_pw.rejected_budget : &g_ld_pw.rejected_file);
+         InterlockedExchange(&e->state, 3);
+     }
++    free(r);
+     WakeByAddressAll((PVOID)&e->state);
++    InterlockedIncrement(&g_ld_pw.completed); ld_pw_progress();
+ }
+ 
+ static void ld_pw_write(ld_pw_record* r)
+@@ -310,10 +423,13 @@ static DWORD WINAPI ld_pw_worker(LPVOID unused)
+         ReleaseSRWLockExclusive(&g_ld_pw.lock);
+         if (!job) break;
+         if (job->entry) {
+-            if (stop) {
+-                if (InterlockedCompareExchange(&job->entry->state, 3, 0) == 0)
++            if (stop || !ld_prepare_enter(&g_ld_pw.stop)) {
++                if (InterlockedCompareExchange(&job->entry->state, 3, 0) == 0) {
++                    InterlockedIncrement(&g_ld_pw.cancelled);
+                     WakeByAddressAll((PVOID)&job->entry->state);
+-            } else ld_pw_prepare(job->entry);
++                    InterlockedIncrement(&g_ld_pw.completed); ld_pw_progress();
++                }
++            } else { ld_pw_prepare(job->entry); ld_prepare_leave(); }
+         } else ld_pw_write(job->record);
+         free(job);
+     }
+@@ -339,6 +455,7 @@ static void ld_pw_start(ID3D12Device* dev, ID3D12PipelineLibrary* lib,
+     const char* setting = getenv("LD_PSO_PREWARM");
+     if (g_ld_pw.active || (setting && *setting == '0') || !cache_dir || !*cache_dir) return;
+     memset(&g_ld_pw, 0, sizeof(g_ld_pw));
++    g_ld_pw.start_tick = GetTickCount64();
+     InitializeSRWLock(&g_ld_pw.lock); InitializeConditionVariable(&g_ld_pw.wake);
+     const int chars = snprintf(g_ld_pw.dir, sizeof(g_ld_pw.dir), "%s\\pipelines_v1", cache_dir);
+     if (chars < 0 || (size_t)chars >= sizeof(g_ld_pw.dir) ||
+@@ -353,6 +470,11 @@ static void ld_pw_start(ID3D12Device* dev, ID3D12PipelineLibrary* lib,
+         if (t) g_ld_pw.threads[g_ld_pw.thread_count++] = t;
+     }
+     if (!g_ld_pw.thread_count) return;
++    /* Own all COM objects used by asynchronous jobs until every worker joins. */
++    dev->lpVtbl->AddRef(dev);
++    if (lib) lib->lpVtbl->AddRef(lib);
++    if (root) root->lpVtbl->AddRef(root);
++    if (point_root) point_root->lpVtbl->AddRef(point_root);
+     g_ld_pw.active = 1;
+     char search[MAX_PATH]; snprintf(search, sizeof(search), "%s\\*.gpso", g_ld_pw.dir);
+     WIN32_FIND_DATAA data; HANDLE find = FindFirstFileA(search, &data);
+@@ -367,12 +489,17 @@ static void ld_pw_start(ID3D12Device* dev, ID3D12PipelineLibrary* lib,
+             unsigned slot = (unsigned)(key ^ (key >> 32)) & (LD_PW_HASH - 1u);
+             while (g_ld_pw.index[slot]) slot = (slot + 1u) & (LD_PW_HASH - 1u);
+             g_ld_pw.index[slot] = (uint16_t)(++g_ld_pw.entry_count);
+-            if (!ld_pw_enqueue(e, NULL)) InterlockedExchange(&e->state, 3);
++            if (!ld_pw_enqueue(e, NULL)) {
++                InterlockedExchange(&e->state, 3);
++                InterlockedIncrement(&g_ld_pw.rejected); InterlockedIncrement(&g_ld_pw.rejected_budget);
++                InterlockedIncrement(&g_ld_pw.completed);
++            }
+         } while (FindNextFileA(find, &data));
+         FindClose(find);
+     }
+     fprintf(stderr, "[pso-prewarm] queued %u exact recipes, %u workers, '%s'\n",
+             g_ld_pw.entry_count, g_ld_pw.thread_count, g_ld_pw.dir);
++    InterlockedExchange(&g_ld_pw.discovered, 1); ld_pw_progress();
+ }
+ 
+ static ID3D12PipelineState* ld_pw_take(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, unsigned root_kind)
+@@ -391,11 +518,10 @@ static ID3D12PipelineState* ld_pw_take(const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
+         WaitOnAddress(&e->state, &state, sizeof(state), 1000);
+     if (state != 2 || !e->record || !e->pso) { g_ld_pw.misses++; return NULL; }
+     const ld_pw_record* r = e->record;
+-    const unsigned char* b = (const unsigned char*)(r + 1);
+     if (memcmp(&r->identity, &id, sizeof(id)) ||
+-        memcmp(b, pd->VS.pShaderBytecode, pd->VS.BytecodeLength) ||
+-        memcmp(b + pd->VS.BytecodeLength, pd->PS.pShaderBytecode, pd->PS.BytecodeLength) ||
+-        (pd->GS.BytecodeLength && memcmp(b + pd->VS.BytecodeLength + pd->PS.BytecodeLength,
++        memcmp(e->shaders[0]->bytes, pd->VS.pShaderBytecode, pd->VS.BytecodeLength) ||
++        memcmp(e->shaders[1]->bytes, pd->PS.pShaderBytecode, pd->PS.BytecodeLength) ||
++        (pd->GS.BytecodeLength && memcmp(e->shaders[2]->bytes,
+                                        pd->GS.pShaderBytecode, pd->GS.BytecodeLength))) {
+         g_ld_pw.collisions++; return NULL;
+     }
+@@ -454,17 +580,26 @@ static void ld_pw_stop(void)
+     if (!g_ld_pw.active) return;
+     AcquireSRWLockExclusive(&g_ld_pw.lock); g_ld_pw.stop = 1;
+     WakeAllConditionVariable(&g_ld_pw.wake); ReleaseSRWLockExclusive(&g_ld_pw.lock);
++    ld_prepare_wake();
+     WaitForMultipleObjects(g_ld_pw.thread_count, g_ld_pw.threads, TRUE, INFINITE);
+     for (unsigned i = 0; i < g_ld_pw.thread_count; ++i) CloseHandle(g_ld_pw.threads[i]);
+-    fprintf(stderr, "[pso-prewarm] ready=%ld rejected=%ld hits=%llu waits=%llu misses=%llu collisions=%llu saved=%ld writefail=%ld skipped=%llu library=%ld builds=%ld\n",
++    fprintf(stderr, "[pso-prewarm] ready=%ld rejected=%ld hits=%llu waits=%llu misses=%llu collisions=%llu saved=%ld writefail=%ld skipped=%llu library=%ld builds=%ld unique_dxbc=%u retained=%llu dedup_saved=%llu\n",
+             g_ld_pw.ready, g_ld_pw.rejected, (unsigned long long)g_ld_pw.hits,
+             (unsigned long long)g_ld_pw.waits, (unsigned long long)g_ld_pw.misses,
+             (unsigned long long)g_ld_pw.collisions, g_ld_pw.saved, g_ld_pw.failed_writes,
+-            (unsigned long long)g_ld_pw.skipped_records, g_ld_pw.library_hits, g_ld_pw.driver_builds);
++            (unsigned long long)g_ld_pw.skipped_records, g_ld_pw.library_hits, g_ld_pw.driver_builds,
++            g_ld_pw.unique_blobs, (unsigned long long)g_ld_pw.retained,
++            (unsigned long long)g_ld_pw.deduplicated_bytes);
++    fprintf(stderr, "[pso-prewarm] rejection(file/budget/driver)=%ld/%ld/%ld cancelled=%ld\n",
++            g_ld_pw.rejected_file, g_ld_pw.rejected_budget, g_ld_pw.rejected_driver, g_ld_pw.cancelled);
+     for (unsigned i = 0; i < g_ld_pw.entry_count; ++i) {
+         if (g_ld_pw.entries[i].pso) g_ld_pw.entries[i].pso->lpVtbl->Release(g_ld_pw.entries[i].pso);
+-        free(g_ld_pw.entries[i].record);
++        ld_pw_release_payload(&g_ld_pw.entries[i]);
+     }
++    if (g_ld_pw.roots[0]) g_ld_pw.roots[0]->lpVtbl->Release(g_ld_pw.roots[0]);
++    if (g_ld_pw.roots[1]) g_ld_pw.roots[1]->lpVtbl->Release(g_ld_pw.roots[1]);
++    if (g_ld_pw.library) g_ld_pw.library->lpVtbl->Release(g_ld_pw.library);
++    g_ld_pw.device->lpVtbl->Release(g_ld_pw.device);
+     memset(&g_ld_pw, 0, sizeof(g_ld_pw));
+ }
+ #endif
+diff --git a/libs/video/rsx_sampler_key_index.h b/libs/video/rsx_sampler_key_index.h
+new file mode 100644
+index 0000000..b52ddce
+--- /dev/null
++++ b/libs/video/rsx_sampler_key_index.h
+@@ -0,0 +1,55 @@
++#ifndef RSX_SAMPLER_KEY_INDEX_H
++#define RSX_SAMPLER_KEY_INDEX_H
++
++#include <stdint.h>
++#include <string.h>
++
++/* The live sampler key array is append-only until its device state is reset.
++ * Buckets contain array index + 1, not truncated keys: collisions still compare
++ * all 64 bits and duplicate keys retain the first slot, as the linear walk did.
++ */
++#define RSX_SAMPLER_KEY_CAPACITY 128u
++#define RSX_SAMPLER_KEY_BUCKETS 256u
++#define RSX_SAMPLER_KEY_NOT_FOUND UINT32_MAX
++
++typedef struct rsx_sampler_key_index {
++    uint16_t buckets[RSX_SAMPLER_KEY_BUCKETS];
++    uint32_t indexed;
++} rsx_sampler_key_index;
++
++static inline uint32_t rsx_sampler_key_hash(uint64_t key)
++{
++    key ^= key >> 33;
++    key *= UINT64_C(0xff51afd7ed558ccd);
++    key ^= key >> 33;
++    return (uint32_t)key & (RSX_SAMPLER_KEY_BUCKETS - 1u);
++}
++
++static inline uint32_t rsx_sampler_key_find(
++    rsx_sampler_key_index* index, const uint64_t* keys,
++    uint32_t count, uint64_t key)
++{
++    if (count > RSX_SAMPLER_KEY_CAPACITY)
++        return RSX_SAMPLER_KEY_NOT_FOUND;
++    if (index->indexed > count) {
++        memset(index, 0, sizeof(*index));
++    }
++    for (; index->indexed < count; index->indexed++) {
++        const uint32_t at = index->indexed;
++        uint32_t bucket = rsx_sampler_key_hash(keys[at]);
++        while (index->buckets[bucket] &&
++               keys[index->buckets[bucket] - 1u] != keys[at])
++            bucket = (bucket + 1u) & (RSX_SAMPLER_KEY_BUCKETS - 1u);
++        if (!index->buckets[bucket])
++            index->buckets[bucket] = (uint16_t)(at + 1u);
++    }
++    uint32_t bucket = rsx_sampler_key_hash(key);
++    while (index->buckets[bucket]) {
++        const uint32_t at = index->buckets[bucket] - 1u;
++        if (keys[at] == key) return at;
++        bucket = (bucket + 1u) & (RSX_SAMPLER_KEY_BUCKETS - 1u);
++    }
++    return RSX_SAMPLER_KEY_NOT_FOUND;
++}
++
++#endif
+diff --git a/libs/video/rsx_shader_prepare.h b/libs/video/rsx_shader_prepare.h
+new file mode 100644
+index 0000000..d8e4000
+--- /dev/null
++++ b/libs/video/rsx_shader_prepare.h
+@@ -0,0 +1,382 @@
++/* Prepare known compact-IA vertex shaders for the exact GPU-pull emitter.
++ * Only owned source/DXBC and independent cache files cross worker threads.
++ * Guest state, renderer caches and command lists are never accessed here.
++ */
++#ifndef RSX_SHADER_PREPARE_H
++#define RSX_SHADER_PREPARE_H
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <windows.h>
++#include <d3dcompiler.h>
++#include "rsx_vp_pull_prepare.h"
++#include "rsx_prepare_control.h"
++
++#define LD_SP_LIMIT 4096u
++#define LD_SP_HASH 8192u
++#define LD_SP_MAX_SOURCE (256u * 1024u)
++#define LD_SP_MAX_BLOB (4u * 1024u * 1024u)
++#define LD_SP_MAX_SOURCE_MEMORY (32u * 1024u * 1024u)
++#define LD_SP_MAX_BLOB_MEMORY (128u * 1024u * 1024u)
++
++typedef struct ld_sp_header {
++    uint32_t magic, version, stage, source_length, blob_length, reserved;
++    uint64_t source_hash;
++} ld_sp_header;
++typedef char ld_sp_header_size_is_32[(sizeof(ld_sp_header) == 32) ? 1 : -1];
++/* Older v2 records used zero here. Preserve their established compatibility;
++ * new records explicitly distinguish compiler options without changing HLSL
++ * identity or discarding the user's existing shader cache. */
++static uint32_t ld_sp_cache_flags(UINT flags) { return 0x80000000u | (uint32_t)flags; }
++typedef struct ld_sp_entry {
++    uint64_t hash;
++    char* source;
++    uint32_t length;
++    uint64_t source_stamp;
++    int cached;
++    volatile LONG state; /* 0 queued, 1 worker owns, 2 ready, 3 failed/cancelled, 4 draw owns */
++    ID3DBlob* blob;
++} ld_sp_entry;
++typedef struct ld_sp_manifest {
++    unsigned count;
++    size_t source_bytes;
++    uint16_t index[LD_SP_HASH];
++    ld_sp_entry entries[LD_SP_LIMIT];
++} ld_sp_manifest;
++static struct {
++    int active;
++    volatile LONG stop, next;
++    /* Discovery owns its manifest exclusively until one release publication.
++     * After publication count/source/index are immutable; only entry states
++     * and blob ownership change. The renderer owner joins before freeing it. */
++    ld_sp_manifest* volatile manifest;
++    HANDLE discovery;
++    unsigned threads_count;
++    HANDLE threads[2];
++    char dir[MAX_PATH];
++    char* pull_helper;
++    UINT flags;
++    uint32_t magic, version;
++    ULONGLONG start_tick;
++    volatile LONG scanned, discovery_done;
++    volatile LONG64 blob_bytes;
++    volatile LONG compiled, disk_hits, failed, rejected, written, ready, foreground;
++    uint64_t hits, waits, wait_us;
++} g_ld_sp;
++
++static ld_sp_manifest* ld_sp_published(void)
++{
++    return (ld_sp_manifest*)InterlockedCompareExchangePointer(
++        (PVOID volatile*)&g_ld_sp.manifest, NULL, NULL);
++}
++
++static void ld_sp_free_manifest(ld_sp_manifest* m)
++{
++    if (!m) return;
++    for (unsigned i = 0; i < m->count; ++i) {
++        if (m->entries[i].blob) m->entries[i].blob->lpVtbl->Release(m->entries[i].blob);
++        free(m->entries[i].source);
++    }
++    free(m);
++}
++
++static int ld_sp_order(const void* aa, const void* bb)
++{
++    const ld_sp_entry *a = (const ld_sp_entry*)aa, *b = (const ld_sp_entry*)bb;
++    if (a->cached != b->cached) return a->cached ? -1 : 1;
++    if (a->source_stamp != b->source_stamp) return a->source_stamp > b->source_stamp ? -1 : 1;
++    return a->hash < b->hash ? -1 : a->hash > b->hash ? 1 : 0;
++}
++
++static uint64_t ld_sp_hash(const void* data, size_t length)
++{
++    uint64_t h = 1469598103934665603ull;
++    const unsigned char* p = (const unsigned char*)data;
++    for (size_t i = 0; i < length; ++i) { h ^= p[i]; h *= 1099511628211ull; }
++    return h;
++}
++static ld_sp_entry* ld_sp_find(ld_sp_manifest* m, const char* source, uint32_t length, uint64_t hash)
++{
++    for (unsigned slot = (unsigned)(hash ^ (hash >> 32)) & (LD_SP_HASH - 1u);
++         m->index[slot]; slot = (slot + 1u) & (LD_SP_HASH - 1u)) {
++        ld_sp_entry* e = &m->entries[m->index[slot] - 1u];
++        if (e->hash == hash && e->length == length && !memcmp(e->source, source, length)) return e;
++    }
++    return NULL;
++}
++static int ld_sp_path(char out[MAX_PATH], const ld_sp_entry* e)
++{
++    const int n = snprintf(out, MAX_PATH, "%s\\V_%016llX_%08X.bin", g_ld_sp.dir,
++                           (unsigned long long)e->hash, e->length);
++    return n > 0 && n < MAX_PATH;
++}
++static ID3DBlob* ld_sp_disk_load(const ld_sp_entry* e)
++{
++    char path[MAX_PATH]; if (!ld_sp_path(path, e)) return NULL;
++    FILE* f = fopen(path, "rb"); if (!f) return NULL;
++    ld_sp_header h; ID3DBlob* blob = NULL; char* source = NULL;
++    int valid = fread(&h, sizeof(h), 1, f) == 1 && h.magic == g_ld_sp.magic &&
++        h.version == g_ld_sp.version && h.stage == 'V' &&
++        (!h.reserved || h.reserved == ld_sp_cache_flags(g_ld_sp.flags)) &&
++        h.source_hash == e->hash && h.source_length == e->length &&
++        h.blob_length >= 32 && h.blob_length <= LD_SP_MAX_BLOB;
++    if (valid) {
++        source = (char*)malloc(e->length);
++        valid = source && fread(source, 1, e->length, f) == e->length &&
++                !memcmp(source, e->source, e->length);
++    }
++    if (valid) valid = SUCCEEDED(D3DCreateBlob(h.blob_length, &blob)) && blob &&
++        fread(blob->lpVtbl->GetBufferPointer(blob), 1, h.blob_length, f) == h.blob_length &&
++        !memcmp(blob->lpVtbl->GetBufferPointer(blob), "DXBC", 4) && fgetc(f) == EOF;
++    fclose(f); free(source);
++    if (!valid) { if (blob) blob->lpVtbl->Release(blob); InterlockedIncrement(&g_ld_sp.rejected); return NULL; }
++    return blob;
++}
++static void ld_sp_disk_store(const ld_sp_entry* e, ID3DBlob* blob)
++{
++    char path[MAX_PATH], temporary[MAX_PATH + 64];
++    if (!ld_sp_path(path, e)) return;
++    const size_t bytes = blob->lpVtbl->GetBufferSize(blob);
++    if (!bytes || bytes > LD_SP_MAX_BLOB) return;
++    snprintf(temporary, sizeof(temporary), "%s.prepare.%lu.%lu.tmp", path,
++             (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId());
++    ld_sp_header h = {g_ld_sp.magic, g_ld_sp.version, 'V', e->length, (uint32_t)bytes,
++                      ld_sp_cache_flags(g_ld_sp.flags), e->hash};
++    FILE* f = fopen(temporary, "wb"); if (!f) return;
++    int ok = fwrite(&h, sizeof(h), 1, f) == 1 &&
++        fwrite(e->source, 1, e->length, f) == e->length &&
++        fwrite(blob->lpVtbl->GetBufferPointer(blob), 1, bytes, f) == bytes;
++    if (fclose(f)) ok = 0;
++    if (ok && !InterlockedCompareExchange(&g_ld_sp.stop, 0, 0))
++        ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING) != 0;
++    else ok = 0;
++    if (ok) InterlockedIncrement(&g_ld_sp.written);
++    else DeleteFileA(temporary); /* this worker's exact temporary file only */
++}
++static DWORD WINAPI ld_sp_worker(LPVOID unused)
++{
++    (void)unused;
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++    ld_sp_manifest* m = ld_sp_published();
++    if (!m) return 0;
++    while (!InterlockedCompareExchange(&g_ld_sp.stop, 0, 0)) {
++        if (!ld_prepare_enter(&g_ld_sp.stop)) break;
++        const LONG index = InterlockedIncrement(&g_ld_sp.next) - 1;
++        if ((unsigned)index >= m->count) { ld_prepare_leave(); break; }
++        ld_sp_entry* e = &m->entries[index];
++        if (InterlockedCompareExchange(&e->state, 1, 0)) { ld_prepare_leave(); continue; }
++        ID3DBlob *blob = ld_sp_disk_load(e), *error = NULL;
++        if (blob) InterlockedIncrement(&g_ld_sp.disk_hits);
++        else if (!InterlockedCompareExchange(&g_ld_sp.stop, 0, 0)) {
++            const HRESULT hr = D3DCompile(e->source, e->length, "xvs", NULL, NULL,
++                "main", "vs_5_0", g_ld_sp.flags, 0, &blob, &error);
++            if (SUCCEEDED(hr) && blob) {
++                InterlockedIncrement(&g_ld_sp.compiled);
++                ld_sp_disk_store(e, blob);
++            } else { if (blob) blob->lpVtbl->Release(blob); blob = NULL; InterlockedIncrement(&g_ld_sp.failed); }
++        }
++        if (error) error->lpVtbl->Release(error);
++        int retain = blob && !InterlockedCompareExchange(&g_ld_sp.stop, 0, 0);
++        if (retain) {
++            const LONG64 bytes = (LONG64)blob->lpVtbl->GetBufferSize(blob);
++            if (InterlockedAdd64(&g_ld_sp.blob_bytes, bytes) > LD_SP_MAX_BLOB_MEMORY) {
++                InterlockedAdd64(&g_ld_sp.blob_bytes, -bytes); retain = 0;
++            }
++        }
++        if (retain) {
++            e->blob = blob; InterlockedIncrement(&g_ld_sp.ready); InterlockedExchange(&e->state, 2);
++        } else { if (blob) blob->lpVtbl->Release(blob); InterlockedExchange(&e->state, 3); }
++        WakeByAddressAll((PVOID)&e->state);
++        ld_prepare_leave();
++    }
++    return 0;
++}
++
++static void ld_sp_discover_file(ld_sp_manifest* m, const WIN32_FIND_DATAA* data)
++{
++    if (data->dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) return;
++    char path[MAX_PATH]; const int pn = snprintf(path, sizeof(path), "%s\\%s", g_ld_sp.dir, data->cFileName);
++    if (pn < 0 || pn >= MAX_PATH) return;
++    FILE* f = fopen(path, "rb"); if (!f) return;
++    ld_sp_header h;
++    int valid = fread(&h, sizeof(h), 1, f) == 1 && h.magic == g_ld_sp.magic && h.version == g_ld_sp.version &&
++        h.stage == 'V' && (!h.reserved || (h.reserved & 0x80000000u)) &&
++        h.source_length && h.source_length <= LD_SP_MAX_SOURCE &&
++        h.blob_length && h.blob_length <= LD_SP_MAX_BLOB;
++    char* source = valid ? (char*)malloc((size_t)h.source_length + 1u) : NULL;
++    valid = source && fread(source, 1, h.source_length, f) == h.source_length;
++    if (valid) valid = fseek(f, 0, SEEK_END) == 0 &&
++        ftell(f) == (long)(sizeof(h) + h.source_length + h.blob_length);
++    fclose(f);
++    if (!valid) { free(source); return; }
++    source[h.source_length] = 0;
++    if (ld_sp_hash(source, h.source_length) != h.source_hash) { free(source); return; }
++    char* derived = (char*)malloc(LD_SP_MAX_SOURCE + 1u); size_t length = 0;
++    if (!derived || !rsx_vp_pull_prepare(source, h.source_length, g_ld_sp.pull_helper,
++            derived, LD_SP_MAX_SOURCE + 1u, &length)) { free(derived); free(source); return; }
++    free(source);
++    const uint64_t hash = ld_sp_hash(derived, length);
++    if (m->source_bytes + length + 1u > LD_SP_MAX_SOURCE_MEMORY ||
++        ld_sp_find(m, derived, (uint32_t)length, hash)) { free(derived); return; }
++    char* compact = (char*)realloc(derived, length + 1u);
++    if (!compact) { free(derived); return; }
++    derived = compact;
++    ld_sp_entry* e = &m->entries[m->count];
++    e->source = derived; e->length = (uint32_t)length; e->hash = hash;
++    e->source_stamp = ((uint64_t)data->ftLastWriteTime.dwHighDateTime << 32) | data->ftLastWriteTime.dwLowDateTime;
++    char target[MAX_PATH];
++    if (ld_sp_path(target, e)) {
++        const DWORD attributes = GetFileAttributesA(target);
++        e->cached = attributes != INVALID_FILE_ATTRIBUTES && !(attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
++    }
++    unsigned slot = (unsigned)(hash ^ (hash >> 32)) & (LD_SP_HASH - 1u);
++    while (m->index[slot]) slot = (slot + 1u) & (LD_SP_HASH - 1u);
++    m->index[slot] = (uint16_t)(++m->count);
++    m->source_bytes += length + 1u;
++}
++
++static DWORD WINAPI ld_sp_discover(LPVOID unused)
++{
++    (void)unused;
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++    ld_sp_manifest* m = (ld_sp_manifest*)calloc(1, sizeof(*m));
++    HANDLE find = INVALID_HANDLE_VALUE;
++    if (!m) goto done;
++    char search[MAX_PATH]; snprintf(search, sizeof(search), "%s\\V_*.bin", g_ld_sp.dir);
++    WIN32_FIND_DATAA data;
++    while (m->count < LD_SP_LIMIT && ld_prepare_enter(&g_ld_sp.stop)) {
++        /* Admission is per file, including the directory query. A movie can
++         * pause discovery without discarding its private partial manifest. */
++        int found;
++        if (find == INVALID_HANDLE_VALUE) {
++            find = FindFirstFileA(search, &data); found = find != INVALID_HANDLE_VALUE;
++        } else found = FindNextFileA(find, &data) != 0;
++        if (found) { ld_sp_discover_file(m, &data); InterlockedIncrement(&g_ld_sp.scanned); }
++        ld_prepare_leave();
++        if (!found) break;
++#ifdef LD_SP_DISCOVERY_TEST_HOOK
++        LD_SP_DISCOVERY_TEST_HOOK(1);
++#endif
++    }
++    if (find != INVALID_HANDLE_VALUE) { FindClose(find); find = INVALID_HANDLE_VALUE; }
++    if (!ld_prepare_enter(&g_ld_sp.stop)) goto done;
++    /* This private index becomes immutable before any draw or worker sees it.
++     * Existing variants remain first, followed by recent original sources. */
++    qsort(m->entries, m->count, sizeof(m->entries[0]), ld_sp_order);
++    memset(m->index, 0, sizeof(m->index));
++    for (unsigned i = 0; i < m->count; ++i) {
++        const uint64_t hash = m->entries[i].hash;
++        unsigned slot = (unsigned)(hash ^ (hash >> 32)) & (LD_SP_HASH - 1u);
++        while (m->index[slot]) slot = (slot + 1u) & (LD_SP_HASH - 1u);
++        m->index[slot] = (uint16_t)(i + 1u);
++    }
++    ld_prepare_leave();
++#ifdef LD_SP_DISCOVERY_TEST_HOOK
++    LD_SP_DISCOVERY_TEST_HOOK(2);
++#endif
++    if (InterlockedCompareExchange(&g_ld_sp.stop, 0, 0)) goto done;
++    InterlockedExchangePointer((PVOID volatile*)&g_ld_sp.manifest, m);
++    m = NULL; /* shared ownership; only owner stop may free after all joins */
++    for (unsigned i = 0; i < 2 && ld_sp_published()->count &&
++            !InterlockedCompareExchange(&g_ld_sp.stop, 0, 0); ++i) {
++        HANDLE t = CreateThread(NULL, 0, ld_sp_worker, NULL, 0, NULL);
++        if (t) g_ld_sp.threads[g_ld_sp.threads_count++] = t;
++    }
++done:
++    if (find != INVALID_HANDLE_VALUE) FindClose(find);
++    ld_sp_free_manifest(m);
++    m = ld_sp_published();
++    fprintf(stderr, "[shader-prepare] discovery complete elapsed_ms=%llu scanned=%ld queued=%u workers=%u flags=0x%X source_bytes=%zu cancelled=%d\n",
++        (unsigned long long)(GetTickCount64() - g_ld_sp.start_tick), g_ld_sp.scanned,
++        m ? m->count : 0, g_ld_sp.threads_count, g_ld_sp.flags, m ? m->source_bytes : 0,
++        InterlockedCompareExchange(&g_ld_sp.stop, 0, 0) != 0);
++    InterlockedExchange(&g_ld_sp.discovery_done, 1);
++    WakeByAddressAll((PVOID)&g_ld_sp.discovery_done);
++    return 0;
++}
++
++/* Owner-only start performs no file enumeration, source load or translation.
++ * Copy caller-owned inputs before returning; discovery publishes a complete
++ * immutable index once. Until then take immediately uses the normal path. */
++static void ld_sp_start(const char* directory, const char* pull_helper,
++    uint32_t magic, uint32_t version, UINT flags)
++{
++    const char* setting = getenv("LD_SHADER_PREPARE");
++    /* Opt in until movie playback and cold-track scheduling pass the same
++     * cache-seed A/B. The source/DXBC gate alone does not prove CPU contention. */
++    if (g_ld_sp.active || !setting || *setting != '1' || !directory || !*directory ||
++        strlen(directory) >= sizeof(g_ld_sp.dir) - sizeof("\\V_*.bin") || !pull_helper) return;
++    LARGE_INTEGER first, last, frequency;
++    QueryPerformanceCounter(&first); QueryPerformanceFrequency(&frequency);
++    const size_t helper_length = strlen(pull_helper);
++    if (!helper_length || helper_length > LD_SP_MAX_SOURCE) return;
++    char* owned_helper = (char*)malloc(helper_length + 1u);
++    if (!owned_helper) return;
++    memcpy(owned_helper, pull_helper, helper_length + 1u);
++    memset(&g_ld_sp, 0, sizeof(g_ld_sp));
++    strcpy(g_ld_sp.dir, directory); g_ld_sp.pull_helper = owned_helper;
++    g_ld_sp.magic = magic; g_ld_sp.version = version; g_ld_sp.flags = flags;
++    g_ld_sp.start_tick = GetTickCount64(); g_ld_sp.active = 1;
++    g_ld_sp.discovery = CreateThread(NULL, 0, ld_sp_discover, NULL, 0, NULL);
++    if (!g_ld_sp.discovery) {
++        free(owned_helper); memset(&g_ld_sp, 0, sizeof(g_ld_sp)); return;
++    }
++    QueryPerformanceCounter(&last);
++    fprintf(stderr, "[shader-prepare] discovery queued asynchronously; flags=0x%X owner_us=%llu\n", flags,
++        (unsigned long long)((last.QuadPart - first.QuadPart) * 1000000 / frequency.QuadPart));
++}
++
++static ID3DBlob* ld_sp_take(const char* source, uint32_t length, uint64_t hash)
++{
++    if (!g_ld_sp.active) return NULL;
++    ld_sp_manifest* m = ld_sp_published();
++    if (!m) return NULL;
++    ld_sp_entry* e = ld_sp_find(m, source, length, hash); if (!e) return NULL;
++    /* A not-yet-started variant belongs to the normal draw compile now; this
++     * prevents a worker duplicating that exact first-use compilation. */
++    if (InterlockedCompareExchange(&e->state, 4, 0) == 0) {
++        InterlockedIncrement(&g_ld_sp.foreground); return NULL;
++    }
++    LONG state = InterlockedCompareExchange(&e->state, 0, 0);
++    if (state == 1) {
++        LARGE_INTEGER first, last, frequency;
++        QueryPerformanceCounter(&first); QueryPerformanceFrequency(&frequency); g_ld_sp.waits++;
++        while ((state = InterlockedCompareExchange(&e->state, 0, 0)) == 1)
++            WaitOnAddress(&e->state, &state, sizeof(state), 1000);
++        QueryPerformanceCounter(&last);
++        g_ld_sp.wait_us += (uint64_t)((last.QuadPart - first.QuadPart) * 1000000 / frequency.QuadPart);
++    }
++    if (state != 2 || !e->blob) return NULL;
++    e->blob->lpVtbl->AddRef(e->blob); ++g_ld_sp.hits;
++    if (g_ld_sp.hits <= 4 || (g_ld_sp.hits & 127u) == 0)
++        fprintf(stderr, "[shader-prepare] hits=%llu ready=%ld/%u compiled=%ld disk=%ld waits=%llu wait_us=%llu foreground=%ld\n",
++            (unsigned long long)g_ld_sp.hits, g_ld_sp.ready, m->count, g_ld_sp.compiled, g_ld_sp.disk_hits,
++            (unsigned long long)g_ld_sp.waits, (unsigned long long)g_ld_sp.wait_us, g_ld_sp.foreground);
++    return e->blob;
++}
++static void ld_sp_stop(void)
++{
++    if (!g_ld_sp.active) return;
++    InterlockedExchange(&g_ld_sp.stop, 1);
++    ld_prepare_wake();
++    /* The discovery join also fixes the final worker handle set. No discovery
++     * publication or worker creation can race destruction after this point. */
++    WaitForSingleObject(g_ld_sp.discovery, INFINITE);
++    CloseHandle(g_ld_sp.discovery);
++    /* FXC has no per-call cancellation. Finish only the at-most-two in-flight
++     * calls, skip all queued work, then release source and bytecode ownership. */
++    if (g_ld_sp.threads_count)
++        WaitForMultipleObjects(g_ld_sp.threads_count, g_ld_sp.threads, TRUE, INFINITE);
++    for (unsigned i = 0; i < g_ld_sp.threads_count; ++i) CloseHandle(g_ld_sp.threads[i]);
++    ld_sp_manifest* m = ld_sp_published();
++    fprintf(stderr, "[shader-prepare] stop ready=%ld/%u compiled=%ld disk=%ld failed=%ld rejected=%ld written=%ld hits=%llu waits=%llu wait_us=%llu foreground=%ld\n",
++        g_ld_sp.ready, m ? m->count : 0, g_ld_sp.compiled, g_ld_sp.disk_hits, g_ld_sp.failed, g_ld_sp.rejected, g_ld_sp.written,
++        (unsigned long long)g_ld_sp.hits, (unsigned long long)g_ld_sp.waits,
++        (unsigned long long)g_ld_sp.wait_us, g_ld_sp.foreground);
++    InterlockedExchangePointer((PVOID volatile*)&g_ld_sp.manifest, NULL);
++    ld_sp_free_manifest(m);
++    free(g_ld_sp.pull_helper);
++    memset(&g_ld_sp, 0, sizeof(g_ld_sp));
++}
++#endif
+diff --git a/libs/video/rsx_surface_key_index.h b/libs/video/rsx_surface_key_index.h
+new file mode 100644
+index 0000000..542eae9
+--- /dev/null
++++ b/libs/video/rsx_surface_key_index.h
+@@ -0,0 +1,98 @@
++#ifndef RSX_SURFACE_KEY_INDEX_H
++#define RSX_SURFACE_KEY_INDEX_H
++
++#include <stdint.h>
++#include <string.h>
++
++/* Only address membership is indexed. Size, format, feedback and write
++ * generations remain live selection inputs. Bucket chains are kept in slot
++ * order so collisions and same-address variants preserve the linear walk's
++ * first-match/tie behavior. Zero initialization is an empty index. */
++#define RSX_SURFACE_KEY_CAPACITY 512u
++#define RSX_SURFACE_KEY_BUCKETS 1024u
++#define RSX_SURFACE_KEY_NONE UINT32_MAX
++
++typedef struct rsx_surface_key_index {
++    uint64_t keys[RSX_SURFACE_KEY_CAPACITY];
++    uint16_t heads[RSX_SURFACE_KEY_BUCKETS]; /* slot + 1 */
++    uint16_t next[RSX_SURFACE_KEY_CAPACITY]; /* slot + 1 */
++    uint16_t bucket[RSX_SURFACE_KEY_CAPACITY]; /* bucket + 1, 0 = absent */
++} rsx_surface_key_index;
++
++static inline uint64_t rsx_surface_key(uint32_t location, uint32_t offset)
++{
++    return ((uint64_t)location << 32) | offset;
++}
++
++static inline uint32_t rsx_surface_key_bucket(uint64_t key)
++{
++    key ^= key >> 33;
++    key *= UINT64_C(0xff51afd7ed558ccd);
++    key ^= key >> 33;
++    return (uint32_t)key & (RSX_SURFACE_KEY_BUCKETS - 1u);
++}
++
++static inline void rsx_surface_key_reset(rsx_surface_key_index* index)
++{
++    memset(index, 0, sizeof(*index));
++}
++
++static inline void rsx_surface_key_remove(rsx_surface_key_index* index,
++                                          uint32_t slot)
++{
++    if (slot >= RSX_SURFACE_KEY_CAPACITY || !index->bucket[slot]) return;
++    uint16_t* link = &index->heads[index->bucket[slot] - 1u];
++    while (*link && *link != slot + 1u)
++        link = &index->next[*link - 1u];
++    if (*link) *link = index->next[slot];
++    index->bucket[slot] = 0;
++    index->next[slot] = 0;
++    index->keys[slot] = 0;
++}
++
++static inline int rsx_surface_key_set(rsx_surface_key_index* index,
++                                      uint32_t slot, uint32_t location,
++                                      uint32_t offset)
++{
++    if (slot >= RSX_SURFACE_KEY_CAPACITY) return 0;
++    const uint64_t key = rsx_surface_key(location, offset);
++    if (index->bucket[slot] && index->keys[slot] == key) return 1;
++    rsx_surface_key_remove(index, slot);
++    const uint32_t bucket = rsx_surface_key_bucket(key);
++    uint16_t* link = &index->heads[bucket];
++    while (*link && *link < slot + 1u)
++        link = &index->next[*link - 1u];
++    index->keys[slot] = key;
++    index->bucket[slot] = (uint16_t)(bucket + 1u);
++    index->next[slot] = *link;
++    *link = (uint16_t)(slot + 1u);
++    return 1;
++}
++
++static inline uint32_t rsx_surface_key_match(
++    const rsx_surface_key_index* index, uint16_t link, uint64_t key)
++{
++    while (link) {
++        const uint32_t slot = link - 1u;
++        if (index->keys[slot] == key) return slot;
++        link = index->next[slot];
++    }
++    return RSX_SURFACE_KEY_NONE;
++}
++
++static inline uint32_t rsx_surface_key_first(
++    const rsx_surface_key_index* index, uint32_t location, uint32_t offset)
++{
++    const uint64_t key = rsx_surface_key(location, offset);
++    return rsx_surface_key_match(index, index->heads[rsx_surface_key_bucket(key)], key);
++}
++
++static inline uint32_t rsx_surface_key_next(
++    const rsx_surface_key_index* index, uint32_t slot)
++{
++    if (slot >= RSX_SURFACE_KEY_CAPACITY || !index->bucket[slot])
++        return RSX_SURFACE_KEY_NONE;
++    return rsx_surface_key_match(index, index->next[slot], index->keys[slot]);
++}
++
++#endif
+diff --git a/libs/video/rsx_texture_watch_policy.h b/libs/video/rsx_texture_watch_policy.h
+new file mode 100644
+index 0000000..b3e7485
+--- /dev/null
++++ b/libs/video/rsx_texture_watch_policy.h
+@@ -0,0 +1,54 @@
++#ifndef PS3RECOMP_RSX_TEXTURE_WATCH_POLICY_H
++#define PS3RECOMP_RSX_TEXTURE_WATCH_POLICY_H
++
++#include <stdint.h>
++
++/* Admission only: direct_hash still validates every source byte and performs
++ * the ordinary refresh. No policy result authorizes reusing unread pixels. */
++typedef struct {
++    uint8_t direct_hash;
++    uint8_t dirty_run;
++    uint8_t unchanged_run;
++} rsx_texture_watch_policy;
++
++typedef enum {
++    RSX_TEX_WATCH_CLEAN,
++    RSX_TEX_WATCH_UNCHANGED,
++    RSX_TEX_WATCH_UPDATED,
++    RSX_TEX_WATCH_FAILED
++} rsx_texture_watch_result;
++
++static inline void rsx_texture_watch_reset(rsx_texture_watch_policy* policy)
++{
++    policy->direct_hash = policy->dirty_run = policy->unchanged_run = 0;
++}
++
++/* Observations occur once per entry's first bind in a different frame, not
++ * once per global frame. UPDATED means the replacement upload succeeded.
++ * A clean watch, unchanged hash or failed operation breaks dirty admission.
++ * Return +1 on entering direct hashing, -1 on returning to the watch. */
++static inline int rsx_texture_watch_observe(
++    rsx_texture_watch_policy* policy, rsx_texture_watch_result result,
++    int successfully_watched_dirty)
++{
++    const int before = policy->direct_hash != 0;
++    if (result == RSX_TEX_WATCH_UPDATED) {
++        policy->unchanged_run = 0;
++        if (!policy->direct_hash) {
++            if (!successfully_watched_dirty) policy->dirty_run = 0;
++            else if (++policy->dirty_run >= 4u) {
++                policy->direct_hash = 1;
++                policy->dirty_run = 0;
++            }
++        }
++    } else if (result == RSX_TEX_WATCH_UNCHANGED) {
++        policy->dirty_run = 0;
++        if (policy->direct_hash && ++policy->unchanged_run >= 2u)
++            rsx_texture_watch_reset(policy);
++    } else {
++        rsx_texture_watch_reset(policy);
++    }
++    return (policy->direct_hash != 0) - before;
++}
++
++#endif
+diff --git a/libs/video/rsx_vertex_cache_admission.h b/libs/video/rsx_vertex_cache_admission.h
+new file mode 100644
+index 0000000..efde737
+--- /dev/null
++++ b/libs/video/rsx_vertex_cache_admission.h
+@@ -0,0 +1,24 @@
++#ifndef PS3RECOMP_RSX_VERTEX_CACHE_ADMISSION_H
++#define PS3RECOMP_RSX_VERTEX_CACHE_ADMISSION_H
++
++#include "rsx_draw_batches.h"
++
++/* A small nonindexed group is cheaper to fetch freshly than to validate and
++ * retain. Count source references, not DRAW packets; overlaps only reduce the
++ * number of unique vertices. Returning zero leaves the old cache path intact.
++ * No guest bytes are read, and limit - total cannot underflow or overflow.
++ */
++static inline u32 rsx_vertex_cache_small_array_refs(
++    const rsx_draw_batch* arrays, u32 n_arrays, u32 n_indexed,
++    int inline_source, u32 limit)
++{
++    if (!limit || !arrays || !n_arrays || n_indexed || inline_source) return 0;
++    u32 total = 0;
++    for (u32 i = 0; i < n_arrays; i++) {
++        if (arrays[i].count > limit - total) return 0;
++        total += arrays[i].count;
++    }
++    return total;
++}
++
++#endif
+diff --git a/libs/video/rsx_vp_pull_prepare.h b/libs/video/rsx_vp_pull_prepare.h
+new file mode 100644
+index 0000000..fc37d49
+--- /dev/null
++++ b/libs/video/rsx_vp_pull_prepare.h
+@@ -0,0 +1,62 @@
++/* Reconstruct only the exact compact-input -> pull-input emitter variant.
++ * No vertex formats, strides, guest addresses, or shader operations are
++ * inferred. The caller supplies the same helper text used by the emitter.
++ * A prepared variant is useful only when a real draw requests identical HLSL.
++ */
++#ifndef RSX_VP_PULL_PREPARE_H
++#define RSX_VP_PULL_PREPARE_H
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++static int rsx_vp_pull_prepare(const char* source, size_t length,
++    const char* helper, char* out, size_t capacity, size_t* out_length)
++{
++    static const char begin[] = "struct VSInput {\n";
++    static const char pull[] = "struct VSInput { uint vertex_id:SV_VertexID; };\n";
++    static const char main_begin[] = "VSOutput main(VSInput input) {\n    float4 v[16];\n"
++        "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n";
++    if (!source || !helper || !out || !out_length || length > 256u * 1024u ||
++        strlen(source) != length || strncmp(source, begin, sizeof(begin) - 1u) ||
++        strstr(source, "register(t19)") || strstr(source, "vp_pull")) return 0;
++    const char* p = source + sizeof(begin) - 1u;
++    unsigned mask = 0, last = 0; int first = 1;
++    while (strncmp(p, "};\n", 3)) {
++        unsigned a; int n = 0;
++        for (a = first ? 0 : last + 1u; a < 16; ++a) {
++            char expected[64]; n = snprintf(expected, sizeof(expected), "    float4 a%u:ATTR%u;\n", a, a);
++            if (!strncmp(p, expected, (size_t)n)) break;
++        }
++        if (a == 16) return 0;
++        p += n; mask |= 1u << a; last = a; first = 0;
++    }
++    if (!mask) return 0;
++    p += 3;
++    if (strncmp(p, "struct VSOutput {\n", sizeof("struct VSOutput {\n") - 1u)) return 0;
++    const char* main = strstr(p, main_begin);
++    if (!main) return 0;
++    const char* assignments = main + sizeof(main_begin) - 1u;
++    /* All input reads must be the emitter's initial assignment block. */
++    const char* tail = assignments;
++    for (unsigned a = 0; a < 16; ++a) if (mask & (1u << a)) {
++        char expected[64]; const int n = snprintf(expected, sizeof(expected), "    v[%u]=input.a%u;\n", a, a);
++        if (strncmp(tail, expected, (size_t)n)) return 0;
++        tail += n;
++    }
++    const char* read = strstr(p, "input.");
++    if (strstr(tail, "input.") || !read || read < assignments || read >= tail) return 0;
++    const size_t helper_length = strlen(helper), prefix_length = (size_t)(assignments - p);
++    size_t need = sizeof(pull) - 1u + helper_length + prefix_length + strlen(tail) + 1u;
++    for (unsigned a = 0; a < 16; ++a) if (mask & (1u << a)) need += 64u;
++    if (need > capacity) return 0;
++    char* write = out;
++#define VP_PREP_COPY(data, count) do { size_t n_ = (count); memcpy(write, (data), n_); write += n_; } while (0)
++    VP_PREP_COPY(pull, sizeof(pull) - 1u); VP_PREP_COPY(helper, helper_length); VP_PREP_COPY(p, prefix_length);
++    for (unsigned a = 0; a < 16; ++a) if (mask & (1u << a))
++        write += sprintf(write, "    v[%u]=vp_pull(%u,input.vertex_id);\n", a, a);
++    VP_PREP_COPY(tail, strlen(tail) + 1u);
++#undef VP_PREP_COPY
++    *out_length = (size_t)(write - out - 1u);
++    return 1;
++}
++#endif
+diff --git a/libs/video/tests/test_prepare_control.c b/libs/video/tests/test_prepare_control.c
+new file mode 100644
+index 0000000..710752a
+--- /dev/null
++++ b/libs/video/tests/test_prepare_control.c
+@@ -0,0 +1,54 @@
++/* CPU-only worker admission/pause/lifetime fixture, no D3D device. */
++#define _WIN32_WINNT 0x0A00
++#include <stdio.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include "../rsx_prepare_control.h"
++static volatile LONG stop, started, finished;
++static HANDLE admitted[4], finish;
++static unsigned checks;
++static void check(int good, const char* text)
++{
++    if (!good) { fprintf(stderr, "FAIL: %s\n", text); exit(1); } ++checks;
++}
++static DWORD WINAPI worker(LPVOID opaque)
++{
++    const unsigned index = (unsigned)(uintptr_t)opaque;
++    while (ld_prepare_enter(&stop)) {
++        InterlockedIncrement(&started); SetEvent(admitted[index]);
++        WaitForSingleObject(finish, INFINITE);
++        InterlockedIncrement(&finished); ld_prepare_leave();
++    }
++    return 0;
++}
++int main(void)
++{
++    check(ld_prepare_set_paused(1), "pause before any worker exists");
++    check(!ld_prepare_set_paused(1), "same state is idempotent");
++    HANDLE threads[4]; finish = CreateEventA(NULL, TRUE, FALSE, NULL);
++    for (unsigned i = 0; i < 4; ++i) {
++        admitted[i] = CreateEventA(NULL, TRUE, FALSE, NULL);
++        threads[i] = CreateThread(NULL, 0, worker, (void*)(uintptr_t)i, 0, NULL);
++        check(admitted[i] && threads[i], "fixture worker started");
++    }
++    Sleep(30);
++    check(started == 0 && g_ld_prepare_in_flight == 0, "no background admission while initially paused");
++    check(ld_prepare_set_paused(0), "resume pending work");
++    check(WaitForMultipleObjects(4, admitted, TRUE, 1000) == WAIT_OBJECT_0, "all original pending jobs admitted after resume");
++    check(started == 4 && g_ld_prepare_in_flight == 4, "four independent worker jobs in flight");
++    check(ld_prepare_set_paused(1), "pause returns without waiting for in-flight completion");
++    check(finished == 0, "pause did not finish or discard existing work");
++    SetEvent(finish);
++    for (unsigned i = 0; i < 1000 && g_ld_prepare_in_flight; ++i) Sleep(1);
++    check(finished == 4 && !g_ld_prepare_in_flight, "in-flight work finishes normally while paused");
++    Sleep(30); check(started == 4, "no next job slips past pause admission barrier");
++    InterlockedExchange(&stop, 1); ld_prepare_wake();
++    check(WaitForMultipleObjects(4, threads, TRUE, 1000) == WAIT_OBJECT_0, "stop wakes and joins paused workers");
++    for (unsigned i = 0; i < 4; ++i) { CloseHandle(threads[i]); CloseHandle(admitted[i]); }
++    CloseHandle(finish);
++    check(!g_ld_prepare_in_flight, "worker lifetime counter balances");
++    ld_prepare_set_paused(0);
++    check(!ld_prepare_enter(&stop), "stopped worker cannot be admitted on resume");
++    printf("Prepare control: %u checks PASS (CPU only)\n", checks);
++    return 0;
++}
+diff --git a/libs/video/tests/test_pso_payload.c b/libs/video/tests/test_pso_payload.c
+new file mode 100644
+index 0000000..9102c48
+--- /dev/null
++++ b/libs/video/tests/test_pso_payload.c
+@@ -0,0 +1,108 @@
++/* CPU-only exact-payload/lifetime fixture. Optional argument audits existing
++ * .gpso files read-only; it never creates a D3D device or changes the cache. */
++#define _WIN32_WINNT 0x0A00
++#define _CRT_SECURE_NO_WARNINGS
++#include <windows.h>
++#include <initguid.h>
++#include <d3d12.h>
++#include "../rsx_pso_warmup.h"
++
++static unsigned checks;
++static void check(int good, const char* text)
++{
++    if (!good) { fprintf(stderr, "FAIL: %s\n", text); exit(1); }
++    ++checks;
++}
++static unsigned char vertex[65536], pixel[8192];
++static ld_pw_record record;
++static D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;
++
++static DWORD WINAPI concurrent(LPVOID unused)
++{
++    (void)unused;
++    for (unsigned i = 0; i < 128; ++i) {
++        ld_pw_entry e = {0}; D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = desc;
++        if (!ld_pw_retain_payload(&e, &record, &pd) ||
++            memcmp(pd.VS.pShaderBytecode, vertex, sizeof(vertex)) ||
++            memcmp(pd.PS.pShaderBytecode, pixel, sizeof(pixel))) return 1;
++        ld_pw_release_payload(&e);
++    }
++    return 0;
++}
++
++static void audit(const char* directory)
++{
++    g_ld_pw.payload_bytes = g_ld_pw.deduplicated_bytes = 0;
++    char search[MAX_PATH]; snprintf(search, sizeof(search), "%s\\*.gpso", directory);
++    WIN32_FIND_DATAA data; HANDLE find = FindFirstFileA(search, &data);
++    check(find != INVALID_HANDLE_VALUE, "audit recipe directory exists");
++    g_ld_pw.roots[0] = g_ld_pw.roots[1] = (ID3D12RootSignature*)(uintptr_t)1;
++    unsigned count = 0, rejected = 0; uint64_t input_bytes = 0;
++    do {
++        if (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
++        check(count < LD_PW_LIMIT, "all audit recipes fit index");
++        char path[MAX_PATH]; snprintf(path, sizeof(path), "%s\\%s", directory, data.cFileName);
++        FILE* f = fopen(path, "rb"); check(f != NULL, "audit open read-only");
++        fseek(f, 0, SEEK_END); long size = ftell(f); rewind(f);
++        check(size > 0 && size < (long)(sizeof(ld_pw_record) + 3u * LD_PW_MAX_SHADER), "bounded recipe file");
++        ld_pw_record* r = (ld_pw_record*)malloc((size_t)size); check(r != NULL, "audit buffer");
++        check(fread(r, 1, (size_t)size, f) == (size_t)size, "audit full read"); fclose(f);
++        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd; D3D12_INPUT_ELEMENT_DESC il[16];
++        if (!ld_pw_unpack(r, (size_t)size, &pd, il)) { rejected++; free(r); continue; }
++        ld_pw_entry* e = &g_ld_pw.entries[count]; e->key = r->key;
++        check(ld_pw_retain_payload(e, r, &pd), "all valid known recipes retained within budget");
++        check(ld_pw_key(&e->record->identity, &pd) == r->key, "interned DXBC preserves complete identity");
++        input_bytes += (uint64_t)size; count++; free(r);
++    } while (FindNextFileA(find, &data));
++    FindClose(find);
++    printf("AUDIT recipes=%u rejected=%u unique_dxbc=%u original_bytes=%llu retained_bytes=%llu saved_payload=%llu\n",
++        count, rejected, g_ld_pw.unique_blobs, (unsigned long long)input_bytes,
++        (unsigned long long)g_ld_pw.retained, (unsigned long long)g_ld_pw.deduplicated_bytes);
++    for (unsigned i = 0; i < count; ++i) ld_pw_release_payload(&g_ld_pw.entries[i]);
++    check(!g_ld_pw.retained && !g_ld_pw.unique_blobs, "audit releases all owned bytes");
++}
++
++int main(int argc, char** argv)
++{
++    InitializeSRWLock(&g_ld_pw.lock);
++    for (unsigned i = 0; i < sizeof(vertex); ++i) vertex[i] = (unsigned char)(i * 17u);
++    for (unsigned i = 0; i < sizeof(pixel); ++i) pixel[i] = (unsigned char)(i * 31u);
++    desc.VS.pShaderBytecode = vertex; desc.VS.BytecodeLength = sizeof(vertex);
++    desc.PS.pShaderBytecode = pixel; desc.PS.BytecodeLength = sizeof(pixel);
++    record.payload_size = sizeof(vertex) + sizeof(pixel);
++    ld_pw_entry entries[256] = {0};
++    for (unsigned i = 0; i < 256; ++i) {
++        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = desc;
++        check(ld_pw_retain_payload(&entries[i], &record, &pd), "repeated exact payload retained");
++        check(entries[i].shaders[0] == entries[0].shaders[0] &&
++              entries[i].shaders[1] == entries[0].shaders[1], "exact DXBC shares stable allocation");
++    }
++    check(g_ld_pw.unique_blobs == 2, "256 states use two DXBC allocations");
++    check(g_ld_pw.retained < 600000, "shared retention bounded independently of duplicate payload");
++    ld_pw_entry extra = {0}; D3D12_GRAPHICS_PIPELINE_STATE_DESC changed = desc;
++    unsigned char changed_vertex[sizeof(vertex)]; memcpy(changed_vertex, vertex, sizeof(vertex)); changed_vertex[23] ^= 1;
++    changed.VS.pShaderBytecode = changed_vertex;
++    check(ld_pw_retain_payload(&extra, &record, &changed), "changed DXBC retained separately");
++    check(extra.shaders[0] != entries[0].shaders[0] && extra.shaders[1] == entries[0].shaders[1], "one byte cannot alias exact program");
++    ld_pw_release_payload(&extra);
++    const uint64_t retained = g_ld_pw.retained;
++    g_ld_pw.retained = LD_PW_MAX_RETAINED - sizeof(record) + 1;
++    check(!ld_pw_retain_payload(&extra, &record, &changed) && !extra.record && !extra.shaders[0], "budget rejection leaves no partial ownership");
++    g_ld_pw.retained = retained;
++    /* Force failure after the header/first shared stage were acquired. */
++    g_ld_pw.retained = LD_PW_MAX_RETAINED - sizeof(record) - 1;
++    changed = desc; changed.PS.pShaderBytecode = changed_vertex; changed.PS.BytecodeLength = sizeof(pixel);
++    check(!ld_pw_retain_payload(&extra, &record, &changed) && !extra.record && !extra.shaders[0], "late budget failure rolls back acquired references");
++    check(g_ld_pw.retained == LD_PW_MAX_RETAINED - sizeof(record) - 1, "late failure restores accounting");
++    g_ld_pw.retained = retained;
++    HANDLE threads[8];
++    for (unsigned i = 0; i < 8; ++i) { threads[i] = CreateThread(NULL, 0, concurrent, NULL, 0, NULL); check(threads[i] != NULL, "concurrent fixture thread"); }
++    check(WaitForMultipleObjects(8, threads, TRUE, 10000) == WAIT_OBJECT_0, "concurrent references complete");
++    for (unsigned i = 0; i < 8; ++i) { DWORD rc; GetExitCodeThread(threads[i], &rc); check(rc == 0, "concurrent references exact"); CloseHandle(threads[i]); }
++    check(g_ld_pw.retained == retained && g_ld_pw.unique_blobs == 2, "concurrent reference ownership balances");
++    for (unsigned i = 0; i < 256; ++i) ld_pw_release_payload(&entries[i]);
++    check(g_ld_pw.retained == 0 && g_ld_pw.unique_blobs == 0, "last release frees every byte");
++    if (argc == 2) audit(argv[1]);
++    printf("PSO payload: %u checks PASS (CPU only)\n", checks);
++    return 0;
++}
+diff --git a/libs/video/tests/test_pso_warmup.c b/libs/video/tests/test_pso_warmup.c
+index 53b7cef..a6a6bbe 100644
+--- a/libs/video/tests/test_pso_warmup.c
++++ b/libs/video/tests/test_pso_warmup.c
+@@ -128,6 +128,18 @@ int main(int argc, char** argv)
+     ok(dev->lpVtbl->QueryInterface(dev, &IID_ID3D12Device1, (void**)&dev1), "Device1");
+     ok(dev1->lpVtbl->CreatePipelineLibrary(dev1, NULL, 0, &IID_ID3D12PipelineLibrary, (void**)&library), "pipeline library");
+     ok(library->lpVtbl->StorePipeline(library, L"p000000000000007B", direct), "store library recipe");
++    ld_prepare_set_paused(1);
++    ld_pw_start(dev, library, root, root, argv[1]);
++    Sleep(30);
++    check(g_ld_pw.entry_count == 1 && !g_ld_pw.ready && !g_ld_prepare_in_flight,
++          "paused PSO worker preserves known recipe without starting driver work");
++    ID3D12PipelineState* foreground = ld_pw_take(&pd, 0);
++    check(foreground != NULL && !g_ld_prepare_in_flight, "real foreground PSO remains available while worker paused");
++    render(dev, root, foreground, got);
++    check(!memcmp(expected, got, sizeof(got)), "paused preparation preserves every foreground pixel");
++    foreground->lpVtbl->Release(foreground);
++    ld_pw_stop(); check(!g_ld_pw.active && !g_ld_prepare_in_flight, "paused PSO stop joins and releases ownership");
++    ld_prepare_set_paused(0);
+     ld_pw_start(dev, library, root, root, argv[1]);
+     check(g_ld_pw.entry_count == 1, "one complete atomic recipe persisted");
+     for (unsigned waited = 0; !InterlockedCompareExchange(&g_ld_pw.ready, 0, 0) && waited < 10000; ++waited) Sleep(1);
+@@ -141,11 +153,18 @@ int main(int argc, char** argv)
+     pd.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+     check(ld_pw_take(&pd, 0) == NULL, "changed render state cannot reuse recipe");
+     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+-    ld_pw_record* r = g_ld_pw.entries[0].record;
+-    r->identity.desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
++    ld_pw_record* retained = g_ld_pw.entries[0].record;
++    retained->identity.desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+     check(ld_pw_take(&pd, 0) == NULL && g_ld_pw.collisions == 1, "full identity comparison rejects a hash collision");
+-    r->identity.desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+-    size_t n = sizeof(*r) + r->payload_size;
++    retained->identity.desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    /* Retained headers no longer carry duplicate payload; rebuild a private
++     * disk-format record for corruption checks, never mutate shared DXBC. */
++    size_t n = sizeof(*retained) + retained->payload_size;
++    ld_pw_record* r = (ld_pw_record*)malloc(n); check(r != NULL, "private validation record");
++    memcpy(r, retained, sizeof(*r));
++    unsigned char* payload = (unsigned char*)(r + 1);
++    memcpy(payload, pd.VS.pShaderBytecode, pd.VS.BytecodeLength);
++    memcpy(payload + pd.VS.BytecodeLength, pd.PS.pShaderBytecode, pd.PS.BytecodeLength);
+     D3D12_GRAPHICS_PIPELINE_STATE_DESC decoded; D3D12_INPUT_ELEMENT_DESC il[16];
+     check(ld_pw_unpack(r, n, &decoded, il), "recipe unpack valid");
+     check(!ld_pw_unpack(r, n - 1, &decoded, il), "truncated recipe rejected");
+@@ -158,6 +177,7 @@ int main(int argc, char** argv)
+     check(!ld_pw_unpack(r, n, &decoded, il), "changed DXBC checksum rejected");
+     ((unsigned char*)(r + 1))[4] ^= 1;
+     r->key ^= 1; check(!ld_pw_unpack(r, n, &decoded, il), "changed identity checksum rejected"); r->key ^= 1;
++    free(r);
+     warmed->lpVtbl->Release(warmed); ld_pw_stop();
+     /* Failure path: overwrite only the owned fixture recipe with truncation. */
+     char search[MAX_PATH]; snprintf(search, sizeof(search), "%s\\pipelines_v1\\*.gpso", argv[1]);
+diff --git a/libs/video/tests/test_shader_prepare.c b/libs/video/tests/test_shader_prepare.c
+new file mode 100644
+index 0000000..c61c008
+--- /dev/null
++++ b/libs/video/tests/test_shader_prepare.c
+@@ -0,0 +1,209 @@
++/* CPU/FXC-only fixture. Uses a NEW disposable directory and generated shader
++ * sources. No game execution, player files, D3D device or GPU submission. */
++#define _WIN32_WINNT 0x0A00
++#define _CRT_SECURE_NO_WARNINGS
++#include <windows.h>
++static void discovery_checkpoint(unsigned phase);
++#define LD_SP_DISCOVERY_TEST_HOOK(phase) discovery_checkpoint(phase)
++#include "../rsx_vertex_pull.h"
++#include "../rsx_vp_decompiler.h"
++#include "../rsx_shader_prepare.h"
++
++static unsigned checks;
++static HANDLE checkpoint_entered, checkpoint_release;
++static volatile LONG checkpoint_phase;
++static void discovery_checkpoint(unsigned phase)
++{
++    if ((LONG)phase != InterlockedCompareExchange(&checkpoint_phase, 0, 0)) return;
++    SetEvent(checkpoint_entered);
++    while (WaitForSingleObject(checkpoint_release, 10) != WAIT_OBJECT_0 &&
++           !InterlockedCompareExchange(&g_ld_sp.stop, 0, 0)) { }
++}
++static void check(int good, const char* text)
++{
++    if (!good) { fprintf(stderr, "FAIL: %s\n", text); exit(1); }
++    ++checks;
++}
++__declspec(dllexport) int gt6_prepare_pull(const char* input, size_t length,
++    char* output, size_t capacity, size_t* output_length)
++{
++    return rsx_vp_pull_prepare(input, length, rsx_vertex_pull_hlsl, output, capacity, output_length);
++}
++static ID3DBlob* compile_flags(const char* source, UINT flags)
++{
++    ID3DBlob *blob = NULL, *error = NULL;
++    HRESULT hr = D3DCompile(source, strlen(source), "xvs", NULL, NULL, "main", "vs_5_0",
++                           flags, 0, &blob, &error);
++    if (error) { if (FAILED(hr)) fprintf(stderr, "%s\n", (char*)error->lpVtbl->GetBufferPointer(error)); error->lpVtbl->Release(error); }
++    check(SUCCEEDED(hr) && blob, "fixture compiles with unchanged production VS flags");
++    return blob;
++}
++static ID3DBlob* compile(const char* source) { return compile_flags(source, D3DCOMPILE_SKIP_OPTIMIZATION); }
++static void write_source(const char* directory, const char* source, ID3DBlob* blob)
++{
++    const uint32_t length = (uint32_t)strlen(source); const uint64_t hash = ld_sp_hash(source, length);
++    char path[MAX_PATH]; snprintf(path, sizeof(path), "%s\\V_%016llX_%08X.bin", directory, (unsigned long long)hash, length);
++    ld_sp_header h = {0x43535A59u, 2, 'V', length, (uint32_t)blob->lpVtbl->GetBufferSize(blob), 0, hash};
++    FILE* f = fopen(path, "wb"); check(f != NULL, "owned fixture cache open");
++    check(fwrite(&h, sizeof(h), 1, f) == 1 && fwrite(source, 1, length, f) == length &&
++          fwrite(blob->lpVtbl->GetBufferPointer(blob), 1, h.blob_length, f) == h.blob_length,
++          "owned fixture cache write"); fclose(f);
++}
++static ld_sp_manifest* discovered(void)
++{
++    check(WaitForSingleObject(g_ld_sp.discovery, 10000) == WAIT_OBJECT_0,
++          "asynchronous discovery finishes within fixture deadline");
++    ld_sp_manifest* m = ld_sp_published();
++    check(m != NULL, "completed immutable manifest published");
++    return m;
++}
++static void ready_entry(ld_sp_entry* e)
++{
++    for (unsigned i = 0; i < 10000 && InterlockedCompareExchange(&e->state, 0, 0) < 2; ++i) Sleep(1);
++    check(InterlockedCompareExchange(&e->state, 0, 0) == 2,
++          "known shader ready before the first draw request");
++}
++static void ready(void)
++{
++    ld_sp_manifest* m = discovered();
++    check(m->count != 0, "known source remains in discovered manifest");
++    ready_entry(&m->entries[0]);
++}
++static void same(ID3DBlob* a, ID3DBlob* b)
++{
++    check(a && b && a->lpVtbl->GetBufferSize(a) == b->lpVtbl->GetBufferSize(b) &&
++        !memcmp(a->lpVtbl->GetBufferPointer(a), b->lpVtbl->GetBufferPointer(b), a->lpVtbl->GetBufferSize(a)),
++        "entire prepared DXBC byte-identical to direct compiler output");
++}
++static void mov(u32* words, u32 dest, u32 attr, int constant, int end)
++{
++    const u32 src = 0x1B00u | (constant ? 3u : 2u);
++    words[0] = (1u << 30) | (63u << 15); words[1] = (1u << 22) | (attr << 8) | (src >> 9);
++    words[2] = (src & 511u) << 23; words[3] = (15u << 13) | (dest << 2) | (end ? 1u : 0u);
++}
++int main(int argc, char** argv)
++{
++    _putenv_s("LD_SHADER_PREPARE", "1");
++    check(argc == 2 && CreateDirectoryA(argv[1], NULL), "provide NEW disposable fixture directory");
++    checkpoint_entered = CreateEventA(NULL, TRUE, FALSE, NULL);
++    checkpoint_release = CreateEventA(NULL, TRUE, FALSE, NULL);
++    check(checkpoint_entered && checkpoint_release, "owned discovery checkpoint events");
++    static char ia[262144], pull[262144], converted[262144], bad[262144]; size_t length;
++    u32 words[68];
++    for (unsigned i = 0; i < 512; ++i) {
++        const u32 mask = ((i * 1297u) & 0xFFFFu) | 6u;
++        unsigned count = 1; mov(words, 0, 0, 1, 0);
++        for (unsigned attr = 0; attr < 16; ++attr) if (mask & (1u << attr)) mov(words + 4u * count++, 1, attr, 0, 0);
++        words[count * 4u - 1u] |= 1u;
++        check(rsx_vp_decompile_compact_ex((u8*)words, count * 16u, 0, mask, ia, sizeof(ia)) == (int)count, "original emitter source");
++        check(rsx_vp_decompile_pull_ex((u8*)words, count * 16u, 0, mask, pull, sizeof(pull)) == (int)count, "actual pull emitter source");
++        check(gt6_prepare_pull(ia, strlen(ia), converted, sizeof(converted), &length), "strict source variant recognized");
++        check(length == strlen(pull) && !memcmp(converted, pull, length + 1), "entire source matches production emitter");
++    }
++    check(!gt6_prepare_pull(pull, strlen(pull), converted, sizeof(converted), &length), "already-pull source not transformed twice");
++    check(!gt6_prepare_pull(ia, strlen(ia), converted, 32, &length), "bounded output");
++    strcpy(bad, ia); char* at = strstr(bad, "input.a1;"); check(at != NULL, "fixture input exists"); at[7] = '2';
++    check(!gt6_prepare_pull(bad, strlen(bad), converted, sizeof(converted), &length), "changed input mapping rejected");
++    snprintf(bad, sizeof(bad), "%s\nTexture2D conflict : register(t19);\n", ia);
++    check(!gt6_prepare_pull(bad, strlen(bad), converted, sizeof(converted), &length), "t19 conflict rejected");
++    ID3DBlob *ordinary = compile(ia), *expected = compile(pull);
++    write_source(argv[1], ia, ordinary);
++    ld_sp_start(argv[1], rsx_vertex_pull_hlsl, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION);
++    check(g_ld_sp.active && g_ld_sp.discovery, "discovery worker owns asynchronous start"); ready();
++    check(ld_sp_published()->count == 1, "owned source published before draw");
++    ID3DBlob* prepared = ld_sp_take(pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull))); same(expected, prepared);
++    check(g_ld_sp.compiled == 1 && g_ld_sp.written == 1 && g_ld_sp.foreground == 0, "cold compile completed entirely in worker");
++    strcpy(bad, pull); bad[strlen(bad) - 2] ^= 1;
++    check(ld_sp_take(bad, (uint32_t)strlen(bad), ld_sp_hash(pull, strlen(pull))) == NULL, "hash collision does not replace source comparison");
++    char prepared_path[MAX_PATH]; check(ld_sp_path(prepared_path, &ld_sp_published()->entries[0]), "prepared exact path");
++    ld_sp_stop(); same(expected, prepared); prepared->lpVtbl->Release(prepared);
++    ld_sp_start(argv[1], rsx_vertex_pull_hlsl, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION); ready();
++    check(g_ld_sp.compiled == 0 && g_ld_sp.disk_hits == 1, "restart uses exact persisted bytecode"); ld_sp_stop();
++    FILE* f = fopen(prepared_path, "r+b"); check(f != NULL, "owned corrupt-cache fixture open");
++    fseek(f, 4, SEEK_SET); const uint32_t wrong_version = 999; fwrite(&wrong_version, 4, 1, f); fclose(f);
++    ld_sp_start(argv[1], rsx_vertex_pull_hlsl, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION); ready();
++    check(g_ld_sp.rejected == 1 && g_ld_sp.compiled == 1, "schema change rejects cache and rebuilds exact program"); ld_sp_stop();
++    ld_sp_start(argv[1], rsx_vertex_pull_hlsl, 0x43535A59u, 2, 0); ready();
++    check(g_ld_sp.rejected == 1 && g_ld_sp.compiled == 1, "changed compiler flags reject tagged cache");
++    ID3DBlob* optimized = compile_flags(pull, 0);
++    prepared = ld_sp_take(pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull))); same(optimized, prepared);
++    prepared->lpVtbl->Release(prepared); optimized->lpVtbl->Release(optimized); ld_sp_stop();
++    char updated_helper[sizeof(rsx_vertex_pull_hlsl) + 32];
++    snprintf(updated_helper, sizeof(updated_helper), "%s// helper revision\n", rsx_vertex_pull_hlsl);
++    ld_sp_start(argv[1], updated_helper, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION); ready();
++    check(g_ld_sp.compiled == 1 && !g_ld_sp.disk_hits &&
++          !ld_sp_take(pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull))),
++          "helper revision changes exact source key and cannot replace another draw"); ld_sp_stop();
++    ld_prepare_set_paused(1);
++    ld_sp_start(argv[1], rsx_vertex_pull_hlsl, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION);
++    Sleep(30);
++    check(!ld_sp_published() && !g_ld_sp.scanned && !g_ld_sp.ready && !g_ld_sp.next && !g_ld_prepare_in_flight,
++          "initial pause starts asynchronously without any enumeration or partial publication");
++    check(!ld_sp_take(pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull))),
++          "foreground uses normal compile/cache immediately before discovery publication");
++    ld_sp_stop(); check(!g_ld_sp.active && !g_ld_prepare_in_flight, "paused shader stop joins safely");
++    strcpy(updated_helper, rsx_vertex_pull_hlsl);
++    ld_sp_start(argv[1], updated_helper, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION);
++    memset(updated_helper, 'x', sizeof(updated_helper));
++    ld_prepare_set_paused(0); ready();
++    prepared = ld_sp_take(pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull))); same(expected, prepared);
++    check(g_ld_sp.hits == 1, "start copied caller helper before return and background access");
++    prepared->lpVtbl->Release(prepared); ld_sp_stop();
++    for (unsigned i = 0; i < 32; ++i) { snprintf(bad, sizeof(bad), "%s\n// cancellation variant %u\n", ia, i); write_source(argv[1], bad, ordinary); }
++    InterlockedExchange(&checkpoint_phase, 1);
++    ld_sp_start(argv[1], rsx_vertex_pull_hlsl, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION);
++    check(WaitForSingleObject(checkpoint_entered, 10000) == WAIT_OBJECT_0, "discovery paused after first private file");
++    check(g_ld_sp.scanned == 1 && !ld_sp_published(), "partial manifest is invisible to foreground");
++    check(!ld_sp_take(pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull))),
++          "partial discovery never waits or replaces a foreground shader");
++    ld_prepare_set_paused(1); SetEvent(checkpoint_release); Sleep(30);
++    check(g_ld_sp.scanned == 1 && !ld_sp_published() && !g_ld_prepare_in_flight,
++          "pause retains private partial discovery without reading another file");
++    ld_sp_stop();
++    check(!g_ld_sp.active && !ld_sp_published() && !g_ld_sp.discovery && !g_ld_prepare_in_flight,
++          "cancel joins partial discovery and destroys unpublished ownership");
++    ResetEvent(checkpoint_entered); ResetEvent(checkpoint_release);
++    InterlockedExchange(&checkpoint_phase, 2); ld_prepare_set_paused(0);
++    ld_sp_start(argv[1], rsx_vertex_pull_hlsl, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION);
++    check(WaitForSingleObject(checkpoint_entered, 10000) == WAIT_OBJECT_0, "complete private index checkpoint reached");
++    check(!ld_sp_published(), "complete index still invisible before atomic publication");
++    ld_prepare_set_paused(1); SetEvent(checkpoint_release);
++    ld_sp_manifest* m = discovered();
++    check(m->count == 33 && !g_ld_sp.next && !g_ld_prepare_in_flight, "publication preserves every paused queued source");
++    for (unsigned i = 0; i < m->count; ++i)
++        check(ld_sp_find(m, m->entries[i].source, m->entries[i].length, m->entries[i].hash) == &m->entries[i],
++              "all published index entries resolve their complete source exactly");
++    ld_sp_entry* requested = ld_sp_find(m, pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull)));
++    check(requested && !ld_sp_take(pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull))) && requested->state == 4,
++          "published queued shader takes normal foreground path while paused");
++    ld_sp_entry* pending = requested == &m->entries[0] ? &m->entries[1] : &m->entries[0];
++    InterlockedExchange(&checkpoint_phase, 0); ld_prepare_set_paused(0); ready_entry(pending);
++    check(ld_sp_published() == m && m->count == 33, "resume prepares the same immutable manifest");
++    ld_prepare_set_paused(1); ld_sp_stop();
++    check(!g_ld_sp.active && !g_ld_sp.threads_count && !ld_sp_published(), "stop joins workers before freeing owned sources");
++    for (unsigned i = 0; i < 16; ++i) {
++        ld_sp_start(argv[1], rsx_vertex_pull_hlsl, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION);
++        ld_sp_stop();
++        check(!g_ld_sp.active && !g_ld_sp.discovery && !ld_sp_published() && !g_ld_prepare_in_flight,
++              "immediate stop/restart cannot publish a previous generation");
++    }
++    char search[MAX_PATH]; snprintf(search, sizeof(search), "%s\\*.prepare.*.tmp", argv[1]);
++    WIN32_FIND_DATAA data; HANDLE find = FindFirstFileA(search, &data);
++    check(find == INVALID_HANDLE_VALUE, "cancellation leaves no partial cache files");
++    char empty[MAX_PATH]; snprintf(empty, sizeof(empty), "%s\\empty", argv[1]);
++    check(CreateDirectoryA(empty, NULL), "empty cache fixture created");
++    ld_prepare_set_paused(0);
++    ld_sp_start(empty, rsx_vertex_pull_hlsl, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION);
++    m = discovered();
++    check(!m->count && !g_ld_sp.threads_count &&
++          !ld_sp_take(pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull))),
++          "empty cache completes asynchronously and retains normal path without workers");
++    ld_sp_stop();
++    _putenv_s("LD_SHADER_PREPARE", "0"); ld_sp_start(argv[1], rsx_vertex_pull_hlsl, 0x43535A59u, 2, D3DCOMPILE_SKIP_OPTIMIZATION);
++    check(!g_ld_sp.active && ld_sp_take(pull, (uint32_t)strlen(pull), ld_sp_hash(pull, strlen(pull))) == NULL, "rollback retains normal compile path");
++    ld_prepare_set_paused(0);
++    CloseHandle(checkpoint_release); CloseHandle(checkpoint_entered);
++    expected->lpVtbl->Release(expected); ordinary->lpVtbl->Release(ordinary);
++    printf("Shader prepare: %u checks PASS (CPU FXC, exact emitter/DXBC, asynchronous publication, cancellation, cache invalidation, ownership)\n", checks);
++    return 0;
++}

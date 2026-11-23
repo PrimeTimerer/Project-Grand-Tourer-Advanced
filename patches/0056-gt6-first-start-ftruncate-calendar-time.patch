@@ -1,0 +1,123 @@
+diff --git a/libs/misc/cellOskDialog.c b/libs/misc/cellOskDialog.c
+index 757713f..14034ce 100644
+--- a/libs/misc/cellOskDialog.c
++++ b/libs/misc/cellOskDialog.c
+@@ -155,7 +155,9 @@ static DWORD WINAPI osk_thread(LPVOID unused)
+                               CLEARTYPE_QUALITY, 0, L"Meiryo UI");
+         RECT cr; GetClientRect(s_osk_hwnd, &cr);
+         const int cw = cr.right - cr.left;
+-        HWND lbl = CreateWindowExW(0, L"STATIC", s_osk_prompt[0] ? s_osk_prompt : L"",
++        /* A title that gives no prompt (Gran Turismo 6, the player's name on a first start) left the box with no
++         * word about what it is for: say how to use it then. */
++        HWND lbl = CreateWindowExW(0, L"STATIC", s_osk_prompt[0] ? s_osk_prompt : L"Type the text, then press Enter.",
+             WS_CHILD | WS_VISIBLE, 16, 12, cw - 32, 28, s_osk_hwnd, NULL, hi, NULL);
+         s_osk_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", s_osk_init,
+             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 16, 46, cw - 32, 34,
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 3f85549..7849dd9 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -1115,6 +1115,33 @@ static void fs_rw_with_offset(ppu_context* ctx, int writing)
+ static void cellFsReadWithOffset(ppu_context* ctx)  { fs_rw_with_offset(ctx, 0); }
+ static void cellFsWriteWithOffset(ppu_context* ctx) { fs_rw_with_offset(ctx, 1); }
+ 
++/* cellFsFtruncate(fd, u64 size): the file is cut or grown to `size` (grown with zeros); the position stays.
++ * Unregistered here, the call reached the library's own cellFsFtruncate (libs/filesystem/cellFs.c), whose handle
++ * table knows none of the handles this file gives out: EBADF for every call. Gran Turismo 6 sizes the databases it
++ * makes on a first start this way (USRDIR/db/userdb0101.dat to 8 MB, the cache's game024.db to 32 KB), took the
++ * failure for a full disc ("Insufficient free space on Hard Disk Drive (HDD). At least 32MB required.") and stayed on
++ * its first screen. A copy of the game that had been started once elsewhere has those files already, which is why
++ * it never showed there. */
++static void cellFsFtruncate(ppu_context* ctx)
++{
++    int fd        = (int)(uint32_t)ctx->gpr[3];
++    uint64_t size = ctx->gpr[4];
++    FILE* f = fd_file(fd);
++    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)(-2147418070); return; }   /* 0x8001002A CELL_FS_EBADF */
++    HOST_LOCKFILE(f);
++    fflush(f);
++#ifdef _WIN32
++    const int rc = _chsize_s(_fileno(f), (long long)size);
++#else
++    const int rc = ftruncate(fileno(f), (off_t)size);
++#endif
++    HOST_UNLOCKFILE(f);
++    if (getenv("PS3_FSLOG") || rc != 0)
++        fprintf(stderr, "[fs] ftruncate fd=%d '%s' size=%llu -> %s\n", fd, g_fd_path[fd], (unsigned long long)size,
++                rc == 0 ? "OK" : "failed");
++    ctx->gpr[3] = rc == 0 ? (uint64_t)CELL_OK : (uint64_t)(int64_t)CELL_FS_EIO;
++}
++
+ extern "C" void ppu_fs_register(void)
+ {
+     ps3_hle_register_ctx(0x0D5B4A14u, "cellFsReadWithOffset",  cellFsReadWithOffset);
+@@ -1140,6 +1167,7 @@ extern "C" void ppu_fs_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsFtruncate"), "cellFsFtruncate", cellFsFtruncate);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsChmod"),         "cellFsChmod",         cellFsChmod);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsUtime"),         "cellFsUtime",         cellFsUtime);
+diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
+index a6b318b..d428595 100644
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -395,14 +395,52 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
+     uint64_t sec, nsec;
+ 
+ #ifdef _WIN32
++    /* The console answers the calendar time here: seconds and nanoseconds since 1970-01-01 UTC. This path gave the
++     * performance counter as it stands, which is the time since the PC was started - Gran Turismo 6 stamped a car
++     * bought two days after the last start of Windows "03/01/1970", and its day changed with the PC's uptime.
++     * The calendar time is read once and carried on by the performance counter: the value runs as evenly as before
++     * (a correction of the PC's clock under way does not jump it) and the difference between two readings is what
++     * it was. PS3_CURRENT_TIME=uptime = as before. */
++    static volatile LONG s_wall_state = 0;      /* 0 not read yet, 1 being read, 2 ready */
++    static LONGLONG s_wall_qpc0;
++    static uint64_t s_wall_ns0;
++    static int      s_wall_uptime;
+     ensure_qpc_init();
++    if (s_wall_state != 2) {
++        if (InterlockedCompareExchange(&s_wall_state, 1, 0) == 0) {
++            FILETIME ft;
++            LARGE_INTEGER q0;
++            GetSystemTimePreciseAsFileTime(&ft);
++            QueryPerformanceCounter(&q0);
++            const uint64_t t100 = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;   /* 100 ns since 1601 */
++            s_wall_ns0  = (t100 - 116444736000000000ULL) * 100ULL;
++            s_wall_qpc0 = q0.QuadPart;
++            const char* e = getenv("PS3_CURRENT_TIME");
++            s_wall_uptime = e && !strcmp(e, "uptime");
++            { const time_t t = (time_t)(s_wall_ns0 / 1000000000ULL);
++              struct tm g;
++              if (gmtime_s(&g, &t) == 0)
++                  fprintf(stderr, "[time] the game's calendar time starts at %04d-%02d-%02d %02d:%02d:%02d UTC%s\n",
++                          g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour, g.tm_min, g.tm_sec,
++                          s_wall_uptime ? " (not used: PS3_CURRENT_TIME=uptime)" : ""); }
++            InterlockedExchange(&s_wall_state, 2);
++        } else {
++            while (s_wall_state != 2) YieldProcessor();
++        }
++    }
+     LARGE_INTEGER now;
+     QueryPerformanceCounter(&now);
+-
+-    /* Convert QPC to seconds + nanoseconds */
+-    sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
+-    uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
+-    nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
++    if (s_wall_uptime) {
++        sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
++        uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
++        nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
++    } else {
++        const uint64_t d = now.QuadPart > s_wall_qpc0 ? (uint64_t)(now.QuadPart - s_wall_qpc0) : 0;
++        const uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
++        const uint64_t ns = s_wall_ns0 + (d / q) * 1000000000ULL + (d % q) * 1000000000ULL / q;
++        sec  = ns / 1000000000ULL;
++        nsec = ns % 1000000000ULL;
++    }
+ #else
+     struct timespec ts;
+     clock_gettime(CLOCK_REALTIME, &ts);

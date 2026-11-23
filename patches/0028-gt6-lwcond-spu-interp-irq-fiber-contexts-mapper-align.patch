@@ -1,0 +1,785 @@
+diff --git a/libs/spurs/cellFiber.c b/libs/spurs/cellFiber.c
+index 3673985..77fb063 100644
+--- a/libs/spurs/cellFiber.c
++++ b/libs/spurs/cellFiber.c
+@@ -547,3 +547,248 @@ s32 cellFiberPpuJoinFiber(CellFiberPpu* fiber, s32* status)
+     UNLOCK();
+     return rc;
+ }
++
++/* ---------------------------------------------------------------------------
++ * Fiber contexts (cellFiberPpuContext*)
++ *
++ * The layer under the scheduler: a guest stack and a register set, switched by the title itself. Gran Turismo 6
++ * runs its menu event loop and its script threads this way (one Run per frame from the thread that owns them).
++ *
++ * As with the scheduler's fibers, a context has its own host stack and its own ppu_context. r13 and the thread id
++ * are not part of a context on the console (a context runs on whichever thread entered it), so every Run copies
++ * them from the entering thread. ppu_loader's per-thread indirect-call counts would only grow if they stayed with
++ * the host thread while guest frames are parked in a context, so each context keeps its own while switched out.
++ * -----------------------------------------------------------------------*/
++
++#define PCTX_HOST_STACK   (8u * 1024u * 1024u)
++
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((weak)) int* ps3_ppu_dispatch_depth_slot(void);   /* ppu_loader.cpp; absent in fixtures */
++__attribute__((weak)) int* ps3_ppu_vcall_sp_slot(void);
++#  define PCTX_COUNTS() (ps3_ppu_dispatch_depth_slot && ps3_ppu_vcall_sp_slot)
++#else
++static int* ps3_ppu_dispatch_depth_slot(void) { return NULL; }
++static int* ps3_ppu_vcall_sp_slot(void) { return NULL; }
++#  define PCTX_COUNTS() 0
++#endif
++
++enum { C_READY, C_RUNNING, C_ENDED };
++
++typedef struct PpuCtx PpuCtx;
++struct PpuCtx {
++    PpuCtx* next;
++    u32     ea;                  /* the guest CellFiberPpuContext */
++    int     state;
++    int     ended;               /* its entry returned */
++    s32     cause;               /* what it passed to ReturnToThread */
++    int     depth, vsp;          /* ppu_loader's counts for the frames parked in it */
++#ifdef _WIN32
++    void*   host_fiber;
++    void*   back;                /* the Run that entered it */
++#else
++    ucontext_t uc, back;
++    void*   host_stack;
++#endif
++    ppu_context ctx;
++};
++
++static PpuCtx* s_pctxs;
++/* The context running on this host thread, if any. */
++static PPU_THREAD_LOCAL PpuCtx* t_pctx;
++
++static PpuCtx* find_pctx(u32 ea)                 /* the lock is held */
++{
++    for (PpuCtx* c = s_pctxs; c; c = c->next)
++        if (c->ea == ea) return c;
++    return NULL;
++}
++
++static void pctx_body(PpuCtx* c);
++
++#ifdef _WIN32
++static VOID CALLBACK pctx_entry(void* p) { pctx_body((PpuCtx*)p); }
++static int pctx_host_create(PpuCtx* c)
++{
++    c->host_fiber = CreateFiberEx(0, PCTX_HOST_STACK, 0, pctx_entry, c);
++    return c->host_fiber != NULL;
++}
++static void pctx_host_destroy(PpuCtx* c) { if (c->host_fiber) DeleteFiber(c->host_fiber); c->host_fiber = NULL; }
++static void pctx_host_enter(PpuCtx* c)
++{
++    if (!IsThreadAFiber()) ConvertThreadToFiber(NULL);
++    c->back = GetCurrentFiber();
++    SwitchToFiber(c->host_fiber);
++}
++static void pctx_host_leave(PpuCtx* c) { SwitchToFiber(c->back); }
++#else
++static void pctx_entry(unsigned hi, unsigned lo) { pctx_body((PpuCtx*)(((uintptr_t)hi << 32) | lo)); }
++static int pctx_host_create(PpuCtx* c)
++{
++    c->host_stack = malloc(PCTX_HOST_STACK);
++    if (!c->host_stack) return 0;
++    getcontext(&c->uc);
++    c->uc.uc_stack.ss_sp   = c->host_stack;
++    c->uc.uc_stack.ss_size = PCTX_HOST_STACK;
++    c->uc.uc_link          = NULL;
++    uintptr_t p = (uintptr_t)c;
++    makecontext(&c->uc, (void (*)(void))pctx_entry, 2, (unsigned)(p >> 32), (unsigned)(p & 0xFFFFFFFFu));
++    return 1;
++}
++static void pctx_host_destroy(PpuCtx* c) { free(c->host_stack); c->host_stack = NULL; }
++static void pctx_host_enter(PpuCtx* c) { swapcontext(&c->back, &c->uc); }
++static void pctx_host_leave(PpuCtx* c) { swapcontext(&c->uc, &c->back); }
++#endif
++
++/* The context's first frame, on its own host stack. */
++static void pctx_body(PpuCtx* c)
++{
++    if (g_ppu_thread_entry_trampoline)
++        g_ppu_thread_entry_trampoline(&c->ctx);
++    /* The entry returned, which the SDK does not allow. Hand control back for good. */
++    c->ended = 1;
++    c->cause = 0;
++    for (;;) pctx_host_leave(c);
++}
++
++s32 _cellFiberPpuContextAttributeInitialize(CellFiberPpuContextAttribute* attr, u32 sdkVersion)
++{
++    (void)sdkVersion;
++    if (!attr) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
++    vm_memset((u32)(uintptr_t)attr, 0, CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_SIZE);
++    return CELL_OK;
++}
++
++s32 cellFiberPpuContextInitialize(CellFiberPpuContext* context, u32 entry, u64 arg,
++                                  void* eaStack, u32 sizeStack, const CellFiberPpuContextAttribute* attr)
++{
++    (void)attr;
++    const u32 ea       = (u32)(uintptr_t)context;
++    const u32 stack_ea = (u32)(uintptr_t)eaStack;
++    if (!ea || !entry || !stack_ea) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
++    if (ea % CELL_FIBER_PPU_CONTEXT_ALIGN) return (s32)CELL_FIBER_ERROR_ALIGN;
++    if (sizeStack < FIBER_MIN_STACK) return (s32)CELL_FIBER_ERROR_INVAL;
++
++    PpuCtx* c = (PpuCtx*)calloc(1, sizeof *c);
++    if (!c) return (s32)CELL_FIBER_ERROR_NOMEM;
++    c->ea    = ea;
++    c->state = C_READY;
++    if (g_active_ctx) c->ctx = *g_active_ctx;    /* the creator's FP modes; the rest is set here or by Run */
++    c->ctx.gpr[1] = (stack_ea + sizeStack - FIBER_STACK_TOP_PAD) & ~0xFull;
++    c->ctx.gpr[3] = arg;
++    c->ctx.gpr[4] = 0;                           /* fiberFrom: entered from a thread */
++    c->ctx.cia    = entry;
++    c->ctx.lr     = 0;
++    c->ctx.reserve_valid = 0;
++    vm_write64((u32)c->ctx.gpr[1], 0);           /* end of the back chain */
++    if (!pctx_host_create(c)) { free(c); return (s32)CELL_FIBER_ERROR_NOMEM; }
++
++    /* The same memory initialised again without a Finalize replaces the old context. */
++    PpuCtx* old = NULL;
++    LOCK();
++    for (PpuCtx** pc = &s_pctxs; *pc; pc = &(*pc)->next)
++        if ((*pc)->ea == ea) { old = *pc; *pc = old->next; break; }
++    if (old && old->state == C_RUNNING) {        /* it is running: put it back and refuse */
++        old->next = s_pctxs; s_pctxs = old;
++        UNLOCK();
++        pctx_host_destroy(c); free(c);
++        return (s32)CELL_FIBER_ERROR_STAT;
++    }
++    c->next = s_pctxs;
++    s_pctxs = c;
++    UNLOCK();
++    if (old) { pctx_host_destroy(old); free(old); }
++    return CELL_OK;
++}
++
++s32 cellFiberPpuContextFinalize(CellFiberPpuContext* context)
++{
++    const u32 ea = (u32)(uintptr_t)context;
++    if (!ea) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
++
++    PpuCtx* c = NULL;
++    LOCK();
++    for (PpuCtx** pc = &s_pctxs; *pc; pc = &(*pc)->next)
++        if ((*pc)->ea == ea) { c = *pc; if (c->state != C_RUNNING) *pc = c->next; break; }
++    const s32 rc = !c ? (s32)CELL_FIBER_ERROR_INVAL : c->state == C_RUNNING ? (s32)CELL_FIBER_ERROR_STAT : CELL_OK;
++    UNLOCK();
++    if (rc == CELL_OK) { pctx_host_destroy(c); free(c); }   /* the guest frames parked in it are dropped */
++    return rc;
++}
++
++s32 cellFiberPpuContextRun(CellFiberPpuContext* context, s32* cause, CellFiberPpuContext** fiberFrom,
++                           const void* option)
++{
++    (void)option;
++    const u32 ea = (u32)(uintptr_t)context;
++    if (!ea) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
++    if (ea % CELL_FIBER_PPU_CONTEXT_ALIGN) return (s32)CELL_FIBER_ERROR_ALIGN;
++
++    LOCK();
++    PpuCtx* c = find_pctx(ea);
++    if (!c) { UNLOCK(); return (s32)CELL_FIBER_ERROR_INVAL; }
++    if (c->state != C_READY) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
++    c->state = C_RUNNING;
++    UNLOCK();
++
++    ppu_context* entering = g_active_ctx;
++    PpuCtx*      outer    = t_pctx;              /* a context may enter another; it comes back here */
++    if (entering) {
++        c->ctx.gpr[13]   = entering->gpr[13];
++        c->ctx.thread_id = entering->thread_id;
++    }
++    int depth = 0, vsp = 0;
++    if (PCTX_COUNTS()) {
++        depth = *ps3_ppu_dispatch_depth_slot(); *ps3_ppu_dispatch_depth_slot() = c->depth;
++        vsp   = *ps3_ppu_vcall_sp_slot();       *ps3_ppu_vcall_sp_slot()       = c->vsp;
++    }
++    t_pctx       = c;
++    g_active_ctx = &c->ctx;
++    pctx_host_enter(c);          /* back here when it returns to the thread */
++    g_active_ctx = entering;
++    t_pctx       = outer;
++    if (PCTX_COUNTS()) {
++        c->depth = *ps3_ppu_dispatch_depth_slot(); *ps3_ppu_dispatch_depth_slot() = depth;
++        c->vsp   = *ps3_ppu_vcall_sp_slot();       *ps3_ppu_vcall_sp_slot()       = vsp;
++    }
++
++    /* Only now may another Run enter it: it has left its host stack. */
++    LOCK();
++    c->state = c->ended ? C_ENDED : C_READY;
++    const s32 why = c->cause;
++    UNLOCK();
++    if (cause)     vm_write32((u32)(uintptr_t)cause, (u32)why);
++    if (fiberFrom) vm_write32((u32)(uintptr_t)fiberFrom, ea);
++    return CELL_OK;
++}
++
++s32 cellFiberPpuContextReturnToThread(s32 cause)
++{
++    PpuCtx* c = t_pctx;
++    if (!c) return (s32)CELL_FIBER_ERROR_PERM;
++    c->cause = cause;
++    pctx_host_leave(c);          /* resumed by the next Run of this context */
++    return CELL_OK;
++}
++/* Diagnostics: every fiber context with its state and where its guest code is (lr, r1 and the return addresses
++ * up the guest back chain), in the format of ppu_report_guest_lrs. A context that is running reads as the thread
++ * that entered it does: live, unsynchronised. */
++void ps3_fiber_contexts_report(void)
++{
++    static const char* const names[] = { "ready", "running", "ended" };
++    LOCK();
++    for (const PpuCtx* c = s_pctxs; c; c = c->next) {
++        char bt[160]; int n = 0; bt[0] = 0;
++        u32 sp = (u32)c->ctx.gpr[1];
++        for (int i = 0; i < 12 && sp >= 0x10000u && !(sp & 7u); i++) {
++            const u32 up = (u32)vm_read64(sp);
++            if (up <= sp || up - sp > 0x100000u) break;
++            n += snprintf(bt + n, sizeof bt - (size_t)n, " %08X", (u32)vm_read64(up + 16));
++            if (n >= (int)sizeof bt - 10) break;
++            sp = up;
++        }
++        fprintf(stderr, "[WATCHDOG]   fiber-ctx 0x%08X %-7s tid=%-3u lr=0x%08X  r3=0x%08X sp=0x%08X  bt:%s\n",
++                c->ea, names[c->state], (unsigned)c->ctx.thread_id, (u32)c->ctx.lr, (u32)c->ctx.gpr[3],
++                (u32)c->ctx.gpr[1], bt);
++    }
++    UNLOCK();
++}
+\ No newline at end of file
+diff --git a/libs/spurs/cellFiber.h b/libs/spurs/cellFiber.h
+index be88d44..6e306d0 100644
+--- a/libs/spurs/cellFiber.h
++++ b/libs/spurs/cellFiber.h
+@@ -84,6 +84,32 @@ CellFiberPpu* cellFiberPpuSelf(void);
+ s32 cellFiberPpuSendSignal(CellFiberPpu* fiber, u32* numWorker);
+ s32 cellFiberPpuJoinFiber(CellFiberPpu* fiber, s32* status);
+ 
++/* ---------------------------------------------------------------------------
++ * Fiber contexts: the layer under the scheduler. A context is a guest stack and
++ * a register set and nothing else; the title schedules them itself. A thread
++ * enters one with cellFiberPpuContextRun and gets control back when the code
++ * running in it calls cellFiberPpuContextReturnToThread; the next Run of that
++ * context carries on after that call.
++ * -----------------------------------------------------------------------*/
++#define CELL_FIBER_PPU_CONTEXT_SIZE             640
++#define CELL_FIBER_PPU_CONTEXT_ALIGN            16
++#define CELL_FIBER_PPU_CONTEXT_ATTRIBUTE_SIZE   128
++
++typedef struct CellFiberPpuContext          CellFiberPpuContext;
++typedef struct CellFiberPpuContextAttribute CellFiberPpuContextAttribute;
++
++s32 _cellFiberPpuContextAttributeInitialize(CellFiberPpuContextAttribute* attr, u32 sdkVersion);
++/* `entry` is the OPD of void entry(u64 arg, CellFiberPpuContext* fiberFrom); it must not return. */
++s32 cellFiberPpuContextInitialize(CellFiberPpuContext* context, u32 entry, u64 arg,
++                                  void* eaStack, u32 sizeStack, const CellFiberPpuContextAttribute* attr);
++s32 cellFiberPpuContextFinalize(CellFiberPpuContext* context);
++/* Runs the context on the calling thread until it returns to the thread; *cause is the value it passed and
++ * *fiberFrom the context that returned. `option` is not modelled. */
++s32 cellFiberPpuContextRun(CellFiberPpuContext* context, s32* cause, CellFiberPpuContext** fiberFrom,
++                           const void* option);
++/* Called in a context: back to the thread that runs it. */
++s32 cellFiberPpuContextReturnToThread(s32 cause);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 6af0e19..ce35a6f 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -945,9 +945,26 @@ extern "C" void ppu_report_guest_lrs(void)
+     for (long i = 0; i < n; i++) {
+         ppu_context* c = g_resv_ctxs[i];
+         if (!c) continue;
+-        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
++        /* ...and the callers, from the guest back chain (0(sp) = caller's frame,
++         * 16(caller frame) = the return address the callee's prologue saved).
++         * lr alone names the last call made, which for a thread parked in a
++         * wait is the same wrapper for every waiter. Racy by nature (the thread
++         * may be running); every step is bounds-checked. */
++        char bt[200]; int bp = 0; bt[0] = 0;
++        { uint32_t sp = (uint32_t)c->gpr[1];
++          for (int f = 0; f < 10 && sp >= 0x10000u && vm_base; f++) {
++              const uint8_t* p = vm_base + sp;
++              const uint32_t up = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | ((uint32_t)p[6] << 8) | p[7];
++              if (up <= sp || up - sp > 0x100000u) break;
++              const uint8_t* q = vm_base + up + 20;
++              const uint32_t ra = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
++              if (ra) bp += snprintf(bt + bp, sizeof bt - bp, " %08X", ra);
++              if (bp > (int)sizeof bt - 12) break;
++              sp = up;
++          } }
++        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X  bt:%s\n",
+                 (unsigned)c->thread_id, (uint32_t)c->lr,
+-                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
++                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1], bt);
+         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
+          * targets. lr cannot see those (bctrl does not write it), so for a
+          * thread looping on a vtable call the ring is the only record of where
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 619f919..27481b7 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -157,9 +157,18 @@ static void sys_lwmutex_create(ppu_context* ctx)
+  * we stamp (only the holder ever writes owner=self, so the re-lock check is
+  * race-free). Keyed by guest address in an open-addressed table. */
+ #define LWM_HASH 65536u
++struct LwcWaiter;
+ static struct LwmSlot { volatile long addr; HANDLE sem; volatile long state;
+     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
+-    volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
++    volatile unsigned long long acq_cpu_us;
++    struct LwcWaiter* handoff;   /* signalled lwcond waiters this lock goes to next, in order (s_lwc_lock) */
++    } g_lwm[LWM_HASH];
++#ifdef _WIN32
++/* One record per thread inside sys_lwcond_wait (see "REAL waits" below). */
++static SRWLOCK s_lwc_lock = SRWLOCK_INIT;
++struct LwcWaiter { uint32_t lwcond; uint32_t tid; int signalled; int granted; struct LwmSlot* sl;
++                   CONDITION_VARIABLE cv; struct LwcWaiter* next; struct LwcWaiter* hnext; };
++#endif
+ extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
+              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
+              unsigned ppu_thread_prof_pc(unsigned tid); }
+@@ -242,9 +251,46 @@ static int lwm_acquire(struct LwmSlot* sl, uint64_t timeout_us)
+     }
+     return 1;
+ }
++#ifdef _WIN32
++/* lv2 hands an lwmutex over directly: a thread that sys_lwcond_signal woke is
++ * moved onto the mutex's queue and owns the mutex the moment the signaller
++ * lets go of it -- nobody else can take it in between. Titles lean on that
++ * order (Gran Turismo 6's event object clears its `waiting` flag only once the
++ * woken thread holds the mutex again; a second signaller that slipped in first
++ * saw the stale flag and signalled a condition nobody waited on).
++ * So a signalled waiter is queued on the lock (sl->handoff) and the lock goes to
++ * it without ever being free. Returns 1 when the lock was handed to a waiter.
++ * held=1: the caller holds the lock and is giving it up; held=0: the lock may
++ * be free or someone else's, so it is handed over only if it can be taken.
++ * Call WITHOUT s_lwc_lock. */
++static int lwm_try(struct LwmSlot* sl);
++static int lwm_handoff(struct LwmSlot* sl, int held)
++{
++    int done = 0;
++    AcquireSRWLockExclusive(&s_lwc_lock);
++    struct LwcWaiter* w = sl->handoff;
++    if (w && (held || lwm_try(sl))) {
++        sl->handoff = w->hnext;
++        w->granted = 1;
++        WakeConditionVariable(&w->cv);
++        done = 1;
++    }
++    ReleaseSRWLockExclusive(&s_lwc_lock);
++    return done;
++}
++#endif
+ static void lwm_release(struct LwmSlot* sl)
+ {
++#ifdef _WIN32
++    if (sl->handoff && sl->state != 0 && lwm_handoff(sl, 1)) return;
++#endif
+     if (InterlockedExchange(&sl->state, 0) == 2) ReleaseSemaphore(sl->sem, 1, NULL);
++#ifdef _WIN32
++    /* A waiter queued itself between the check above and the release (the
++     * signaller found the lock held and re-checks after queueing, we re-check
++     * after releasing: one of the two sees the other). */
++    if (sl->handoff) lwm_handoff(sl, 0);
++#endif
+ }
+ /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
+  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
+@@ -422,7 +468,6 @@ static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+  * vblank beat calls ppu_lwcond_wake_all so a waiter runs the vblank handler at
+  * once. PS3_LWCOND_POLL=1 = the old fixed sleep. */
+ #ifdef _WIN32
+-static SRWLOCK s_lwc_lock = SRWLOCK_INIT;
+ static CONDITION_VARIABLE s_lwc_cv = CONDITION_VARIABLE_INIT;
+ static LONG s_lwc_seq = 0;
+ static thread_local LONG t_lwc_seen = -1;
+@@ -432,17 +477,73 @@ static int lwc_poll_mode(void)
+     if (m < 0) { const char* e = getenv("PS3_LWCOND_POLL"); m = (e && *e == '1') ? 1 : 0; }
+     return m;
+ }
++/* REAL waits (the default since the Gran Turismo 6 port; PS3_LWCOND_POLL=1 = the
++ * polling wait described above, where every wait returned CELL_OK within 1 ms).
++ *
++ * lv2 has no spurious wakeups: sys_lwcond_wait returns when THIS lwcond was
++ * signalled for THIS thread, or with ETIMEDOUT. Titles build on that. Gran
++ * Turismo 6's event object (0xAE27AC) is
++ *     if (signalled) { signalled = 0; return; }
++ *     waiting = 1; sys_lwcond_wait(cond, timeout); waiting = 0;
++ * with no predicate loop, and its signal side only calls sys_lwcond_signal when
++ * `waiting` is set. Under the polling wait every such wait "completed" at once:
++ * a file reader thread read through a stream pointer nobody had set yet, and a
++ * synchronous request on the caller's stack was torn down before the worker
++ * touched it (NULL vtable calls, endless recursion, stack overflow).
++ *
++ * One record per waiting thread (struct LwcWaiter, above), in arrival order,
++ * each with its own host condition variable. A waiter queues its record BEFORE
++ * it gives the guest lwmutex up, and a signaller takes that lwmutex first, so a
++ * signal cannot slip in between. A signalled waiter returns to the guest only
++ * once it has been handed the lwmutex (lwm_handoff). The vblank beat still
++ * nudges every waiter (ppu_lwcond_wake_all): a nudged waiter does not return to
++ * the guest, it runs the GCM pump -- guest vblank/flip handlers are delivered by
++ * whichever guest thread pumps, and a title whose threads all sit in real waits
++ * would otherwise never get them -- and goes back to waiting. */
++static struct LwcWaiter* s_lwc_head = nullptr;     /* guarded by s_lwc_lock */
++extern "C" void ppu_gcm_pump(void);                 /* cellGcmSys.c, or ppu_loader.cpp's absent stub */
++
++/* mode 0: the longest waiter, 1: every waiter, 2: the waiter that is thread `tid`.
++ * Returns how many records it selected. */
++static int lwc_signal(uint32_t lwcond, int mode, uint32_t tid)
++{
++    int n = 0;
++    AcquireSRWLockExclusive(&s_lwc_lock);
++    for (struct LwcWaiter* w = s_lwc_head; w; w = w->next) {
++        if (w->lwcond != lwcond || w->signalled) continue;
++        if (mode == 2 && w->tid != tid) continue;
++        w->signalled = 1; n++;
++        struct LwmSlot* sl = w->sl;
++        if (lwm_try(sl)) {                          /* the lwmutex is free: it is the waiter's */
++            w->granted = 1;
++            WakeConditionVariable(&w->cv);
++        } else {                                    /* held (normally by this signaller): next in line for it */
++            w->hnext = nullptr;
++            struct LwcWaiter** t = &sl->handoff;
++            while (*t) t = &(*t)->hnext;
++            *t = w;
++            if (lwm_try(sl)) {                      /* released meanwhile (see lwm_release): hand it over here */
++                struct LwcWaiter* h = sl->handoff;
++                sl->handoff = h->hnext;
++                h->granted = 1;
++                WakeConditionVariable(&h->cv);
++            }
++        }
++        if (mode != 1) break;
++    }
++    ReleaseSRWLockExclusive(&s_lwc_lock);
++    return n;
++}
+ static void lwc_wake_all(void)
+ {
+-    if (lwc_poll_mode()) return;
+     AcquireSRWLockExclusive(&s_lwc_lock);
+     s_lwc_seq++;
++    for (struct LwcWaiter* w = s_lwc_head; w; w = w->next) WakeConditionVariable(&w->cv);   /* nudge: pump, wait on */
+     ReleaseSRWLockExclusive(&s_lwc_lock);
+-    WakeAllConditionVariable(&s_lwc_cv);
++    if (lwc_poll_mode()) WakeAllConditionVariable(&s_lwc_cv);
+ }
+ static void lwc_wait_1ms(void)
+ {
+-    if (lwc_poll_mode()) { Sleep(1); return; }
+     AcquireSRWLockExclusive(&s_lwc_lock);
+     if (s_lwc_seq == t_lwc_seen)
+         SleepConditionVariableSRW(&s_lwc_cv, &s_lwc_lock, 1, 0);
+@@ -450,14 +551,31 @@ static void lwc_wait_1ms(void)
+     ReleaseSRWLockExclusive(&s_lwc_lock);
+ }
+ extern "C" void ppu_lwcond_wake_all(void) { lwc_wake_all(); }
++static void sys_lwcond_signal(ppu_context* ctx)
++{
++    if (lwc_poll_mode()) lwc_wake_all(); else lwc_signal((uint32_t)ctx->gpr[3], 0, 0);
++    ctx->gpr[3] = 0;   /* nobody waiting is CELL_OK too (liblv2 swallows the kernel's EPERM) */
++}
++static void sys_lwcond_signal_all(ppu_context* ctx)
++{
++    if (lwc_poll_mode()) lwc_wake_all(); else lwc_signal((uint32_t)ctx->gpr[3], 1, 0);
++    ctx->gpr[3] = 0;
++}
++static void sys_lwcond_signal_to(ppu_context* ctx)
++{
++    if (lwc_poll_mode()) { lwc_wake_all(); ctx->gpr[3] = 0; return; }
++    /* The named thread is not waiting on this lwcond: CELL_EPERM, as liblv2 hands it back. */
++    const int n = lwc_signal((uint32_t)ctx->gpr[3], 2, (uint32_t)ctx->gpr[4]);
++    ctx->gpr[3] = n ? 0 : (uint64_t)(int64_t)(int32_t)0x80010009u;
++}
+ #else
+ static void lwc_wake_all(void) {}
+ static void lwc_wait_1ms(void) { Sleep(1); }
+ extern "C" void ppu_lwcond_wake_all(void) {}
+-#endif
+ static void sys_lwcond_signal(ppu_context* ctx)     { lwc_wake_all(); ctx->gpr[3] = 0; }
+ static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_wake_all(); ctx->gpr[3] = 0; }
+ static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_wake_all(); ctx->gpr[3] = 0; }
++#endif
+ /* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
+  * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
+  * guest's while(!predicate) loop re-checks). Handles the common single
+@@ -467,6 +585,52 @@ static void sys_lwcond_wait(ppu_context* ctx)
+     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+     uint32_t lwmutex = vm_read32(lwcond + 0x00);
+     struct LwmSlot* sl = lwm_slot(lwmutex);
++#ifdef _WIN32
++    if (sl && !lwc_poll_mode()) {
++        /* r4 = timeout in microseconds, 0 = wait for the signal however long it takes. */
++        const uint64_t timeout_us = ctx->gpr[4];
++        const long long deadline = timeout_us ? lwm_now_us() + (long long)timeout_us : 0;
++        const uint32_t own = vm_read32(lwmutex + LWM_OWNER);
++        const uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
++        struct LwcWaiter w;
++        w.lwcond = lwcond; w.tid = (uint32_t)ctx->thread_id; w.signalled = 0; w.granted = 0; w.sl = sl;
++        w.next = nullptr; w.hnext = nullptr;
++        InitializeConditionVariable(&w.cv);
++        ppu_thread_note_block(ctx->thread_id);
++        AcquireSRWLockExclusive(&s_lwc_lock);
++        { struct LwcWaiter** t = &s_lwc_head; while (*t) t = &(*t)->next; *t = &w; }
++        ReleaseSRWLockExclusive(&s_lwc_lock);
++        /* The record is findable; only now give the lwmutex up (lwm_release takes s_lwc_lock itself). */
++        vm_write32(lwmutex + LWM_RECUR, 0);
++        vm_write32(lwmutex + LWM_OWNER, 0);
++        lwm_release(sl);
++        AcquireSRWLockExclusive(&s_lwc_lock);
++        for (;;) {
++            if (w.signalled && w.granted) break;     /* signalled AND handed the lwmutex */
++            DWORD ms = INFINITE;
++            if (!w.signalled && timeout_us) {
++                const long long left = deadline - lwm_now_us();
++                if (left <= 0) break;
++                const unsigned long long m = ((unsigned long long)left + 999) / 1000;
++                ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m;
++            }
++            SleepConditionVariableSRW(&w.cv, &s_lwc_lock, ms, 0);
++            if (w.signalled) continue;
++            /* A nudge (vblank beat) or the timeout: deliver pending GCM callbacks, then wait on. */
++            ReleaseSRWLockExclusive(&s_lwc_lock);
++            ppu_gcm_pump();
++            AcquireSRWLockExclusive(&s_lwc_lock);
++        }
++        const int signalled = w.signalled;           /* else: timed out, never selected */
++        { struct LwcWaiter** t = &s_lwc_head; while (*t && *t != &w) t = &(*t)->next; if (*t) *t = w.next; }
++        ReleaseSRWLockExclusive(&s_lwc_lock);
++        if (!signalled) lwm_acquire(sl, 0);          /* a timeout takes the lwmutex the ordinary way */
++        vm_write32(lwmutex + LWM_OWNER, own);
++        vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
++        ctx->gpr[3] = signalled ? 0 : (uint64_t)(int64_t)(int32_t)0x8001000Bu;   /* CELL_ETIMEDOUT */
++        return;
++    }
++#endif
+     if (sl) {
+         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+@@ -482,6 +646,93 @@ static void sys_lwcond_wait(ppu_context* ctx)
+     ctx->gpr[3] = 0;
+ }
+ 
++/* sys_mempool_* (sysPrxForUser): a pool of fixed-size blocks carved from a chunk
++ * the title supplies. Behaviour as RPCS3's sys_mempool.cpp: ids start at 1, the
++ * free list starts as every block in address order and is used as a stack
++ * (allocate takes the last, free pushes), try_allocate answers NULL when the
++ * pool is empty and allocate waits for a free. Gran Turismo 6 imports create,
++ * destroy, free_block and try_allocate_block. */
++#include <mutex>
++#include <condition_variable>
++namespace {
++struct MemPool { bool used; uint32_t chunk; uint64_t chunk_size, block_size; uint32_t* free_list; uint32_t nfree; };
++MemPool                 s_mp[256];
++std::mutex              s_mp_lock;
++std::condition_variable s_mp_cv;
++MemPool* mp_get(uint64_t id) { return (id >= 1 && id <= 256 && s_mp[id - 1].used) ? &s_mp[id - 1] : nullptr; }
++}
++static void sys_mempool_create(ppu_context* ctx)
++{
++    const uint32_t  id_out     = (uint32_t)ctx->gpr[3];
++    const uint32_t  chunk      = (uint32_t)ctx->gpr[4];
++    const uint64_t  chunk_size = ctx->gpr[5], block_size = ctx->gpr[6];
++    uint64_t        alignment  = ctx->gpr[7];
++    if (alignment == 0 || alignment == 2) alignment = 4;
++    if (!block_size || block_size > chunk_size || (alignment & (alignment - 1)) || (chunk & 7)) {
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002u;   /* CELL_EINVAL */
++        return;
++    }
++    std::lock_guard<std::mutex> hold(s_mp_lock);
++    for (uint32_t i = 0; i < 256; i++) {
++        MemPool& p = s_mp[i];
++        if (p.used) continue;
++        const uint64_t n = chunk_size / block_size;
++        p.free_list = (uint32_t*)malloc((size_t)(n ? n : 1) * sizeof(uint32_t));
++        if (!p.free_list) break;
++        for (uint64_t k = 0; k < n; k++) p.free_list[k] = chunk + (uint32_t)(k * block_size);
++        p.nfree = (uint32_t)n; p.chunk = chunk; p.chunk_size = chunk_size; p.block_size = block_size; p.used = true;
++        if (id_out) vm_write32(id_out, i + 1);
++        fprintf(stderr, "[mempool] create id=%u chunk=0x%08X size=0x%llX block=0x%llX (%llu blocks)\n", i + 1, chunk,
++                (unsigned long long)chunk_size, (unsigned long long)block_size, (unsigned long long)n);
++        ctx->gpr[3] = 0;
++        return;
++    }
++    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010001u;       /* CELL_EAGAIN */
++}
++static void sys_mempool_destroy(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> hold(s_mp_lock);
++    if (MemPool* p = mp_get(ctx->gpr[3])) { free(p->free_list); p->free_list = nullptr; p->used = false; }
++    s_mp_cv.notify_all();
++    ctx->gpr[3] = 0;
++}
++static void sys_mempool_free_block(ppu_context* ctx)
++{
++    const uint32_t block = (uint32_t)ctx->gpr[4];
++    std::lock_guard<std::mutex> hold(s_mp_lock);
++    MemPool* p = mp_get(ctx->gpr[3]);
++    if (!p || block < p->chunk || block > p->chunk + p->chunk_size || p->nfree >= p->chunk_size / p->block_size) {
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002u;   /* CELL_EINVAL */
++        return;
++    }
++    p->free_list[p->nfree++] = block;
++    s_mp_cv.notify_one();
++    ctx->gpr[3] = 0;
++}
++static void sys_mempool_try_allocate_block(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> hold(s_mp_lock);
++    MemPool* p = mp_get(ctx->gpr[3]);
++    ctx->gpr[3] = (p && p->nfree) ? p->free_list[--p->nfree] : 0;
++}
++static void sys_mempool_allocate_block(ppu_context* ctx)
++{
++    const uint64_t id = ctx->gpr[3];
++    std::unique_lock<std::mutex> hold(s_mp_lock);
++    for (;;) {
++        MemPool* p = mp_get(id);
++        if (!p) { ctx->gpr[3] = 0; return; }
++        if (p->nfree) { ctx->gpr[3] = p->free_list[--p->nfree]; return; }
++        s_mp_cv.wait(hold);
++    }
++}
++static void sys_mempool_get_count(ppu_context* ctx)
++{
++    std::lock_guard<std::mutex> hold(s_mp_lock);
++    MemPool* p = mp_get(ctx->gpr[3]);
++    ctx->gpr[3] = p ? p->nfree : 0;
++}
++
+ /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
+  * The old fixed "1" broke every am-I-the-designated-thread check in
+  * multithreaded titles (LBP's job system routes work by thread identity, so
+@@ -1026,6 +1277,12 @@ extern "C" void ppu_sysprx_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_all"), "sys_lwcond_signal_all", sys_lwcond_signal_all);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_to"),  "sys_lwcond_signal_to",  sys_lwcond_signal_to);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_wait"),       "sys_lwcond_wait",       sys_lwcond_wait);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mempool_create"),             "sys_mempool_create",             sys_mempool_create);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mempool_destroy"),            "sys_mempool_destroy",            sys_mempool_destroy);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mempool_free_block"),         "sys_mempool_free_block",         sys_mempool_free_block);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mempool_allocate_block"),     "sys_mempool_allocate_block",     sys_mempool_allocate_block);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mempool_try_allocate_block"), "sys_mempool_try_allocate_block", sys_mempool_try_allocate_block);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_mempool_get_count"),          "sys_mempool_get_count",          sys_mempool_get_count);
+ 
+     /* Thread id + memory manager (high-frequency boot imports). The flat VM
+      * means map/unmap/free are no-ops: the memory already exists everywhere. */
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index e9b8f61..ef6fd1f 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -513,6 +513,33 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+                 fflush(stderr); _g1--;
+             }
+         }
++        /* Architectural SPU interrupt. The lifted path takes one at a dispatch
++         * (SPU_DRAIN -> spu_take_interrupt); code that only ever runs here -- a
++         * policy module or job a SPURS kernel streamed into local store, with no
++         * lift -- never reaches a dispatch, so an enabled event stayed pending
++         * for good. Gran Turismo 6's job manager loads each job with a DMA list
++         * whose first element is stall-and-notify and finishes the load in the
++         * interrupt handler: the list stayed parked and no job ever ran.
++         * As on hardware: SRR0 <- pc, interrupts off, execution continues at
++         * LS 0, where the program planted a branch to its handler. The handler
++         * saves and restores the registers itself and returns with iret. */
++        if (ctx->int_enable &&
++            (__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
++            const uint32_t w0 = ((uint32_t)ctx->ls[0] << 24) | ((uint32_t)ctx->ls[1] << 16) |
++                                ((uint32_t)ctx->ls[2] << 8) | ctx->ls[3];
++            const uint32_t op9 = w0 >> 23;
++            if (op9 == 0x060 || op9 == 0x064) {       /* bra / br: a handler is installed */
++                { static int s_it = -1; static int _n = 0;
++                  if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
++                  if (s_it && _n < 200) { _n++;
++                      fprintf(stderr, "[irq] TAKE (interp) img=%d srr0=0x%05X events=0x%X&0x%X\n", ctx->image_id,
++                              ctx->pc & 0x3FFFC, ctx->event_status, ctx->event_mask); } }
++                ctx->srr0 = ctx->pc;
++                ctx->int_enable = 0;
++                ctx->pc = 0;
++                continue;
++            }
++        }
+         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
+         steps++;
+         if (interp_stats_on()) interp_stats_step(ctx);
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 9626673..bf31d56 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -355,6 +355,9 @@ typedef struct {
+      * into this queue with source = SYS_SPU_THREAD_GROUP_EVENT (0x100..) so
+      * PPU code blocked on sys_event_queue_receive wakes up. */
+     uint32_t event_queue_id;
++    /* The event type that connection asked for (1 RUN, 2 EXCEPTION, 4 SYSTEM_MODULE).
++     * lv2 sends nothing to an EXCEPTION connection when the group simply stops. */
++    uint32_t event_type;
+     uint32_t user_event_ports[64];
+ } spu_group_t;
+ 
+@@ -1304,7 +1307,14 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
+      * event with type-specific data; we collapse to a "group stopped" tag
+      * (data1 = group_id, data2 = exit_status, data3 = cause). PPU code
+      * blocked in sys_event_queue_receive on this queue wakes up here. */
+-    if (g->event_queue_id) {
++    /* Not for an EXCEPTION-only connection (event type 2), which is what SPURS
++     * makes: its event helper thread reads data2 & 0xFFFFFF == 1 as the request
++     * to stop itself (_spurs::stop_event_helper sends exactly that), and the
++     * cause GROUP_EXIT is 1. A SPURS instance that exits its group when idle
++     * (Gran Turismo 6's sound SPURS, about 170 start/join cycles a second) lost
++     * its helper on the first idle exit; nothing then served job-chain or
++     * workload events and cellSpursJoinJobChain waited for ever. */
++    if (g->event_queue_id && g->event_type != 2) {
+         sys_event_queue_push_by_id(g->event_queue_id,
+                                    (uint64_t)g->id,
+                                    (uint64_t)(int64_t)g->exit_status,
+@@ -1595,8 +1605,9 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
+         return -1;
+     }
+     g->event_queue_id = queue_id;
+-    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X\n",
+-            group_id, queue_id);
++    g->event_type     = (uint32_t)ctx->gpr[5];
++    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X type=%u\n",
++            group_id, queue_id, g->event_type);
+     fflush(stderr);
+     ctx->gpr[3] = 0;
+     return 0;
+diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
+index 927f141..d0a730e 100644
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -4,6 +4,7 @@
+ 
+ #include "sys_memory.h"
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
+ 
+@@ -345,6 +346,19 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
+     if (!alignment) alignment = 0x10000u;
+     if (alignment > UINT32_MAX || (alignment & (alignment - 1u)) || !size || size > UINT32_MAX)
+         return (int64_t)(int32_t)CELL_EINVAL;
++    /* PS3_MAPPER_SELF_ALIGN=1: place a reservation on a boundary of its own size (the largest power of two in
++     * it), not only on the alignment asked for. The console hands address space out in 256 MB slots from the
++     * bottom, so a 512 MB reservation lands wherever the title's allocation order puts it, and a title can come
++     * to depend on that: Gran Turismo 6's heap names a page by (address >> 13) & 0xFFFF, which is only right
++     * when its 512 MB window starts on a 512 MB boundary (0x40000000 there). This mapper steps over the
++     * runtime's own windows and gave it 0x70000000. Off by default: it moves every large reservation. */
++    { static int s_self = -1;
++      if (s_self < 0) { const char* e = getenv("PS3_MAPPER_SELF_ALIGN"); s_self = (e && *e && *e != '0') ? 1 : 0; }
++      if (s_self) {
++          uint64_t own = 0x10000u;
++          while (own * 2u <= size && own < 0x40000000ull) own *= 2u;
++          if (own > alignment) alignment = own;
++      } }
+     bump_lock();
+     int slot = -1;
+     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i)

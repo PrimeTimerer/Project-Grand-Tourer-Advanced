@@ -1,0 +1,2 @@
+// The exe's icon (launcher\tools\make_icon.py draws it; the launcher uses the same file).
+1 ICON "app.ico"

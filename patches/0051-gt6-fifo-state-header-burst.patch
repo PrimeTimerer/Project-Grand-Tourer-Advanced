@@ -1,0 +1,426 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index b4a457e..6f9e16a 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2524,16 +2524,48 @@ static int gcm_method_run_on(void)
+     if (g_gcm_method_run < 0) { const char* e = getenv("GCM_METHOD_RUN"); g_gcm_method_run = (e && *e == '0') ? 0 : 1; }
+     return g_gcm_method_run;
+ }
++/* The methods gcm_3d_method acts on. */
++static const u32 s_walker_methods[] = { 0x0050u, 0x0104u, 0x0180u, 0x01A4u, 0x01A8u, 0x1800u, 0x1D6Cu, 0x1D70u, 0x1D74u };
+ /* 1 when a run of `n` words for the methods m0, m0 + 4, ... holds a method gcm_3d_method acts on. */
+ static int gcm_run_has_walker_method(u32 m0, u32 n)
+ {
+-    static const u32 special[] = { 0x0050u, 0x0104u, 0x0180u, 0x01A4u, 0x01A8u, 0x1800u, 0x1D6Cu, 0x1D70u, 0x1D74u };
+     const u32 m1 = m0 + (n - 1u) * 4u;
+-    for (u32 i = 0; i < sizeof special / sizeof special[0]; i++)
+-        if (special[i] >= m0 && special[i] <= m1) return 1;
++    for (u32 i = 0; i < sizeof s_walker_methods / sizeof s_walker_methods[0]; i++)
++        if (s_walker_methods[i] >= m0 && s_walker_methods[i] <= m1) return 1;
+     return 0;
+ }
+ 
++/* Consecutive state headers in one call [GT6 0055]. The walker's loop body is long - a dozen diagnostic switches,
++ * the control words, the semaphore methods - and a twelve-car Gran Turismo 6 race sends 67,000 headers a frame
++ * through it, about forty a draw, of which all but four only store state. When the live engine has registered a
++ * taker (g_gcm_live_fifo_burst, rsx_live_draw.c) the walker hands it the header it has just decoded together with
++ * everything behind it up to `put` or the end of the 1 MB IO page; the taker consumes headers for as long as they
++ * are plain subchannel-0 state runs (rsx_dispatch_fifo_burst, rsx_dispatch.c) and the walker goes on from where it
++ * stopped. What the loop body does for such a header besides handing its words over - the budget, the last ring
++ * offset, the ring of decoded words - is done for the burst as a whole, to the same result; the methods the walker
++ * executes itself (gcm_3d_method's, and the semaphore methods) stop a burst, so they still come through the loop.
++ * GCM_FIFO_BURST=0 (g_gcm_fifo_burst, which a host may turn during a run) = header by header, as before; so do
++ * GCM_RING_DBG, TCONST_FIFO and GCM_RUN_STATS, which look at every header. */
++#include "rsx_dispatch.h"       /* rsx_fifo_burst */
++u32 (*g_gcm_live_fifo_burst)(const void* be, u32 max_bytes, rsx_fifo_burst* b) = NULL;
++int g_gcm_fifo_burst = -1;
++static int gcm_fifo_burst_on(void)
++{
++    if (g_gcm_fifo_burst < 0) { const char* e = getenv("GCM_FIFO_BURST"); g_gcm_fifo_burst = (e && *e == '0') ? 0 : 1; }
++    return g_gcm_fifo_burst;
++}
++static const u8* gcm_burst_stop_table(void)
++{
++    static u8 stop[0x800];
++    static int ready = 0;
++    if (!ready) {
++        for (u32 i = 0; i < sizeof s_walker_methods / sizeof s_walker_methods[0]; i++) stop[s_walker_methods[i] >> 2] = 1;
++        stop[0x64u >> 2] = stop[0x68u >> 2] = stop[0x6Cu >> 2] = 1;     /* NV406E semaphore offset / acquire / release */
++        ready = 1;
++    }
++    return stop;
++}
++
+ /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
+ static int gcm_get_eq_put(void)
+ {
+@@ -2601,11 +2633,56 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+ }
+ 
+ 
++/* GCM_RUN_STATS=<secs> (diagnostic) [GT6 0055]: what the 3D method runs handed to the live engine in the last <secs>
++ * seconds were made of - headers and words in all and a frame, how rsx_dispatch_run took the words (stored in a
++ * loop, or one by one through rsx_dispatch_method), and the twenty methods that carried most words (i = an
++ * incrementing run starting at that method, n = non-incrementing; words/headers). One predictable branch a header
++ * when off. */
++static int s_run_stats = -1;
++static u32 s_rs_hdr[2][0x800], s_rs_words[2][0x800];
++static unsigned long long s_rs_t0, s_rs_headers, s_rs_wordsum, s_rs_disp0[6];
++static u32 s_rs_flip0;
++extern unsigned long long g_rsx_run_stat[6];   /* rsx_dispatch.c */
++static void gcm_run_stats_note(u32 method, u32 type, u32 count)
++{
++    const u32 t = type == 0 ? 0u : 1u, mi = (method & 0x1FFCu) >> 2;
++    s_rs_hdr[t][mi]++; s_rs_words[t][mi] += count; s_rs_headers++; s_rs_wordsum += count;
++    if (s_rs_headers & 0x3FFu) return;                       /* the clock every 1,024 headers */
++    const unsigned long long now = ps3_ms_now();
++    if (s_rs_t0 && now - s_rs_t0 < (unsigned long long)s_run_stats * 1000u) return;
++    if (s_rs_t0) {
++        const u32 frames = s_flip_request_count - s_rs_flip0;
++        const double f = frames ? (double)frames : 1.0;
++        unsigned long long d[6];
++        for (int k = 0; k < 6; k++) d[k] = g_rsx_run_stat[k] - s_rs_disp0[k];
++        fprintf(stderr, "[run-stats] %.1f s, %u frames; a frame: headers %.0f, words %.0f; words stored in a loop %.0f, "
++                "constants %.0f, vertex program %.0f, one by one: inside BEGIN/END %.0f, not incrementing or subchannel %.0f, "
++                "own effect %.0f\n[run-stats] most words (words/headers a frame):",
++                (now - s_rs_t0) / 1000.0, frames, s_rs_headers / f, s_rs_wordsum / f,
++                d[0] / f, d[1] / f, d[2] / f, d[3] / f, d[4] / f, d[5] / f);
++        for (int top = 0; top < 20; top++) {
++            u32 bt = 0, bm = 0, bw = 0;
++            for (u32 tt = 0; tt < 2; tt++) for (u32 m = 0; m < 0x800; m++)
++                if (s_rs_words[tt][m] > bw) { bw = s_rs_words[tt][m]; bt = tt; bm = m; }
++            if (!bw) break;
++            fprintf(stderr, " %c%04X=%.0f/%.0f", bt ? 'n' : 'i', bm << 2, bw / f, s_rs_hdr[bt][bm] / f);
++            s_rs_words[bt][bm] = 0;
++        }
++        fprintf(stderr, "\n");
++    }
++    memset(s_rs_hdr, 0, sizeof s_rs_hdr); memset(s_rs_words, 0, sizeof s_rs_words);
++    for (int k = 0; k < 6; k++) s_rs_disp0[k] = g_rsx_run_stat[k];
++    s_rs_headers = 0; s_rs_wordsum = 0; s_rs_t0 = now; s_rs_flip0 = s_flip_request_count;
++}
++
+ /* The diagnostic switches below are tested on every drain pass, and GCM_RECDBG
+  * on every semaphore method. getenv walks the whole environment and showed in
+  * RSX-thread profiles, so each is read once and cached, like the other knobs. */
+ static void gcm_rsx_process_fifo_unlocked(void)
+ {
++    if (s_run_stats < 0) { const char* e = getenv("GCM_RUN_STATS"); s_run_stats = e && atoi(e) > 0 ? atoi(e) : 0; }
++    static int s_burst_diag = -1;      /* switches that look at every header: no burst with them [GT6 0055] */
++    if (s_burst_diag < 0) s_burst_diag = (getenv("GCM_RING_DBG") || getenv("TCONST_FIFO")) ? 1 : 0;
+     gcm_blocked_write_clear(); /* invalidate the previous pass before any early exit */
+     { static unsigned _n = 0; static unsigned long long _t0 = 0;
+       extern unsigned long long ps3_ms_now(void);
+@@ -3200,12 +3277,32 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
+                 if (dea) {
+                     const u32 sm = subch << 13;
++                    /* This header and the plain state headers behind it at once [GT6 0055]: see g_gcm_live_fifo_burst. */
++                    if (g_gcm_live_fifo_burst && subch == 0 && !legacy_state_live && !s_burst_diag && s_run_stats <= 0 &&
++                        gcm_method_run_on() && gcm_fifo_burst_on()) {
++                        const u32 page_end = (s_fifo_getoff | 0xFFFFFu) + 1u;
++                        const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
++                        rsx_fifo_burst b;
++                        b.stop = gcm_burst_stop_table();
++                        b.max_headers = (u32)budget + 1u < 64u ? (u32)budget + 1u : 64u;    /* this header is paid for */
++                        b.trace_off = s_tr_off; b.trace_w = s_tr_w; b.trace_i = &s_tr_i; b.trace_mask = GCM_TRACE_N - 1u;
++                        b.io = s_fifo_getoff;
++                        const u32 used = g_gcm_live_fifo_burst(vm_base + ea, lim - s_fifo_getoff, &b);
++                        if (used) {
++                            /* as the loop does for each header: offsets rise inside a burst, so the last one decides */
++                            if (s_fifo_getoff + b.last < put) s_last_ring_off = s_fifo_getoff + b.last + 4u;
++                            budget -= (int)b.headers - 1;
++                            s_fifo_getoff += used;
++                            continue;
++                        }
++                    }
+                     /* The whole run to the live engine in one call [GT6 0036, block 5], when it has registered a
+                      * taker (g_gcm_live_method_run) and no word of the run is one gcm_3d_method acts on: with the
+                      * legacy state not live that function does nothing for any other method, so leaving it out
+                      * changes nothing. GCM_METHOD_RUN=0 (g_gcm_method_run) = the loop below. */
+                     if (g_gcm_live_method_run && gcm_method_run_on() && !legacy_state_live &&
+                         !gcm_run_has_walker_method(method, type == 0 ? count : 1u)) {
++                        if (__builtin_expect(s_run_stats > 0, 0)) gcm_run_stats_note(method, type, count);
+                         s_prepare_dispatch = subch == 0 && count == 1u && method == 0x1808u && vm_read32(dea) == 0;
+                         g_gcm_live_method_run(sm | method, type == 0, vm_base + dea, count);
+                         s_prepare_dispatch = 0;
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index abe0f6f..ec14803 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -480,6 +480,11 @@ static inline u32 rsx_run_word(const u8* w, u32 i)
+     return __builtin_bswap32(v);
+ }
+ 
++/* How rsx_dispatch_run took its words, for the walker's GCM_RUN_STATS line (cellGcmSys.c) [GT6 0055]: 0 stored in a
++ * loop, 1 transform constants, 2 vertex program words, and one by one through rsx_dispatch_method: 3 inside
++ * BEGIN/END, 4 a run that is not incrementing or has subchannel bits, 5 a method with an effect of its own. */
++unsigned long long g_rsx_run_stat[6];
++
+ void rsx_dispatch_run(rsx_dispatch* rsx, u32 method, int incrementing, const void* be_words, u32 count)
+ {
+     /* per canonical method (0..0x1FFC): 1 = the word only stores its register, 2 = a transform constant word */
+@@ -508,20 +513,24 @@ void rsx_dispatch_run(rsx_dispatch* rsx, u32 method, int incrementing, const voi
+     while (i < count) {
+         u32 m = incrementing ? method + i * 4u : method;
+         if (!incrementing || (m & ~0x1FFCu) || rsx->in_begin_end) {
++            g_rsx_run_stat[rsx->in_begin_end ? 3 : 4]++;
+             rsx_dispatch_method(rsx, m, rsx_run_word(w, i));
+             i++;
+             continue;
+         }
+         const u32 k = kind[m >> 2];
+         if (k == 1) {
++            const u32 i0 = i;
+             do {
+                 const u32 idx = m >> 2;
+                 rsx->seen[idx]++;
+                 rsx->regs[idx] = rsx_run_word(w, i);
+                 i++; m += 4u;
+             } while (i < count && m < 0x2000u && kind[m >> 2] == 1);
++            g_rsx_run_stat[0] += i - i0;
+         } else if (k == 2 && !const_log) {
+             const u32 base_slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
++            const u32 i0 = i;
+             do {
+                 const u32 idx = m >> 2, arg = rsx_run_word(w, i);
+                 rsx->seen[idx]++;
+@@ -532,13 +541,158 @@ void rsx_dispatch_run(rsx_dispatch* rsx, u32 method, int incrementing, const voi
+                     rsx->constants[slot][word & 3] = arg;
+                 i++; m += 4u;
+             } while (i < count && m < 0x2000u && kind[m >> 2] == 2);
++            g_rsx_run_stat[1] += i - i0;
+         } else {
++            g_rsx_run_stat[m >= M_VP_UPLOAD_INST && m < M_VP_UPLOAD_INST + 32u * 4u ? 2 : 5]++;
+             rsx_dispatch_method(rsx, m, rsx_run_word(w, i));
+             i++;
+         }
+     }
+ }
+ 
++/* ---- a burst of state headers [GT6 0055] ------------------------------- */
++
++/* In a twelve-car Gran Turismo 6 race a frame is 67,000 method headers with 260,000 words (GCM_RUN_STATS), about
++ * forty headers a draw, and all but four of each forty only store state. Every header went through the walker's
++ * whole loop body, the live engine's gates and rsx_dispatch_run, and the 110,000 vertex program words a frame
++ * went through rsx_dispatch_method one by one: 4.4 ms of a 24 ms frame on the drawing thread. Here the headers
++ * between two draws are decoded in one loop.
++ *
++ * What a word does is rsx_dispatch_method's, restated per kind (the reference is that function):
++ *   1  seen++, regs = word                                  (every method that function has no case for)
++ *   2  ... and constants[CONST_ID + word/4][word%4] = word  (the transform constant window)
++ *   3  ... and vp[UPLOAD_FROM_ID * 4 + lane] = word, the load pointer moving on after lane 3 (the program window)
++ *   0  not here: the immediate vertex data it folds into the constant attributes (DATA1F/2F/3F/2S/4UB/4S and
++ *      SCALED4S), DATA4F W of attribute 0, BEGIN/END, the two batches, the inline array, CLEAR - and what the
++ *      caller keeps. rsx_dispatch_run's own table is coarser (all of 0x1800..0x19FC is 0 there); the methods in
++ *      0x1600..0x187C other than those five are plain stores in rsx_dispatch_method, and are 1 here. */
++int g_rsx_vp_gen_on_change = 1;
++static u8  s_bkind[0x800];
++static u16 s_blen[0x800];              /* how many methods from this one on are all of a burst kind */
++static u16 s_klen[0x800];              /* ... and how many from this one on are of this one's kind */
++static const u8* s_burst_stop;
++static int s_burst_ready, s_burst_refuse;
++
++static void rsx_burst_tables(const u8* stop)
++{
++    for (u32 m = 0; m < 0x2000u; m += 4u) {
++        u8 k = 1;
++        if ((m >= 0x0A80u && m < 0x0B00u) || (m >= 0x1500u && m < 0x1600u) || (m >= 0x1880u && m < 0x1A00u) ||
++            (m >= 0x1E40u && m < 0x1E80u) || m == 0x1C0Cu ||
++            m == M_VERTEX_BEGIN_END || m == M_VB_VERTEX_BATCH || m == M_INLINE_ARRAY || m == M_VB_INDEX_BATCH ||
++            m == M_CLEAR_BUFFERS || (stop && stop[m >> 2]))
++            k = 0;
++        else if (m >= M_VP_UPLOAD_CONST && m < M_VP_UPLOAD_CONST + 32u * 4u) k = 2;
++        else if (m >= M_VP_UPLOAD_INST && m < M_VP_UPLOAD_INST + 32u * 4u) k = 3;
++        s_bkind[m >> 2] = k;
++    }
++    for (int i = 0x7FF; i >= 0; i--) {
++        s_blen[i] = s_bkind[i] ? (u16)(1u + (i < 0x7FF ? s_blen[i + 1] : 0u)) : (u16)0;
++        s_klen[i] = (u16)(1u + (i < 0x7FF && s_bkind[i + 1] == s_bkind[i] ? s_klen[i + 1] : 0u));
++    }
++    s_burst_refuse = getenv("RSX_CONST_LOG") ? 1 : 0;    /* rsx_dispatch_method prints each constant word then */
++    s_burst_stop = stop;
++    s_burst_ready = 1;
++}
++
++u32 rsx_dispatch_fifo_burst(rsx_dispatch* rsx, const void* be, u32 max_bytes, rsx_fifo_burst* b)
++{
++    b->headers = 0; b->last = 0;
++    if (rsx->in_begin_end) return 0;
++    if (!s_burst_ready || b->stop != s_burst_stop) rsx_burst_tables(b->stop);
++    if (s_burst_refuse) return 0;
++    const u8* p = (const u8*)be;
++    u32* const regs = rsx->regs;
++    u32* const seen = rsx->seen;
++    u32* const vp = rsx->vp;
++    /* everything the loop needs in locals: the stores below go through u32 pointers, and the compiler has to assume
++     * each of them may have written a field of *b or of *rsx */
++    const u32 max_headers = b->max_headers, tr_mask = b->trace_mask, io = b->io;
++    u32* const tr_off = b->trace_off;
++    u32* const tr_w = b->trace_w;
++    u32 tr_i = tr_off ? *b->trace_i : 0u;
++    u32 off = 0, nh = 0, last = 0, n_const = 0, n_vp = 0, vp_changed = 0;
++    while (nh < max_headers && off + 8u <= max_bytes) {
++        const u32 w = rsx_run_word(p + off, 0);
++        const u32 count = (w >> 18) & 0x7FFu, m = w & 0x1FFCu;
++        const u32 top = w & 0xE000E003u;                     /* run type, subchannel, the two low bits */
++        if (!count || off + 4u + count * 4u > max_bytes) break;
++        const u8* d = p + off + 4u;
++        /* the stream ahead: SPU jobs on other cores wrote it, and its lines are in their caches */
++        __builtin_prefetch(d + count * 4u + 512u);
++        __builtin_prefetch(d + count * 4u + 576u);
++        if (top == 0u) {                                     /* incrementing, subchannel 0 */
++            if (count > s_blen[m >> 2]) break;
++            u32 i = 0, mi = m >> 2;
++            do {
++                /* the words of this run that are of one kind: a counted loop each */
++                u32 n = s_klen[mi];
++                if (n > count - i) n = count - i;
++                const u32 k = s_bkind[mi];
++                if (k == 1) {
++                    for (u32 j = 0; j < n; j++) {
++                        seen[mi + j]++;
++                        regs[mi + j] = rsx_run_word(d, i + j);
++                    }
++                } else if (k == 2) {
++                    const u32 base_slot = regs[M_VP_UPLOAD_CONST_ID >> 2];
++                    const u32 word0 = mi - (M_VP_UPLOAD_CONST >> 2);
++                    for (u32 j = 0; j < n; j++) {
++                        const u32 arg = rsx_run_word(d, i + j);
++                        seen[mi + j]++;
++                        regs[mi + j] = arg;
++                        const u32 word = word0 + j;
++                        const u32 slot = base_slot + (word >> 2);
++                        if (slot < RSX_DSP_NUM_CONSTANTS)
++                            rsx->constants[slot][word & 3u] = arg;
++                    }
++                    n_const += n;
++                } else {
++                    u32 load = regs[M_VP_UPLOAD_FROM_ID >> 2];       /* no word of the window stores it */
++                    const u32 lane0 = mi - (M_VP_UPLOAD_INST >> 2);
++                    for (u32 j = 0; j < n; j++) {
++                        const u32 arg = rsx_run_word(d, i + j);
++                        seen[mi + j]++;
++                        regs[mi + j] = arg;
++                        const u32 lane = (lane0 + j) & 3u;
++                        const u32 pos = load * 4u + lane;
++                        if (pos < RSX_DSP_VP_WORDS && vp[pos] != arg) { vp[pos] = arg; vp_changed = 1; }
++                        if (lane == 3u) load++;
++                    }
++                    regs[M_VP_UPLOAD_FROM_ID >> 2] = load;
++                    n_vp += n;
++                }
++                i += n; mi += n;
++            } while (i < count);
++        } else if (top == 0x40000000u) {                     /* not incrementing: the same register `count` times */
++            if (s_bkind[m >> 2] != 1) break;
++            const u32 idx = m >> 2;
++            seen[idx] += count;
++            regs[idx] = rsx_run_word(d, count - 1u);
++        } else
++            break;
++        if (nh && tr_off) {                                  /* the caller has noted the first header itself */
++            const u32 t = tr_i & tr_mask;
++            tr_off[t] = io + off;
++            tr_w[t] = w;
++            tr_i++;
++        }
++        last = off;
++        off += 4u + count * 4u;
++        nh++;
++    }
++    b->headers = nh;
++    b->last = last;
++    if (tr_off) *b->trace_i = tr_i;
++    if (n_vp) {
++        if (!g_rsx_vp_gen_on_change) g_rsx_vp_upload_gen += n_vp;
++        else if (vp_changed) g_rsx_vp_upload_gen++;
++    }
++    /* every word taken that is neither a constant nor a program word was a plain store */
++    g_rsx_run_stat[0] += off / 4u - nh - n_const - n_vp; g_rsx_run_stat[1] += n_const; g_rsx_run_stat[2] += n_vp;
++    return off;
++}
++
+ /* ---- getters ----------------------------------------------------------- */
+ 
+ u32 rsx_dsp_clear_color(const rsx_dispatch* rsx)
+diff --git a/libs/video/rsx_dispatch.h b/libs/video/rsx_dispatch.h
+index 0262bee..f0549aa 100644
+--- a/libs/video/rsx_dispatch.h
++++ b/libs/video/rsx_dispatch.h
+@@ -164,6 +164,29 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
+  * handled in a loop (rsx_dispatch.c). */
+ void rsx_dispatch_run(rsx_dispatch* rsx, u32 method, int incrementing, const void* be_words, u32 count);
+ 
++/* Consecutive method HEADERS with their words, straight from FIFO memory [GT6 0055]: as long as the next word at
++ * `be` is the header of a subchannel-0 run whose words all only store state (a register, a transform constant, a
++ * vertex program word), the run is taken as rsx_dispatch_run would take it and the next header is looked at. It
++ * stops, without touching it, at anything else: a run with a method that has an effect of its own or that the caller
++ * keeps for itself (`stop`), another subchannel, a control word (jump, call, return, no-op, marker), a run that
++ * would pass `max_bytes`, or after `max_headers`. Nothing is called from inside, so nothing of the caller's can be
++ * observed while it runs. Returns the bytes taken (0 = the first word is not such a header, or BEGIN/END is open). */
++typedef struct rsx_fifo_burst {
++    const u8* stop;        /* in: 0x800 flags by (canonical method >> 2), 1 = the caller takes this method itself; or NULL */
++    u32  max_headers;      /* in */
++    u32* trace_off;        /* in, or NULL: the caller's ring of the last decoded words - offset, word, write index */
++    u32* trace_w;
++    u32* trace_i;
++    u32  trace_mask;       /*     ring size - 1 */
++    u32  io;               /*     the offset the caller knows `be` by (what trace_off receives) */
++    u32  headers;          /* out: headers taken */
++    u32  last;             /* out: byte position of the last header taken */
++} rsx_fifo_burst;
++u32 rsx_dispatch_fifo_burst(rsx_dispatch* rsx, const void* be, u32 max_bytes, rsx_fifo_burst* b);
++/* 1 (default): a vertex program word that stores the value already there does not move g_rsx_vp_upload_gen, so a
++ * program uploaded again unchanged is not looked at again (the burst only; rsx_dispatch_method counts every word). */
++extern int g_rsx_vp_gen_on_change;
++
+ /* ---- decoded state getters -------------------------------------------- */
+ 
+ static inline u32 rsx_dsp_reg(const rsx_dispatch* rsx, u32 method)
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 7400817..54ff926 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1687,6 +1687,8 @@ typedef struct {
+  * LD_DYNAMIC_DEPTH_BIAS=0, everything is as before. */
+ static void rsx_live_draw_method_run(u32 method, int incrementing, const void* be_words, u32 count);
+ extern void (*g_gcm_live_method_run)(u32 method, int incrementing, const void* be_words, u32 count);   /* cellGcmSys.c */
++static u32 rsx_live_draw_fifo_burst(const void* be, u32 max_bytes, rsx_fifo_burst* b);                  /* [GT6 0055] */
++extern u32 (*g_gcm_live_fifo_burst)(const void* be, u32 max_bytes, rsx_fifo_burst* b);                  /* cellGcmSys.c */
+ #define LD_DYN_BIAS_MARK 0x7FC0D1A5u
+ static int   g_ld_draw_bias_on;             /* get_pso, for the draw being built: its bias comes from the list */
+ static float g_ld_draw_bias_units, g_ld_draw_bias_slope;
+@@ -15868,6 +15870,9 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     /* Runs of method words in one call (rsx_live_draw_method_run). LD_METHOD_RUN=0 = word by word, as before. */
+     { const char* e = getenv("LD_METHOD_RUN");
+       g_gcm_live_method_run = (e && *e == '0') ? NULL : rsx_live_draw_method_run; }
++    /* Consecutive state headers in one call (rsx_live_draw_fifo_burst) [GT6 0055]. LD_FIFO_BURST=0 = not offered. */
++    { const char* e = getenv("LD_FIFO_BURST");
++      g_gcm_live_fifo_burst = (e && *e == '0') ? NULL : rsx_live_draw_fifo_burst; }
+     g.dev->lpVtbl->CreateFence(g.dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&g.fence);
+     g.fence_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+ 
+@@ -16233,6 +16238,22 @@ static void rsx_live_draw_method_run(u32 method, int incrementing, const void* b
+     }
+ }
+ 
++/* Consecutive state headers from the FIFO walker (cellGcmSys.c, g_gcm_live_fifo_burst) [GT6 0055]: the gates of
++ * rsx_live_draw_method_run, looked at once for a burst - the walker asks for at most 64 headers at a time, and no
++ * word of a burst can draw, clear or flip, so none of them can move a gate - and then rsx_dispatch_fifo_burst.
++ * 0 = not now: the walker hands that header over the way it always did. */
++static u32 rsx_live_draw_fifo_burst(const void* be, u32 max_bytes, rsx_fifo_burst* b)
++{
++    static int state_trace = -1;
++    if (state_trace < 0) state_trace = getenv("RSX_VERTEX_STATE_TRACE") ? 1 : 0;
++    if (state_trace || g_ld_debug_layer_enabled || g_ld_movie_mode || g_ld_host_waiting || !g.ready ||
++        ld_movie_composite_ui_enabled()) {
++        b->headers = 0; b->last = 0;
++        return 0;
++    }
++    return rsx_dispatch_fifo_burst(&g.rsx, be, max_bytes, b);
++}
++
+ void rsx_live_draw_set_movie_mode(int on)
+ {
+     static unsigned long long suppressed_at_start = 0;

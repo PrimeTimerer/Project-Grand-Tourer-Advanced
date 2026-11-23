@@ -1,0 +1,340 @@
+diff --git a/libs/filesystem/cellFs.c b/libs/filesystem/cellFs.c
+index 981bca2..af60e74 100644
+--- a/libs/filesystem/cellFs.c
++++ b/libs/filesystem/cellFs.c
+@@ -967,6 +967,31 @@ s32 cellFsRename(const char* from, const char* to)
+ 
+     ensure_parent_dirs(host_to);
+ 
++#ifdef _WIN32
++    /* [GT6 0089] A rename onto an existing file replaces it on the console; the CRT's rename() on Windows fails with
++     * EEXIST instead. Gran Turismo 6's own installation (the first start of every new installation) renames its
++     * "<file>.bsdiff.deflate" over the "<file>.bsdiff" it has just written and took the failure for a broken
++     * installation ("An error occurred during installation."). Only onto the game's own partitions (/dev_hdd0,
++     * /dev_hdd1): the disc and the rest keep the old behaviour. PS3_FS_LEGACY=1: as before. */
++    {
++        const char* to_guest = gpath(to);
++        const char* legacy = getenv("PS3_FS_LEGACY");
++        if (to_guest && (strncmp(to_guest, "/dev_hdd0/", 10) == 0 || strncmp(to_guest, "/dev_hdd1/", 10) == 0) &&
++            !(legacy && *legacy && *legacy != '0')) {
++            const DWORD to_attr = GetFileAttributesA(host_to), from_attr = GetFileAttributesA(host_from);
++            if (to_attr != INVALID_FILE_ATTRIBUTES && !(to_attr & FILE_ATTRIBUTE_DIRECTORY) &&
++                from_attr != INVALID_FILE_ATTRIBUTES && !(from_attr & FILE_ATTRIBUTE_DIRECTORY)) {
++                if (to_attr & FILE_ATTRIBUTE_READONLY) SetFileAttributesA(host_to, to_attr & ~FILE_ATTRIBUTE_READONLY);
++                if (!MoveFileExA(host_from, host_to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
++                    printf("[cellFs] Rename: replacing '%s' failed (error %lu)\n", host_to, (unsigned long)GetLastError());
++                    return (s32)CELL_ENOENT;
++                }
++                return CELL_OK;
++            }
++        }
++    }
++#endif
++
+     if (rename(host_from, host_to) != 0) {
+         printf("[cellFs] Rename: rename('%s', '%s') failed: %s\n",
+                host_from, host_to, strerror(errno));
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 7849dd9..70c027d 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -137,9 +137,9 @@ extern "C" int ps3_vfs_usrdir_overlay(const char* guest, char* out, size_t cap);
+ 
+ /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
+  * prefixes are stripped; the rest is appended to the root. */
+-static void host_path(char* out, size_t cap, const char* guest)
++static void host_path_impl(char* out, size_t cap, const char* guest, bool use_overlay)
+ {
+-    if (ps3_vfs_usrdir_overlay(guest, out, cap)) return;   /* PS3_USRDIR_OVERLAY (sys_fs.c) */
++    if (use_overlay && ps3_vfs_usrdir_overlay(guest, out, cap)) return;   /* PS3_USRDIR_OVERLAY (sys_fs.c) */
+     const char* rel = guest;
+     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
+      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
+@@ -211,6 +211,9 @@ static void host_path(char* out, size_t cap, const char* guest)
+     for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+     ps3_vfs_ps3game_fallback(out, cap);
+ }
++static void host_path(char* out, size_t cap, const char* guest) { host_path_impl(out, cap, guest, true); }
++/* The file itself, never the mod overlay's stand-in for it ([GT6 0089]: what the game deletes, renames or re-dates is its own data). */
++static void host_path_real(char* out, size_t cap, const char* guest) { host_path_impl(out, cap, guest, false); }
+ 
+ /* PS3_FS_STRICT_MOUNTS=1: a path that names no mount point fails as it does on
+  * the console -- CELL_FS_ENOTMOUNTED for an unknown first component, ENOENT for
+@@ -946,17 +949,15 @@ static void cellFsMkdir(ppu_context* ctx)
+     if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] mkdir '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
+     ctx->gpr[3] = CELL_OK;   /* existing dir is benign for boot */
+ }
+-static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
+-static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
++/* cellFsRmdir / cellFsUnlink: defined below, after the file helpers ([GT6 0089]; they used to answer OK and do nothing). */
+ static void cellFsFsync(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];
+     if (FILE* f = fd_file(fd)) fflush(f);
+     ctx->gpr[3] = CELL_OK;
+ }
+-/* File-area preallocation (LBP cache warm-up spams this): host filesystems
+- * grow files on write, so accepting is correct -- no preallocation needed. */
+-static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
++/* cellFsAllocateFileAreaWithoutZeroFill: defined below, after the file helpers ([GT6 0089]; it used to answer OK and
++ * do nothing - "host filesystems grow files on write" - which is not all the call does: it also SETS the size). */
+ 
+ /* Free space for (path, u32* block_size, u64* free_block_count). Unregistered,
+  * the call took the unresolved-NID path: CELL_OK with both out-params left as
+@@ -976,7 +977,7 @@ static void cellFsGetFreeSize(ppu_context* ctx)
+     ctx->gpr[3] = CELL_OK;
+ }
+ static void cellFsChmod(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* host ignores PS3 mode bits */
+-static void cellFsUtime(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* timestamps are not modelled */
++/* cellFsUtime: defined below ([GT6 0089]; it used to answer OK, "timestamps are not modelled"). */
+ /* SDATA opened from an already-open fd is not implemented: fail visibly rather
+  * than return CELL_OK with *sdata_fd never written. */
+ static void cellFsSdataOpenByFd(ppu_context* ctx)
+@@ -1098,13 +1099,39 @@ static void fs_rw_with_offset(ppu_context* ctx, int writing)
+     if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+     if (!writing) fs_prefault(buf, size);
+     size_t n = 0;
++    int at_eof = 0, io_err = 0, seek_ok = 0;
+     HOST_LOCKFILE(f);
+     const int64_t pos = (int64_t)HOST_FTELL64(f);
+-    if (HOST_FSEEK64(f, offset) == 0)
++    if (HOST_FSEEK64(f, offset) == 0) {
++        seek_ok = 1;
+         n = writing ? fwrite(vm_base + buf, 1, (size_t)size, f)
+                     : fread(vm_base + buf, 1, (size_t)size, f);
++        at_eof = feof(f); io_err = ferror(f);
++    }
+     if (pos >= 0) HOST_FSEEK64(f, pos);
+     HOST_UNLOCKFILE(f);
++    /* PS3_FSLOG_RW=<part of a path>[|<part>...]: every offset read and write on the files whose guest path holds one
++     * of the parts (to follow what a loader does with one file; unbounded, so name the file narrowly). */
++    { static int on = -1; static char pats[4][96]; static int npat = 0;
++      if (on < 0) { const char* e = getenv("PS3_FSLOG_RW"); on = (e && *e) ? 1 : 0;
++          while (on && e && *e && npat < 4) { size_t k = strcspn(e, "|"); if (k >= sizeof pats[0]) k = sizeof pats[0] - 1;
++              memcpy(pats[npat], e, k); pats[npat][k] = 0; npat++; e += k; if (*e == '|') e++; } }
++      if (on && fd >= 0 && fd < FS_MAX)
++          for (int i = 0; i < npat; i++)
++              if (strstr(g_fd_path[fd], pats[i])) {
++                  fprintf(stderr, "[rw] %c fd=%d off=%llu size=%llu -> %zu%s  '%s' lr=0x%08X\n", writing ? 'W' : 'R', fd,
++                          (unsigned long long)offset, (unsigned long long)size, n, at_eof ? " EOF" : "",
++                          g_fd_path[fd] + (strlen(g_fd_path[fd]) > 28 ? strlen(g_fd_path[fd]) - 28 : 0), (uint32_t)ctx->lr);
++                  break; } }
++    /* PS3_FSLOG_SHORT=1: the transfers that moved fewer bytes than asked (the first 120), with who asked. */
++    if (n < size) {
++        static int on = -1, shown = 0;
++        if (on < 0) on = getenv("PS3_FSLOG_SHORT") ? 1 : 0;
++        if (on && shown < 120) { shown++;
++            fprintf(stderr, "[fs] short %s fd=%d '%s' off=%llu size=%llu -> %zu (seek %d eof %d err %d) lr=0x%08X tid=%u\n",
++                    writing ? "write@" : "read@", fd, g_fd_path[fd], (unsigned long long)offset, (unsigned long long)size, n,
++                    seek_ok, at_eof, io_err, (uint32_t)ctx->lr, (unsigned)ctx->thread_id); }
++    }
+     if (done_p) { vm_write32(done_p, (uint32_t)((uint64_t)n >> 32)); vm_write32(done_p + 4, (uint32_t)n); }
+     if (!writing) fs_guest_chain_read(ctx, fd, (long long)offset, size, n, buf);
+     if (getenv("PS3_FSLOG")) { static int _n = 0; if (PS3_LOG_FIRST(_n, 40))
+@@ -1142,6 +1169,165 @@ static void cellFsFtruncate(ppu_context* ctx)
+     ctx->gpr[3] = rc == 0 ? (uint64_t)CELL_OK : (uint64_t)(int64_t)CELL_FS_EIO;
+ }
+ 
++/* ---- cellFsUnlink / cellFsRmdir / cellFsUtime ([GT6 0089]) ----------------------------------------------------------
++ * These three answered CELL_OK and did nothing. Gran Turismo 6's own installation, which every new installation runs
++ * on its first start (it merges the update packages' TPPS-01.xx folders into PDIPFS, applies the .bsdiff patches and
++ * then removes what it has used), depends on them: with Unlink / Rmdir doing nothing, ~11 GB of merged-away data
++ * stayed on the disk (and the next start found the update folders again), and the game's file times (it sets
++ * the times of the files it copies to 0) were lost. A copy of the game started once under RPCS3 has all of that done
++ * already, which is why it never showed there.
++ * Only the game's own partitions (/dev_hdd0, /dev_hdd1, whose host folders PS3_HDD0_ROOT / PS3_HDD1_ROOT name) are
++ * changed; the disc (/dev_bdvd), the firmware and any other path keep the old answer, as the disc is read-only on a
++ * console. The host file is the real one, never the mod overlay's stand-in. PS3_FS_LEGACY=1: all three as before. */
++static bool fs_legacy_mode()
++{
++    static int legacy = -1;
++    if (legacy < 0) { const char* e = getenv("PS3_FS_LEGACY"); legacy = (e && *e && *e != '0') ? 1 : 0; }
++    return legacy == 1;
++}
++static bool fs_change_allowed(const char* g)
++{
++    const char* root = nullptr;
++    if (strncmp(g, "/dev_hdd0/", 10) == 0) root = getenv("PS3_HDD0_ROOT");
++    else if (strncmp(g, "/dev_hdd1/", 10) == 0) root = getenv("PS3_HDD1_ROOT");
++    return root && *root;
++}
++#define CELL_FS_EBUSY      ((int)0x8001000A)
++#define CELL_FS_ENOTDIR    ((int)0x8001002E)
++#define CELL_FS_ENOTEMPTY  ((int)0x80010036)
++
++static void host_backslashes(char* p) { for (; *p; p++) if (*p == '/') *p = '\\'; }
++
++static void cellFsUnlink(ppu_context* ctx)
++{
++    char gpath[1024], hpath[1100];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    if (fs_legacy_mode() || !fs_change_allowed(gpath)) { ctx->gpr[3] = CELL_OK; return; }
++    host_path_real(hpath, sizeof hpath, gpath);
++    int err = 0;
++#ifdef _WIN32
++    host_backslashes(hpath);
++    const DWORD attr = GetFileAttributesA(hpath);
++    if (attr == INVALID_FILE_ATTRIBUTES) err = CELL_FS_ENOENT;
++    else if (attr & FILE_ATTRIBUTE_DIRECTORY) err = CELL_FS_EISDIR;
++    else {
++        if (attr & FILE_ATTRIBUTE_READONLY) SetFileAttributesA(hpath, attr & ~FILE_ATTRIBUTE_READONLY);
++        if (!DeleteFileA(hpath)) {
++            const DWORD e = GetLastError();
++            err = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? CELL_FS_ENOENT
++                : (e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) ? CELL_FS_EBUSY : CELL_FS_EIO;
++        }
++    }
++#else
++    if (unlink(hpath) != 0) err = errno == ENOENT ? CELL_FS_ENOENT : errno == EISDIR ? CELL_FS_EISDIR : CELL_FS_EIO;
++#endif
++    if (getenv("PS3_FSLOG") || (err && err != CELL_FS_ENOENT))
++        fprintf(stderr, "[fs] unlink '%s' -> 0x%08X\n", gpath, (unsigned)err);
++    ctx->gpr[3] = (uint64_t)(int64_t)err;
++}
++
++static void cellFsRmdir(ppu_context* ctx)
++{
++    char gpath[1024], hpath[1100];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    if (fs_legacy_mode() || !fs_change_allowed(gpath)) { ctx->gpr[3] = CELL_OK; return; }
++    host_path_real(hpath, sizeof hpath, gpath);
++    int err = 0;
++#ifdef _WIN32
++    host_backslashes(hpath);
++    for (size_t n = strlen(hpath); n > 3 && hpath[n - 1] == '\\'; ) hpath[--n] = 0;
++    if (!RemoveDirectoryA(hpath)) {
++        const DWORD e = GetLastError();
++        err = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? CELL_FS_ENOENT
++            : e == ERROR_DIR_NOT_EMPTY ? CELL_FS_ENOTEMPTY : e == ERROR_DIRECTORY ? CELL_FS_ENOTDIR
++            : (e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) ? CELL_FS_EBUSY : CELL_FS_EIO;
++    }
++#else
++    if (rmdir(hpath) != 0) err = errno == ENOENT ? CELL_FS_ENOENT : errno == ENOTEMPTY ? CELL_FS_ENOTEMPTY : errno == ENOTDIR ? CELL_FS_ENOTDIR : CELL_FS_EIO;
++#endif
++    if (getenv("PS3_FSLOG") || (err && err != CELL_FS_ENOENT))
++        fprintf(stderr, "[fs] rmdir '%s' -> 0x%08X\n", gpath, (unsigned)err);
++    ctx->gpr[3] = (uint64_t)(int64_t)err;
++}
++
++/* cellFsUtime(path, const CellFsUtimbuf* {time_t actime; time_t modtime;} (big-endian, seconds since 1970; NULL = now)). */
++static void cellFsUtime(ppu_context* ctx)
++{
++    char gpath[1024], hpath[1100];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    if (fs_legacy_mode() || !fs_change_allowed(gpath)) { ctx->gpr[3] = CELL_OK; return; }
++    const uint32_t buf = (uint32_t)ctx->gpr[4];
++    host_path_real(hpath, sizeof hpath, gpath);
++    int err = 0;
++#ifdef _WIN32
++    host_backslashes(hpath);
++    const DWORD attr = GetFileAttributesA(hpath);
++    if (attr == INVALID_FILE_ATTRIBUTES) err = CELL_FS_ENOENT;
++    else {
++        HANDLE h = CreateFileA(hpath, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
++                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
++        if (h == INVALID_HANDLE_VALUE) err = CELL_FS_EBUSY;
++        else {
++            FILETIME a, m, now;
++            GetSystemTimeAsFileTime(&now);
++            a = m = now;
++            if (buf) {
++                const uint64_t at = guest_be64(buf), mt = guest_be64(buf + 8);
++                const uint64_t epoch = 116444736000000000ULL;   /* 1970-01-01 in FILETIME ticks (100 ns since 1601) */
++                const uint64_t ta = epoch + at * 10000000ULL, tm = epoch + mt * 10000000ULL;
++                a.dwLowDateTime = (DWORD)ta; a.dwHighDateTime = (DWORD)(ta >> 32);
++                m.dwLowDateTime = (DWORD)tm; m.dwHighDateTime = (DWORD)(tm >> 32);
++            }
++            if (!SetFileTime(h, NULL, &a, &m)) err = CELL_FS_EIO;
++            CloseHandle(h);
++        }
++    }
++#else
++    (void)buf; (void)hpath;   /* the host's own file times stay: only Windows has needed this so far */
++#endif
++    if (getenv("PS3_FSLOG") || err)
++        fprintf(stderr, "[fs] utime '%s' -> 0x%08X\n", gpath, (unsigned)err);
++    ctx->gpr[3] = (uint64_t)(int64_t)err;
++}
++
++/* cellFsAllocateFileAreaWithoutZeroFill(path, u64 size) ([GT6 0089]): the file gets that size (on the console and in
++ * RPCS3 it is a truncate to `size`; the area is not filled). It used to answer OK and do nothing, on the grounds that
++ * a host file grows when it is written. But a title can depend on the SIZE: Gran Turismo 6's installation of its
++ * updates (the first start of every new installation) gives the file a patch will produce its final size this way,
++ * opens it as a stream - whose length is the file's size at that moment (0x00AC9A38: fstat, kept at +0x10) - writes
++ * the patch's difference bytes and then reads them back window by window (4 MB) to add the old file to them. With a
++ * length of 0 the window read back is empty (0x00AC9B88) and the adding loop (0x00AB386C) never ends: every file
++ * over 4 MB stopped the installation, one thread at 100 %, "Installing... Approx. 30 mins. left" for ever. Smaller
++ * files never left the first window, which is why 84 files went through before the first large one.
++ * Only the game's own partitions, as the three calls above; PS3_FS_LEGACY=1 = as before. */
++static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx)
++{
++    char gpath[1024], hpath[1100];
++    guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
++    const uint64_t size = ctx->gpr[4];
++    if (fs_legacy_mode() || !fs_change_allowed(gpath)) { ctx->gpr[3] = CELL_OK; return; }
++    host_path_real(hpath, sizeof hpath, gpath);
++    int err = 0;
++#ifdef _WIN32
++    host_backslashes(hpath);
++    HANDLE h = CreateFileA(hpath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
++                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (h == INVALID_HANDLE_VALUE) {
++        const DWORD e = GetLastError();
++        err = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? CELL_FS_ENOENT : CELL_FS_EBUSY;
++    } else {
++        LARGE_INTEGER to; to.QuadPart = (LONGLONG)size;
++        if (!SetFilePointerEx(h, to, NULL, FILE_BEGIN) || !SetEndOfFile(h)) err = CELL_FS_EIO;
++        CloseHandle(h);
++    }
++#else
++    if (truncate(hpath, (off_t)size) != 0) err = errno == ENOENT ? CELL_FS_ENOENT : CELL_FS_EIO;
++#endif
++    if (getenv("PS3_FSLOG") || err)
++        fprintf(stderr, "[fs] allocate '%s' size=%llu -> 0x%08X\n", gpath, (unsigned long long)size, (unsigned)err);
++    ctx->gpr[3] = (uint64_t)(int64_t)err;
++}
++
+ extern "C" void ppu_fs_register(void)
+ {
+     ps3_hle_register_ctx(0x0D5B4A14u, "cellFsReadWithOffset",  cellFsReadWithOffset);
+@@ -1164,13 +1350,13 @@ extern "C" void ppu_fs_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsReaddir"),  "cellFsReaddir",  cellFsReaddir);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsClosedir"), "cellFsClosedir", cellFsClosedir);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsMkdir"),    "cellFsMkdir",    cellFsMkdir);
+-    ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);     /* [GT6 0089] real; the old no-op for PS3_FS_LEGACY=1 is inside */
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsFtruncate"), "cellFsFtruncate", cellFsFtruncate);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsChmod"),         "cellFsChmod",         cellFsChmod);
+-    ps3_hle_register_ctx(ps3_compute_nid("cellFsUtime"),         "cellFsUtime",         cellFsUtime);
++    ps3_hle_register_ctx(ps3_compute_nid("cellFsUtime"),         "cellFsUtime",         cellFsUtime);   /* [GT6 0089] */
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsSdataOpenByFd"), "cellFsSdataOpenByFd", cellFsSdataOpenByFd);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
+                          "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 031b435..86d05c5 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -241,7 +241,7 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
+     if (now - ht_t0 < (unsigned long long)window_s * 1000000ull) return;
+     ht_t0 = now;
+     fprintf(stderr, "--- HLE calls (last %lds) ---\n", window_s);
+-    for (int k = 0; k < 10; k++) {
++    for (int k = 0; k < 24; k++) {
+         int best = -1;
+         for (int j = 0; j < ht_used; j++)
+             if (ht_n[j] && (best < 0 || ht_n[j] > ht_n[best])) best = j;
+@@ -712,6 +712,11 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+ 
+     for (uint32_t i = 0; i < g_ctx_count; i++)
+         if (g_ctx[i].nid == nid) {
++            /* PS3_HLE_TOP counts these too: the handlers registered with a context are the file, lock and thread
++             * calls - what a thread that spins in the game's own file layer is calling. */
++            { static long s_ht2 = -1;
++              if (s_ht2 < 0) { const char* ev = getenv("PS3_HLE_TOP"); s_ht2 = ev ? atol(ev) : 0; if (s_ht2 < 0) s_ht2 = 0; }
++              if (s_ht2 > 0) hle_top_note(nid, g_ctx[i].name, ctx, s_ht2); }
+             ps3_msf("hle:%s", g_ctx[i].name);
+             /* Record the name here too. This loop dispatches every
+              * ps3_hle_register_ctx handler -- which is the whole sysPrxForUser

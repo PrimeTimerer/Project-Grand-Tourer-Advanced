@@ -1,0 +1,186 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 6f9e16a..f89e59a 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2287,6 +2287,69 @@ static void gcm_blocked_write_log(DWORD result)
+             (unsigned long long)delta[6], (unsigned long long)delta[7]);
+ }
+ 
++/* What the last walker pass ended on, and the wait that looks at it [GT6 0056].
++ *
++ * The walker's thread learns of new work only when it comes back from the wait below, and nothing signals the kick
++ * event when a title stores `put` or an SPU job overwrites the self-jump the walker stands at: the wait ran its
++ * whole timeout, which with a 1 ms timer is 1 to 2 ms (the sampler's Sleep(1) averages 1.7 ms on the same machine).
++ * In a Gran Turismo 6 race that is the time between the game publishing its last batch of commands for a frame and
++ * the walker starting on it, in the one stretch of the frame where the walker is what the game waits for
++ * (tools\ftrace_park.py) - and the same again before every finished frame is presented, because a flip the pass
++ * stopped at is shown after the wait.
++ *
++ * The wait now first asks whether a pass would get anywhere: a flip waiting to be shown; the word the walker is
++ * parked on no longer the self-jump; the label an acquire waits for at its value; `put` moved since the pass read
++ * it; or a pass that stopped at a flip with commands left. If so it does not wait. If not it looks again in a
++ * short spin - once per idle stretch and for GCM_WAIT_SPIN_US microseconds at most (0 = the timed wait alone, as
++ * before, and the DEFAULT; g_gcm_wait_spin_us for a host to turn during a run) - and then falls back to the timed
++ * wait.
++ *
++ * MEASURED 2026-11-18 (two races, 4000 against 0 in alternating 6 s stretches, the second race in reversed order):
++ * the walker's waits a heavy frame went from 6.2 to 5.8 ms and the frame did not change (20.06 against 20.11 ms,
++ * 49.8 against 49.7 fps). The reasoning above was wrong about what the waits are: the walker does come back in
++ * time; it stands because the SPU jobs have not written the cars' commands yet (tools\ftrace_chain.py). So this
++ * stays off, as a switch for a title whose waits ARE the timer. Left as it was in any case: a title with reference values queued (they are published one a pass, and the timed wait
++ * is what paces them), a pass that burned its whole word budget or did not move (the walker's stuck and circling
++ * rules count passes), and two early returns in a row with no pass between them. Walker thread only.
++ *
++ * The spin (not the look before it, which costs nothing) is kept for where it can matter: it runs only while
++ * frames come slower than a 60 Hz beat AND the walker is busy for much of them - a frame longer than 17.5 ms in
++ * which the passes took 8 ms or more arms it for the next 120 frames. A menu, a movie, a loading screen or a race
++ * that holds its 60 frames a second waits as it always did, on the timer. GCM_WAIT_SPIN_ALWAYS=1 = no such rule. */
++int g_gcm_wait_spin_us = -1;
++static u32 s_wait_kind, s_wait_ea, s_wait_word, s_wait_put;     /* kind: 0 caught up or stopped, 1 acquire, 2 park */
++static int s_wait_progress, s_wait_spun;
++static unsigned s_wait_seq, s_wait_seq_early;
++static LONGLONG s_wait_busy_ticks, s_wait_flip_qpc;             /* the passes since the last flip; when that flip was */
++static u32 s_wait_flip_seen;
++static int s_wait_spin_frames;                                  /* frames the spin stays armed for */
++static void gcm_wait_note_pass(LONGLONG q0, LONGLONG q1)
++{
++    static LARGE_INTEGER freq;
++    static int always = -1;
++    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
++    if (always < 0) { const char* e = getenv("GCM_WAIT_SPIN_ALWAYS"); always = (e && *e == '1') ? 1 : 0; }
++    s_wait_busy_ticks += q1 - q0;
++    if (s_flip_request_count == s_wait_flip_seen) return;
++    /* a frame ended in this pass */
++    const LONGLONG frame = q1 - s_wait_flip_qpc;
++    if (always || (s_wait_flip_qpc && frame * 1000 > freq.QuadPart * 35 / 2 && frame < freq.QuadPart &&
++                   s_wait_busy_ticks * 1000 >= freq.QuadPart * 8))
++        s_wait_spin_frames = 120;
++    else if (s_wait_spin_frames > 0)
++        s_wait_spin_frames--;
++    s_wait_flip_seen = s_flip_request_count; s_wait_flip_qpc = q1; s_wait_busy_ticks = 0;
++}
++static int gcm_walker_has_work(void)
++{
++    if (s_flip_pending) return 1;
++    if (s_wait_kind == 2u) return s_wait_ea && vm_read32(s_wait_ea) != s_wait_word;
++    if (s_wait_kind == 1u) return s_wait_ea && vm_read32(s_wait_ea) == s_wait_word;
++    const u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
++    if (put != s_wait_put) return 1;
++    return s_wait_progress && s_fifo_getoff != put;
++}
++
+ /* The present thread's idle wait. It used to be a flat Sleep(4), which meant
+  * the kick above was created, signalled -- and waited on by nobody, so a
+  * starved guest still paid the full tick. Waiting here instead costs nothing
+@@ -2296,6 +2359,28 @@ void cellGcm_fifo_kick_wait(unsigned ms)
+ {
+     static int on = -1;
+     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
++    if (g_gcm_wait_spin_us < 0) {
++        const char* e = getenv("GCM_WAIT_SPIN_US");
++        const int v = e ? atoi(e) : 0;          /* off unless asked for: measured, it shortens the waits and no frame */
++        g_gcm_wait_spin_us = v < 0 ? 0 : v > 20000 ? 20000 : v;
++    }
++    if (g_gcm_wait_spin_us > 0 && s_ref_qhead == s_ref_qtail && s_wait_seq != s_wait_seq_early) {
++        if (gcm_walker_has_work()) { s_wait_seq_early = s_wait_seq; return; }
++        if (!s_wait_spun && s_wait_spin_frames > 0) {
++            static LARGE_INTEGER freq;
++            if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
++            LARGE_INTEGER t0, t;
++            QueryPerformanceCounter(&t0);
++            const LONGLONG lim = freq.QuadPart * (LONGLONG)g_gcm_wait_spin_us / 1000000;
++            for (;;) {
++                for (int i = 0; i < 32; i++) YieldProcessor();
++                if (gcm_walker_has_work()) { s_wait_seq_early = s_wait_seq; return; }
++                QueryPerformanceCounter(&t);
++                if (t.QuadPart - t0.QuadPart >= lim) break;
++            }
++            s_wait_spun = 1;                    /* nothing came: the timed wait from here on, until a pass moves */
++        }
++    }
+     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+     DWORD result = WAIT_TIMEOUT;
+     if (ev) result = WaitForSingleObject(ev, ms);
+@@ -2463,9 +2548,13 @@ void cellGcm_rsx_process_fifo(void)
+     wprof_note_walker();
+     g_gcm_drain_tid = GetCurrentThreadId();
+     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
++    LARGE_INTEGER wq0, wq1;                                 /* [GT6 0056] how long the passes of a frame take */
++    QueryPerformanceCounter(&wq0);
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+     gcm_rsx_process_fifo_unlocked();
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
++    QueryPerformanceCounter(&wq1);
++    gcm_wait_note_pass(wq0.QuadPart, wq1.QuadPart);
+     if (ft_t0) {
+         const uint64_t t1 = ps3_ft_now();
+         /* b = why the pass stopped: 1 self-JUMP park, 2 flip (0 = caught up). */
+@@ -3082,6 +3171,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                   }
+                   why = "parked";
+                   s_park_pass = 1;
++                  s_wait_ea = gcm_io2ea(s_fifo_getoff); s_wait_word = w;      /* [GT6 0056] what the wait looks at */
+                   if (s_fifo_getoff == tgt)
+                       gcm_blocked_write_arm(gcm_io2ea(s_fifo_getoff), w, 2);
+                   s_ft_pass_flags |= 1;
+@@ -3228,6 +3318,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 if (!blk_ms || now - b_t0 < blk_ms) {
+                     if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+                     gcm_blocked_write_arm(la, v, 1);
++                    s_wait_ea = la; s_wait_word = v;                          /* [GT6 0056] */
+                     sem_blocked = 1; break;
+                 }
+                 { static int tn; if (PS3_LOG_FIRST(tn, 12))
+@@ -3545,6 +3636,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * for good that way in about one New Marais run in five ("stuck-get" at a
+      * self-jump with no "jump-park" before it). */
+     g_gcm_last_pass_blocked = s_sema_blocked_pass ? 1 : (s_park_pass ? 2 : 0);
++    /* [GT6 0056] for cellGcm_fifo_kick_wait: how this pass ended, and whether it got anywhere */
++    s_wait_kind = (u32)g_gcm_last_pass_blocked;
++    s_wait_progress = s_fifo_getoff != start_off && budget > 0;
++    if (s_fifo_getoff != start_off) s_wait_spun = 0;
++    s_wait_seq++;
+     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
+       if (s_sema_blocked_pass || s_park_pass) {
+           stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
+@@ -3658,6 +3754,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+     }
+ 
+     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
++    s_wait_put = put;                           /* [GT6 0056] the `put` this pass worked towards */
+     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
+      * the walker actually is. A probe, not a fix -- it removes the back-pressure
+      * a title uses to avoid overwriting commands the GPU has not read. It exists
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index ec44780..6b1f910 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1167,7 +1167,10 @@ static DWORD WINAPI samp_multi_thread(LPVOID p)
+                         out[n++] = rva;
+                     }
+                     samp_multi_push(s, SAMP_RVA_WAIT_MARK);
+-                    samp_multi_push(s, samp_multi_module_of(rip));
++                    const uint32_t mi = samp_multi_module_of(rip);
++                    samp_multi_push(s, mi);
++                    /* where in that module [GT6 0056]: an "o <hex>" line, for the nearest export (tools\ftrace_samp_tail.py) */
++                    samp_multi_push(s, mi < (uint32_t)s_sm_mod_n ? (uint32_t)(rip - s_sm_mod[mi].lo) : 0u);
+                     for (int q = 0; q < SAMP_RVA_WAIT_DEPTH; q++) samp_multi_push(s, out[q]);
+                 }
+             }
+@@ -1185,12 +1188,12 @@ static DWORD WINAPI samp_multi_thread(LPVOID p)
+                         i += 2;
+                         continue;
+                     }
+-                    if (s->buf[i] == SAMP_RVA_WAIT_MARK && i + 1 + SAMP_RVA_WAIT_DEPTH < s->n) {
++                    if (s->buf[i] == SAMP_RVA_WAIT_MARK && i + 2 + SAMP_RVA_WAIT_DEPTH < s->n) {
+                         const uint32_t mi = s->buf[i + 1];
+-                        fprintf(s->f, "0\nm %s\nw", mi < (uint32_t)s_sm_mod_n ? s_sm_mod[mi].name : "?");
+-                        for (int q = 0; q < SAMP_RVA_WAIT_DEPTH; q++) fprintf(s->f, " %x", s->buf[i + 2 + q]);
++                        fprintf(s->f, "0\nm %s\no %x\nw", mi < (uint32_t)s_sm_mod_n ? s_sm_mod[mi].name : "?", s->buf[i + 2]);
++                        for (int q = 0; q < SAMP_RVA_WAIT_DEPTH; q++) fprintf(s->f, " %x", s->buf[i + 3 + q]);
+                         fputc('\n', s->f);
+-                        i += 1 + SAMP_RVA_WAIT_DEPTH;
++                        i += 2 + SAMP_RVA_WAIT_DEPTH;
+                         continue;
+                     }
+                     fprintf(s->f, "%x\n", s->buf[i]);

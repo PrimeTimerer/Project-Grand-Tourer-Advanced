@@ -1,0 +1,173 @@
+diff --git a/include/ps3emu/ps3_ftrace.h b/include/ps3emu/ps3_ftrace.h
+index 4b90d1f..9ed0800 100644
+--- a/include/ps3emu/ps3_ftrace.h
++++ b/include/ps3emu/ps3_ftrace.h
+@@ -62,6 +62,10 @@ enum ps3_ft_kind {
+     PS3_FT_PUMP        = 17, /* the host window message pump (Sakatsuku main.cpp) */
+     PS3_FT_PARK_WRITE  = 18, /* instant: an SPU DMA PUT covered the word the RSX walker is
+                               * parked on; who = 2 (SPU), a = spu id, b = PUT ea */
++    PS3_FT_SPU_MODULE  = 19, /* the code an SPU ran, as its DMA commands show it [GT6 0057]: from the first to the
++                              * last command issued from one lifted image with no channel wait between;
++                              * who = SPU id, a = image (the resident code slot the pc is in, else the context's),
++                              * b = commands (low 24 bits) | SPURS workload id at LS 0x1DC << 24 */
+ };
+ 
+ #if defined(_MSC_VER)
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 59c50a7..04dda0c 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1366,6 +1366,7 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
+ {
+     const uint64_t t1 = ps3_ft_now();
+     if (t1 - t0 < ps3_ft_min_ns()) return;
++    spu_ft_module_note(ctx, 1);         /* [GT6 0057] the module span ends at its last command before this wait */
+     if (t_ft_busy0 && t0 > t_ft_busy0) {
+         const uint8_t* w = ctx->ls + 0x1DC;
+         ps3_ft_span(PS3_FT_SPU_BUSY, ctx->spu_id, (uint32_t)ctx->image_id,
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 6664a81..0ae56d4 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -1044,6 +1044,43 @@ static inline void spu_dma_repeat_log_end(const spu_context* spu, uint32_t ea, u
+     }
+ }
+ 
++/* PS3_FTRACE: which job module an SPU is in, and for how long [GT6 0057]. A Gran Turismo 6 frame waits for SPU jobs
++ * to write the cars' RSX commands (the walker stands parked on a self-jump, tools\ftrace_chain.py), and the
++ * timeline said only that an SPU was busy, not with what. Every job fetches its input and stores its output
++ * through the MFC, so the commands mark its run: a span opens at the first command issued from a lifted image -
++ * the resident code slot the pc is in, which is the job binary the policy module loaded, else the context's own
++ * image - and closes when a command comes from another image or the SPU goes into a channel wait
++ * (spu_ft_wait_span, spu_channels.c). Called only while recording. */
++#if defined(_MSC_VER)
++#  define SPU_FT_TLS __declspec(thread)
++#else
++#  define SPU_FT_TLS __thread
++#endif
++static inline void spu_ft_module_note(spu_context* spu, int closing)
++{
++    static SPU_FT_TLS struct { uint64_t t0, t1; int img; uint32_t n, id, wid; } r;
++    int img = -1;
++    if (!closing) {
++        const uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
++        img = spu->image_id;
++        for (unsigned s = 0; s < spu->resident_code_count; ++s)
++            if (spu->resident_code[s].image_id && pc >= spu->resident_code[s].lsa &&
++                pc - spu->resident_code[s].lsa < spu->resident_code[s].size) { img = spu->resident_code[s].image_id; break; }
++    }
++    if (r.n && (closing || img != r.img || r.id != spu->spu_id)) {
++        ps3_ft_span(PS3_FT_SPU_MODULE, r.id, (uint32_t)r.img, (r.n & 0xFFFFFFu) | (r.wid << 24), r.t0, r.t1);
++        r.n = 0;
++    }
++    if (closing) return;
++    const uint64_t now = ps3_ft_now();
++    if (!r.n) {
++        const uint8_t* w = spu->ls + 0x1DC;
++        r.t0 = now; r.img = img; r.id = spu->spu_id;
++        r.wid = (((uint32_t)w[0] << 24) | ((uint32_t)w[1] << 16) | ((uint32_t)w[2] << 8) | w[3]) & 0xFFu;
++    }
++    r.t1 = now; r.n++;
++}
++
+ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+ {
+     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
+@@ -1318,6 +1355,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+           uint32_t* r = t_gr[t_gn++ & 63];
+           r[0] = (uint32_t)ea; r[1] = lsa; r[2] = size; r[3] = cmd & 0xFFu;
+       }
++      if (PS3_FT_ON()) spu_ft_module_note(spu, 0);       /* [GT6 0057] before the park probe: the PUT is inside its span */
+       const uint32_t pe = g_ps3_ft_park_ea;
+       if (pe && (cmd & 0xFF) >= 0x20u && (cmd & 0xFF) <= 0x2Fu &&
+           (uint32_t)ea <= pe && pe < (uint32_t)ea + size) {
+diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
+index 41d5721..22d7ca6 100644
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -241,6 +241,17 @@ static void* ppu_host_thread_proc(void* param)
+     ps3_tprof_thread_exit();
+     /* Mark as finished */
+     table_lock();
++#ifdef _WIN32
++    /* [GT6 0058] The slot is this thread's only while it still names this host thread. A joiner is woken by
++     * sys_ppu_thread_exit from INSIDE the thread body, before this epilogue; if it has already given the slot back
++     * (or a new thread has taken it), stamping FINISHED here would keep a joined slot forever - or mark a thread
++     * that is still running as finished and wake ITS joiner. sys_ppu_thread_join waits for this host thread now, so
++     * this is the path only of a join that gave up waiting. */
++    if (info->state == PPU_THREAD_STATE_FREE || info->host_tid != GetCurrentThreadId()) {
++        table_unlock();
++        return 0;
++    }
++#endif
+     info->exit_status = (int64_t)info->ctx.gpr[3];
+ 
+     /* A thread nobody can join (created without SYS_PPU_THREAD_CREATE_JOINABLE, or detached)
+@@ -265,13 +276,15 @@ static void* ppu_host_thread_proc(void* param)
+ #endif
+     }
+     info->state = PPU_THREAD_STATE_FINISHED;
+-    table_unlock();
+-
+-    /* Signal anyone waiting for join */
+ #ifdef _WIN32
+-    SetEvent(info->finish_event);
++    /* Signal anyone waiting for join - under the table lock: the event is the slot's, and the slot is ours here. */
++    if (info->finish_event) SetEvent(info->finish_event);
++    table_unlock();
+     return 0;
+ #else
++    table_unlock();
++
++    /* Signal anyone waiting for join */
+     pthread_mutex_lock(&info->finish_mutex);
+     info->finished = 1;
+     pthread_cond_signal(&info->finish_cond);
+@@ -436,6 +449,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
+     int slot = find_free_slot();
+     if (slot < 0) {
+         table_unlock();
++        { static int n = 0;   /* [GT6 0058] said: a title retries this silently, then stops itself */
++          if (PS3_LOG_FIRST(n, 5)) fprintf(stderr, "[SYS] sys_ppu_thread_create: all %d thread slots are taken -> EAGAIN\n", PPU_THREAD_MAX); }
+         return (int64_t)(int32_t)CELL_EAGAIN;
+     }
+ 
+@@ -505,9 +520,14 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
+         *out = be_id;
+     }
+ 
+-    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
+-            (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
+-            stack_size, priority, (unsigned long long)flags);
++    {
++        int used = 0;   /* [GT6 0058] with this one: a count that only grows is a slot leak */
++        for (int i = 0; i < PPU_THREAD_MAX; i++)
++            used += g_ppu_threads[i].state != PPU_THREAD_STATE_FREE;
++        fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX slots=%d/%d\n",
++                (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
++                stack_size, priority, (unsigned long long)flags, used, PPU_THREAD_MAX);
++    }
+     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
+      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
+      * the worker dispatches its job on a null object -> construction never runs. */
+@@ -707,6 +727,20 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
+ 
+     /* Clean up */
+ #ifdef _WIN32
++    /* [GT6 0058] The joiner is woken from INSIDE the thread body (sys_ppu_thread_exit signals, then unwinds to the
++     * thread procedure's epilogue), so the host thread is normally still running here. Giving the slot back at once
++     * let that epilogue stamp it FINISHED afterwards: a joined slot that nothing frees again. Gran Turismo 6 starts
++     * two short threads for every save and joins them at once; after about fifteen of them all 64 slots were taken,
++     * sys_ppu_thread_create answered EAGAIN and the game stopped itself after its 2500 retries (a freeze half a
++     * minute after a save began). Wait for the host thread as the POSIX half does with pthread_join - with the table
++     * lock released, the epilogue takes it. Bounded: a thread whose exit could not unwind goes on running, and the
++     * epilogue's own check keeps it off a slot that was given back. */
++    {
++        HANDLE host = t->host_thread;
++        if (host && WaitForSingleObject(host, 5000) != WAIT_OBJECT_0)
++            fprintf(stderr, "[SYS] sys_ppu_thread_join(tid=%llu): the host thread is still running 5 s after its exit\n",
++                    (unsigned long long)tid);
++    }
+     table_lock();
+     CloseHandle(t->host_thread);
+     CloseHandle(t->finish_event);

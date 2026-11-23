@@ -1,0 +1,56 @@
+# Project Grand Tourer Advanced - the native PC port of Gran Turismo 6 (BCES01893, 1.22).
+# Everything is ignored unless it is named below: a working folder also holds the game's own data and code (game\,
+# the lifted code in recompiled\ and spu_*\), builds, saves, mods and logs, and none of that may ever reach the
+# repository. Only the port's own source is let in.
+/*
+
+!/.gitignore
+!/.gitattributes
+!/.gitmodules
+!/README.md
+!/BUILD.md
+!/LICENSE
+!/CMakeLists.txt
+!/game.path
+!/app.rc
+!/app.ico
+!/*.cpp
+!/*.h
+!/*.inc
+!/build_launcher.bat
+!/build_release.bat
+
+# the engine: upstream ps3recomp as a submodule; this project's changes to it are patches/00*.patch
+!/ps3recomp
+!/patches/
+
+!/launcher/
+!/tools/
+!/trainer/
+!/tests/
+!/package/
+!/third_party/
+/third_party/*
+!/third_party/imgui/
+
+# Inside the folders that are let in: no builds, no caches, nothing made from the game, nothing that needs keys.
+__pycache__/
+*.pyc
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.lib
+*.obj
+*.elf
+*.ELF
+*.sprx
+*.prx
+*.pkg
+*.PUP
+*.iso
+cars.json
+parts_index.txt
+/tools/ps3/
+/trainer/publish/

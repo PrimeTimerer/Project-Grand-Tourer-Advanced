@@ -1,0 +1,68 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index cab61e5..609f91b 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2177,7 +2177,7 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
+  * GET_REPORT (0x1800, type 1). A title asks the RSX how many pixels of what it drew passed the depth test - Gran
+  * Turismo 6 does it for the lights it draws a glow for, and shows the glow by the answer. Until now the walker
+  * answered 0xFFFF ("visible") without measuring, so at night the glows of lights behind walls and hills stood in
+- * the picture (owner, 2026-11-19: "야간 주행을 하면 벽을 뚫고 저 멀리의 빛이 보이거나").
++ * the picture (2026-11-19: at night, lights far away showed through walls).
+  * Measured with D3D12 occlusion queries: while the enable register is set, the draws of sink_end_impl run inside a
+  * query (one heap slot from the first such draw to the next GET_REPORT, CLEAR, uncounted draw or submit). The
+  * count is known only when the GPU has run that command list, so GET_REPORT hands the report over
+@@ -3809,7 +3809,7 @@ static int ld_ww_clean_since(const u8* p, u32 n, u32 since)
+  * surfaces were still taken as what is at those addresses: a texture that starts where one started was bound to
+  * the old label picture, and the lazy mirror copied label pixels that guest memory "did not have yet" over the
+  * icon bytes the title had just written (the quick menu after a race showed a driver's name and noise where its
+- * icons are; the owner saw the track tiles turn white).
++ * icons are; the track tiles turned white).
+  *
+  * RPCS3 has the same question and answers it by remembering a few words of the memory under each render target
+  * (render_target_descriptor::sync_tag) and dropping the target as a texture source when they have changed
+@@ -7301,8 +7301,8 @@ static int zdepth_snapshot(u32 slot)
+  * Gran Turismo 6 draws the glow of each street lamp at night with the depth test OFF (one group of 325 quads at the
+  * end of the scene) and lets the fragment program decide, from the scene's depth read as a 1280x720 texture, whether
+  * the lamp is covered. The zeta is the one its reflection faces, mirror and 2D layer use as well, so the snapshot
+- * stood at 2048x3174: the glows of lamps behind walls and under the road were in the picture (owner, 2026-11-19:
+- * "야간 주행을 하면 벽을 뚫고 저 멀리의 빛이 보이거나").
++ * stood at 2048x3174: the glows of lamps behind walls and under the road were in the picture (2026-11-19:
++ * at night, lights far away showed through walls).
+  * The window is a copy of that top-left part, as large as the texture, made anew when the snapshot has changed; two
+  * sizes a zeta are kept. Texel-addressed reads need none - their coordinates are divided by the snapshot's size
+  * (unnorm_dim). LD_ZDEPTH_WINDOW=0: off, the snapshot as before.
+@@ -10335,8 +10335,8 @@ static int ld_upload_pixel_constants(u32* out_offset)
+      * Gran Turismo 6 draws with the origin at the BOTTOM, and its glass - the covers of the headlights, the windows,
+      * panes beside the track - reads the picture behind it out of the colour target it is drawing into, at
+      * WPOS x (1/W, -1/H) with the texture set to repeat in t: with the real WPOS that is the pixel's own row, with
+-     * the host's y it is the row mirrored about the middle of the screen. So a headlight showed the sky (owner,
+-     * 2026-11-20: "헤드라이트가 제대로 보이지 않고 마냥 거울처럼 반사만"), and panes high on the screen showed pieces
++     * the host's y it is the row mirrored about the middle of the screen. So a headlight showed the sky (2026-11-20:
++     * headlights did not show, only mirror-like reflections), and panes high on the screen showed pieces
+      * of the road. LD_WPOS_WINDOW=0 = as before. */
+     { static int on = -1;
+       if (on < 0) { const char* e = getenv("LD_WPOS_WINDOW"); on = (e && *e == '0') ? 0 : 1; }
+@@ -16031,8 +16031,8 @@ static int make_depth_snapshot_pipeline(void)
+     return SUCCEEDED(hr) ? 0 : -1;
+ }
+ 
+-/* The present's sync interval (owner, 2026-11-08: "경기 화면에서 버벅거리고"). Default 1, as before.
+- * LD_SYNC_INTERVAL=auto (the launcher's "고주사율 모니터 프레임 간격 맞춤"): at 120/180/240 Hz a frame presented with
++/* The present's sync interval (2026-11-08: the race screen stuttered). Default 1, as before.
++ * LD_SYNC_INTERVAL=auto (the launcher's frame pacing for high refresh rate monitors): at 120/180/240 Hz a frame presented with
+  * interval 1 shows at the next refresh after it is ready, so frames stay up 11, 17 or 22 ms by turns at 180 Hz;
+  * refresh / 60 keeps each up 16.7 ms when frames are on time, but a late frame then stays up 33 ms instead of 22
+  * (sy2 vs fm2, a match: seconds under 58 fps 27 vs 13). Other rates keep 1. LD_SYNC_INTERVAL=<1-4> forces a value.
+diff --git a/runtime/syscalls/sys_fs.c b/runtime/syscalls/sys_fs.c
+index 040bc4d..03669d3 100644
+--- a/runtime/syscalls/sys_fs.c
++++ b/runtime/syscalls/sys_fs.c
+@@ -153,7 +153,7 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+  * is a regular file there, on any device (/dev_bdvd/PS3_GAME/USRDIR/..., /dev_hdd0/game/<ID>/USRDIR/...). A
+  * translation or mod then lives in its own folder and the original files stay as they are; without the
+  * variable nothing changes. Directories are never redirected, so listings still show the original tree.
+- * All three path translators call this first. Sakatsuku: the Korean patch's data files (launcher "한글패치"). */
++ * All three path translators call this first. Sakatsuku: the Korean patch's data files (the launcher's Korean patch). */
+ int ps3_vfs_usrdir_overlay(const char* guest, char* out, size_t cap)
+ {
+     static const char* root = NULL; static int init = 0, log = 0;

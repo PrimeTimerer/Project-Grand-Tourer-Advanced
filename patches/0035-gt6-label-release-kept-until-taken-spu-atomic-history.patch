@@ -1,0 +1,356 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 14e1762..294af7c 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1676,8 +1676,94 @@ void gcm_forget_spu_blocks(void)
+     s_spu_blk_w = 0;
+ }
+ 
++/* GCM_LABEL_BANK=<hex label offset>: a RELEASE of that label is not lost when the previous one has not been
++ * taken yet.
++ *
++ * Gran Turismo 6 uses label 0x53 (offset 0x530) as a handshake between the RSX and its SPU render jobs. Every
++ * frame's list ends with RELEASE (label := 1); the last of the frame's five parallel jobs waits until the label is
++ * 1, clears it and only then lets the job queue go on. On the console the take of frame N always comes before the
++ * release of list N -- the RSX needs most of a frame for the list, the jobs end within microseconds of each other
++ * -- so every take finds the release of list N-1 waiting and never depends on its own list. Here the walker can
++ * finish list N before the slower SPU side has taken: that release lands on a label that is still 1 and is gone,
++ * the take clears the label, and from then on the last job of every frame waits for the release of its OWN list,
++ * which comes only after the serial job (SPURS workload 6, SPU 0 only) has opened that list's gate. In the first
++ * frame whose last job happens to run on SPU 0 the serial job can never start, and the title stands still.
++ *
++ * It cannot be left like that: as soon as a frame has jobs BEHIND that wait which fill parts of the list (the
++ * menu's 3D scene), the list cannot end before the take, and a take that waits for its own list never comes.
++ *
++ * So for this one label a release that finds the label already set is kept and written back when an SPU clears
++ * the label: every release is consumed by exactly one take, in order, as on the console (the SPU side can be
++ * several lists behind in the light frames before the 3D scene, so the count is not capped at one). While nobody
++ * takes (64 releases in a row) at most one release is kept, so that the first frame with parallel jobs
++ * -- whose list the walker has usually finished before its last job takes -- starts in step. When that first
++ * take comes before its list's release instead, the title is one release ahead of the console from then on:
++ * its jobs wait for the list before the previous one. That costs no correctness here (nothing is drawn from a
++ * list before the RSX has it), only a frame of the title's own throttle. */
++/* A port's trace sink for walker events (GCM_PARK_LOG / GCM_LABEL_LOG): NULL unless the port sets it, e.g. to the
++ * SPU runtime's spu_atom_ring_note so that RSX and SPU events share one clock. */
++void (*g_gcm_trace_note)(const char* fmt, ...) = 0;
++
++static long s_bank_off = -2;                /* label offset; -1 = off */
++static u32  s_bank_val = 1;
++static int  s_bank_count = 0;               /* releases kept for the next take(s) */
++static int  s_bank_rel_since_take = 100;    /* releases since the last take; large = nobody takes */
++static char s_bank_lock = 0;
++unsigned long g_gcm_label_bank_kept = 0, g_gcm_label_bank_given = 0;
++
++static long gcm_label_bank_off(void)
++{
++    if (s_bank_off == -2) { const char* e = getenv("GCM_LABEL_BANK"); s_bank_off = (e && *e) ? strtol(e, NULL, 16) : -1; }
++    return s_bank_off;
++}
++static void gcm_bank_lock(void)   { while (__atomic_test_and_set(&s_bank_lock, __ATOMIC_ACQUIRE)) { } }
++static void gcm_bank_unlock(void) { __atomic_clear(&s_bank_lock, __ATOMIC_RELEASE); }
++
++/* The walker's RELEASE of the banked label. Returns 1 when the release was kept instead of written. */
++static int gcm_label_bank_release(u32 la, u32 v)
++{
++    int kept = 0;
++    gcm_bank_lock();
++    const u32 was = vm_read32(la);
++    if (was != v) vm_write32(la, v);
++    else if (s_bank_rel_since_take < 64) { if (s_bank_count < 1024) s_bank_count++; s_bank_val = v; g_gcm_label_bank_kept++; kept = 1; }
++    else { s_bank_count = 1; s_bank_val = v; }      /* nobody takes: one is kept, never more (see above) */
++    if (s_bank_rel_since_take < 100) s_bank_rel_since_take++;
++    /* GCM_LABEL_BANK_LOG=<n> (diagnostic): the first n releases and takes of the banked label. */
++    { static int want = -1, n = 0;
++      if (want < 0) { const char* e = getenv("GCM_LABEL_BANK_LOG"); want = e ? atoi(e) : 0; }
++      if (n < want) { n++;
++          fprintf(stderr, "[gcm-bank] release: label was %u -> %s, kept %d, releases since the last take %d, t=%llu ms\n",
++                  was, was != v ? "set" : kept ? "kept" : "one kept (nobody takes)", s_bank_count, s_bank_rel_since_take, ps3_ms_now()); } }
++    gcm_bank_unlock();
++    return kept;
++}
++
++/* An SPU PUT that covers the banked label is a take: if it left the label cleared and a release is kept, the
++ * label gets that release now. */
++static void gcm_label_bank_take(u32 ea, u32 size)
++{
++    const long off = gcm_label_bank_off();
++    if (off < 0) return;
++    const u32 la = GCM_LABEL_GUEST_BASE + ((u32)off & 0xFFFFu);
++    if (ea > la || la + 4u > ea + size) return;
++    gcm_bank_lock();
++    const int since = s_bank_rel_since_take;
++    const u32 now_v = vm_read32(la);
++    int given = 0;
++    s_bank_rel_since_take = 0;
++    if (s_bank_count > 0 && now_v != s_bank_val) { vm_write32(la, s_bank_val); s_bank_count--; g_gcm_label_bank_given++; given = 1; }
++    { static int want = -1, n = 0;
++      if (want < 0) { const char* e = getenv("GCM_LABEL_BANK_LOG"); want = e ? atoi(e) : 0; }
++      if (n < want) { n++;
++          fprintf(stderr, "[gcm-bank] take: SPU PUT ea=0x%08X size=%u left the label %u -> %s, kept %d, releases since the previous take %d, t=%llu ms\n",
++                  ea, size, now_v, given ? "a kept release is given" : "nothing given", s_bank_count, since, ps3_ms_now()); } }
++    gcm_bank_unlock();
++}
++
+ void gcm_note_spu_put(u32 ea, u32 size)
+ {
++    gcm_label_bank_take(ea, size);
+     if (!size || size > 0x40000u) return;
+     u32 room = 0;
+     u32 io = gcm_ea2io_range(ea, &room);
+@@ -2554,6 +2640,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                     if (want < 0) { const char* e = getenv("GCM_PARK_LOG"); want = e ? atoi(e) : 0; }
+                     if (want > 0 && last_park != s_fifo_getoff && n < want) {
+                         n++; last_park = s_fifo_getoff;
++                        if (g_gcm_trace_note) g_gcm_trace_note("RSX walker stands at io %08X", s_fifo_getoff);
+                         fprintf(stderr, "[park] walker stands at io 0x%08X (ea 0x%08X) put=0x%08X t=%llu ms\n",
+                                 s_fifo_getoff, gcm_io2ea(s_fifo_getoff), put, ps3_ms_now());
+                     } }
+@@ -2668,12 +2755,22 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         if (!gcm_get_eq_put())
+                             vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
+                         atomic_thread_fence(memory_order_release);
++                        if (gcm_label_bank_off() == (long)s_sema_offset) {      /* GCM_LABEL_BANK */
++                            if (gcm_label_bank_release(la, v)) {
++                                static int kn = 0;
++                                if (PS3_LOG_FIRST(kn, 8))
++                                    fprintf(stderr, "[cellGcmSys] label off 0x%X: release at get=0x%08X kept for the next take"
++                                            " (the previous one was not taken yet)\n", s_sema_offset, s_fifo_getoff);
++                            }
++                        } else
+                         vm_write32(la, v);
+                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
+                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
+                         /* GCM_LABEL_LOG=<hex offset> (diagnostic): every release of that label (first 400). */
+                         { static long want = -2; static int n = 0;
+                           if (want == -2) { const char* e = getenv("GCM_LABEL_LOG"); want = e ? strtol(e, NULL, 16) : -1; }
++                          if (want >= 0 && (u32)want == s_sema_offset && g_gcm_trace_note)
++                              g_gcm_trace_note("RSX releases label off %X := %08X at get %08X", s_sema_offset, v, s_fifo_getoff);
+                           if (want >= 0 && (u32)want == s_sema_offset && n++ < 400)
+                               fprintf(stderr, "[SEMA-REL] label off 0x%X := 0x%08X at get=0x%08X (was 0x%08X) t=%llu ms\n", s_sema_offset, v,
+                                       s_fifo_getoff, vm_read32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu)), ps3_ms_now()); }
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 0adbdf0..61b118d 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -576,6 +576,137 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
+  * completion. Chosen above the context/descriptor we park near the top of LS. */
+ #define SPU_JOB_RETURN_LS   0x3FF00u
+ 
++/* SPU_ATOM_RING=<hex ea>[,<hex ea>]: keep the last SPU_ATOM_RING_N lock-line atomics on those 128-byte lines --
++ * SPU, command, pc, lr, the line as it is in memory and, for a PUT, the line being stored and whether it
++ * committed -- and print them with the SPU thread report (spu_atom_ring_dump). Unlike SPU_ATOM_EA nothing is
++ * printed while the title runs, so the timing of a stall stays as it is and the history right before it is kept. */
++#include <stdlib.h>
++#include <time.h>
++#define SPU_ATOM_RING_N 4096
++typedef struct {
++    uint64_t us; uint32_t ea, pc, lr; uint8_t spu, cmd, verdict, pad;
++    uint8_t ram[MFC_ATOMIC_LINE], put[MFC_ATOMIC_LINE];
++} spu_atom_rec;
++static spu_atom_rec* s_ring;
++static long s_ring_n;
++static uint32_t s_ring_ea[2];
++static int s_ring_on = -1;
++
++static int spu_atom_ring_ready(void)
++{
++    if (s_ring_on < 0) {
++        const char* e = getenv("SPU_ATOM_RING");
++        char* end = NULL;
++        if (e && *e) {
++            s_ring_ea[0] = (uint32_t)strtoul(e, &end, 16) & ~127u;
++            s_ring_ea[1] = (end && *end == ',') ? ((uint32_t)strtoul(end + 1, NULL, 16) & ~127u) : 0xFFFFFFFFu;
++            s_ring = (spu_atom_rec*)calloc(SPU_ATOM_RING_N, sizeof(spu_atom_rec));
++        }
++        s_ring_on = s_ring ? 1 : 0;
++    }
++    return s_ring_on;
++}
++
++static uint64_t spu_atom_ring_us(void)
++{
++    struct timespec ts; timespec_get(&ts, TIME_UTC);
++    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
++}
++
++/* A line of text on the same clock, from anywhere (the RSX walker, a watched DMA): spu_atom_ring_note("..."). */
++#include <stdarg.h>
++void spu_atom_ring_note(const char* fmt, ...)
++{
++    if (!spu_atom_ring_ready()) return;
++    const long i = __atomic_fetch_add(&s_ring_n, 1, __ATOMIC_RELAXED);
++    spu_atom_rec* r = &s_ring[(unsigned long)i % SPU_ATOM_RING_N];
++    r->us = spu_atom_ring_us(); r->ea = 0; r->cmd = 0;
++    va_list ap; va_start(ap, fmt);
++    vsnprintf((char*)r->put, sizeof r->put, fmt, ap);
++    va_end(ap);
++}
++
++static spu_atom_rec* spu_atom_ring_add(spu_context* ctx, uint32_t cmd, uint32_t ea, const uint8_t* mem, const uint8_t* ls)
++{
++    if (!spu_atom_ring_ready()) return NULL;
++    if (ea != s_ring_ea[0] && ea != s_ring_ea[1]) {
++        /* SPU_ATOM_RING_PC=<lo>,<hi> (hex LS addresses): also every atomic issued from that code range,
++         * whatever line it is on -- for a helper whose target address is not known yet. */
++        static int pc_on = -1; static uint32_t pc_lo, pc_hi;
++        if (pc_on < 0) {
++            const char* e = getenv("SPU_ATOM_RING_PC"); char* end = NULL;
++            uint32_t lo = 0, hi = 0;
++            if (e && *e) { lo = (uint32_t)strtoul(e, &end, 16); hi = (end && *end == ',') ? (uint32_t)strtoul(end + 1, NULL, 16) : 0; }
++            pc_lo = lo; pc_hi = hi; pc_on = hi > lo ? 1 : 0;
++        }
++        const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
++        if (!pc_on || pc < pc_lo || pc >= pc_hi) return NULL;
++    }
++    const long i = __atomic_fetch_add(&s_ring_n, 1, __ATOMIC_RELAXED);
++    spu_atom_rec* r = &s_ring[(unsigned long)i % SPU_ATOM_RING_N];
++    r->us = spu_atom_ring_us();
++    r->ea = ea; r->pc = (uint32_t)ctx->pc & SPU_LS_MASK; r->lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++    r->spu = (uint8_t)(ctx->spu_id & 7u); r->cmd = (uint8_t)cmd; r->verdict = 0xFF;
++    memcpy(r->ram, mem, MFC_ATOMIC_LINE);
++    if (cmd != MFC_GETLLAR_CMD) memcpy(r->put, ls, MFC_ATOMIC_LINE);
++    return r;
++}
++
++static int spu_atom_ring_diff(char* buf, int p, int cap, const uint8_t* a, const uint8_t* b)
++{
++    for (int o = 0; o < MFC_ATOMIC_LINE && p < cap - 24; o += 4)
++        if (memcmp(a + o, b + o, 4))
++            p += snprintf(buf + p, cap - p, " +%02X:%02X%02X%02X%02X>%02X%02X%02X%02X", o,
++                          a[o], a[o + 1], a[o + 2], a[o + 3], b[o], b[o + 1], b[o + 2], b[o + 3]);
++    return p;
++}
++
++void spu_atom_ring_dump(void)
++{
++    if (s_ring_on != 1) return;
++    const long n = s_ring_n, first = n > SPU_ATOM_RING_N ? n - SPU_ATOM_RING_N : 0;
++    fprintf(stderr, "[atom-ring] %ld atomics on 0x%08X / 0x%08X, printing from %ld\n", n, s_ring_ea[0], s_ring_ea[1], first);
++    static uint8_t cur[3][MFC_ATOMIC_LINE];
++    int have[3] = { 0, 0, 0 };
++    uint32_t other_ea = 0;      /* slot 2: lines recorded because of SPU_ATOM_RING_PC */
++    uint64_t t0 = 0;
++    long rep = 0; uint32_t rep_key = 0xFFFFFFFFu;
++    char buf[1600];
++    for (long i = first; i < n; i++) {
++        const spu_atom_rec* r = &s_ring[(unsigned long)i % SPU_ATOM_RING_N];
++        const int k = (r->ea == s_ring_ea[1]) ? 1 : (r->ea == s_ring_ea[0] || r->cmd == 0) ? 0 : 2;
++        if (k == 2 && r->ea != other_ea) { other_ea = r->ea; have[2] = 0; }
++        if (!t0) t0 = r->us;
++        if (r->cmd == 0) {      /* a note */
++            if (rep) { fprintf(stderr, "[atom-ring]      ... the same GETLLAR %ld more time(s)\n", rep); rep = 0; }
++            rep_key = 0xFFFFFFFFu;
++            fprintf(stderr, "[atom-ring] +%10.3f ms      %.127s\n", (double)(r->us - t0) / 1000.0, (const char*)r->put);
++            continue;
++        }
++        const int outside = have[k] && memcmp(cur[k], r->ram, MFC_ATOMIC_LINE) != 0;
++        const uint32_t key = ((uint32_t)r->spu << 28) | ((uint32_t)k << 27) | r->pc;
++        if (r->cmd == MFC_GETLLAR_CMD && !outside && key == rep_key) { rep++; continue; }   /* an unchanged poll */
++        if (rep) { fprintf(stderr, "[atom-ring]      ... the same GETLLAR %ld more time(s)\n", rep); rep = 0; }
++        rep_key = (r->cmd == MFC_GETLLAR_CMD) ? key : 0xFFFFFFFFu;
++        if (outside) {      /* changed by somebody this ring does not see: the PPU, or an SPU's plain DMA */
++            int p = snprintf(buf, sizeof buf, "[atom-ring]      (line %08X changed outside these atomics)", r->ea);
++            p = spu_atom_ring_diff(buf, p, (int)sizeof buf, cur[k], r->ram);
++            fprintf(stderr, "%s\n", buf);
++        }
++        const int committed = r->cmd != MFC_GETLLAR_CMD && (r->cmd != MFC_PUTLLC_CMD || r->verdict == 0);
++        int p = snprintf(buf, sizeof buf, "[atom-ring] +%10.3f ms spu%u %-11s ea=%08X pc=%05X lr=%05X",
++                         (double)(r->us - t0) / 1000.0, r->spu,
++                         r->cmd == MFC_GETLLAR_CMD ? "GETLLAR" : r->cmd != MFC_PUTLLC_CMD ? "PUTLLUC"
++                             : r->verdict == 0 ? "PUTLLC ok" : "PUTLLC FAIL", r->ea, r->pc, r->lr);
++        if (committed) p = spu_atom_ring_diff(buf, p, (int)sizeof buf, r->ram, r->put);
++        fprintf(stderr, "%s\n", buf);
++        memcpy(cur[k], committed ? r->put : r->ram, MFC_ATOMIC_LINE);
++        have[k] = 1;
++    }
++    if (rep) fprintf(stderr, "[atom-ring]      ... the same GETLLAR %ld more time(s)\n", rep);
++    fflush(stderr);
++}
++
+ /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
+ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+ {
+@@ -653,6 +784,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+         return 1;
+     }
+ 
++    spu_atom_rec* const ring_rec = spu_atom_ring_add(ctx, cmd, ea, mem, ls);   /* SPU_ATOM_RING */
++
+     /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA`s 128B line.
+      * SPU_ATOM_FULL=1 additionally dumps 32 bytes of the line before and after.
+      *
+@@ -926,6 +1059,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+               fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
+                       ctx->atomic_stat ? "FAIL" : "OK",
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
++        if (ring_rec) ring_rec->verdict = (uint8_t)ctx->atomic_stat;
+         ctx->resv_valid = 0;                           /* reservation consumed */
+         spu_lockline_unlock();
+         if (ctx->atomic_stat == 0) {
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 6a83695..734e32d 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -1053,11 +1053,20 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+      * Nothing in that module's code stores +0x88, so the consumer count is
+      * written from outside -- an SPU DMA is the obvious candidate, and this
+      * says outright whether that is true. Watch 0x002DF008. */
+-    { static int s_we = -2; static uint32_t s_wa;
+-      if (s_we == -2) { const char* e = getenv("SPU_WATCHEA");
+-                        s_we = e ? 1 : 0;
+-                        s_wa = e ? (uint32_t)strtoul(e, 0, 16) : 0u; }
+-      if (s_we && vm_base && (uint32_t)ea <= s_wa && s_wa < (uint32_t)ea + size) {
++    /* Up to four words, comma separated: SPU_WATCHEA=80D4A08C,8146A08C. Each line carries the host tick in ms
++     * (the clock of cellGcmSys's [park] and [SEMA-REL] lines) so the order against the RSX walker can be read. */
++    { static int s_we = -2; static uint32_t s_was[4]; static int s_wn;
++      if (s_we == -2) {     /* several SPU threads get here at once: parse into locals, then publish */
++          const char* e = getenv("SPU_WATCHEA");
++          uint32_t tmp[4] = { 0, 0, 0, 0 }; int tn = 0;
++          while (e && *e && tn < 4) { char* end = 0; tmp[tn++] = (uint32_t)strtoul(e, &end, 16);
++                                      e = (end && *end == ',') ? end + 1 : 0; }
++          for (int ti = 0; ti < 4; ti++) s_was[ti] = tmp[ti];
++          s_wn = tn; s_we = tn ? 1 : 0; }
++      uint32_t s_wa = 0; int s_hit = 0;
++      for (int wi = 0; s_we && wi < s_wn; wi++)
++          if ((uint32_t)ea <= s_was[wi] && s_was[wi] < (uint32_t)ea + size) { s_wa = s_was[wi]; s_hit = 1; break; }
++      if (s_hit && vm_base) {
+           static unsigned long wn;
+           /* SPU_WATCHEA_EVERY=<n> (default 64): print every nth hit. 1
+            * shows the last transfers before a freeze, which a stride skips --
+@@ -1070,10 +1079,22 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+           if (wn <= 12 || (wn % s_wev) == 0) {
+               uint32_t v; memcpy(&v, vm_base + s_wa, 4);
+               v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
++              uint32_t lv = 0;      /* the word as the SPU holds it in local store (what a PUT writes) */
++              if (lsa + (s_wa - (uint32_t)ea) + 4 <= 0x40000u) {
++                  memcpy(&lv, spu->ls + ((lsa + (s_wa - (uint32_t)ea)) & SPU_LS_MASK), 4);
++                  lv = (lv >> 24) | ((lv >> 8) & 0xFF00u) | ((lv << 8) & 0xFF0000u) | (lv << 24);
++              }
++              if ((cmd & 0xF0u) == 0x20u) {     /* a PUT: also on the SPU_ATOM_RING clock */
++                  extern void spu_atom_ring_note(const char* fmt, ...);
++                  spu_atom_ring_note("spu%u PUT [%08X] := %08X (was %08X) pc=%05X workload %u", spu->spu_id & 7u, s_wa, lv, v,
++                                     (uint32_t)spu->pc & SPU_LS_MASK, (unsigned)spu->ls[0x1DF]);
++              }
+               fprintf(stderr, "[watchea] n=%lu spu%u cmd=0x%02X ea=0x%08X"
+-                              " size=%u lsa=0x%05X pc=0x%05X -> [0x%08X]=0x%08X\n",
++                              " size=%u lsa=0x%05X pc=0x%05X lr=0x%05X -> [0x%08X]=0x%08X ls=0x%08X wkl=%u t=%llu ms\n",
+                       wn, spu->spu_id & 7u, cmd & 0xFFu, (uint32_t)ea, size,
+-                      lsa, (uint32_t)spu->pc & SPU_LS_MASK, s_wa, v);
++                      lsa, (uint32_t)spu->pc & SPU_LS_MASK, spu->gpr[0]._u32[0] & SPU_LS_MASK, s_wa, v, lv,
++                      (unsigned)spu->ls[0x1DF],      /* the SPURS kernel's "current workload id" (LS 0x1DC) */
++                      (unsigned long long)GetTickCount64());
+           }
+       } }
+ 
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 7405912..e95a6f4 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -2029,6 +2029,7 @@ void ps3_spu_threads_report(void)
+             fprintf(stderr, "[spu-threads] spurs 0x%08X workload %d: %s\n", spurs_seen[j], w, b);
+         }
+     }
++    { extern void spu_atom_ring_dump(void); spu_atom_ring_dump(); }     /* SPU_ATOM_RING history, if any */
+ }
+ 
+ /* Public: consume the pending inbound-mailbox command for a SPU thread, if any.

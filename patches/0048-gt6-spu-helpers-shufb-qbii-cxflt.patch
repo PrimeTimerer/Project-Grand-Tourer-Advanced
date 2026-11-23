@@ -1,0 +1,108 @@
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 9f139b0..b03d6f4 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -466,6 +466,24 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b,
+ /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
+  * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
+  * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
++#if !defined(SPU_SHUFB_SWAPPED)
++/* [GT6 0052] Without the four byte swaps (SPU_SHUFB_SWAPPED = the form below, as before). All three operands and the
++ * result keep SPU byte P in host lane P^3, so the result's host lane h is chosen by the control's host lane h, and
++ * byte q of the a:b concatenation is host lane (q & 15) ^ 3 of a (q < 16) or of b. pshufb reads the low four bits of
++ * an index and gives 0 where its top bit is set - the lanes a special selector then fills, picked from a table by
++ * the selector's three top bits (100, 101 -> 0x00, 110 -> 0xFF, 111 -> 0x80). Nine vector operations for twenty: in
++ * Gran Turismo 6's heaviest job (jobmod_9039b3cc346b, the car vertex loops) every fifth instruction is a shufb, and
++ * it was close to half of that code's host work. With a == b the two table reads fold into one. */
++static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
++    __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
++    const __m128i idx = _mm_xor_si128(C, _mm_set1_epi8(3));
++    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), _mm_slli_epi16(C, 3));
++    const __m128i lut = _mm_setr_epi8(0, 0, 0, 0, 0, 0, (char)0xFF, (char)0x80, 0, 0, 0, 0, 0, 0, 0, 0);
++    const __m128i special = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 5), _mm_set1_epi8(7)));
++    r = _mm_blendv_epi8(r, special, C);
++    u128 out; memcpy(&out, &r, 16); return out;
++}
++#else
+ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+     const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+@@ -481,6 +499,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+     r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+     u128 out; memcpy(&out, &r, 16); return out;
+ }
++#endif
+ #elif defined(__ARM_NEON)
+ #include <arm_neon.h>
+ /* NEON version: tbl over the 32-byte {a,b} concatenation. SPU byte P lives at
+@@ -588,14 +607,31 @@ static inline u128 spu_rotqbyi(u128 a, int sh) { return spu_rotqbyi_ref(a, sh);
+  * word1<<32, but SPU's MS half is word0<<32 | word1), so native shifts on them
+  * corrupt any bits crossing a 32-bit boundary. Assemble the logical hi/lo halves
+  * with _u32[0] as most-significant, shift, then disassemble. */
+-static inline u128 spu_shlqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
++static inline u128 spu_shlqbii_ref(u128 a, int sh) { sh&=7; if(!sh) return a;
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh);
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+-static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
++static inline u128 spu_rotqbii_ref(u128 a, int sh) { sh&=7; if(!sh) return a;
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
++#if SPU_X86 && !defined(SPU_QBI_SCALAR)
++/* [GT6 0052] The quadword bit shifts in the vector register (SPU_QBI_SCALAR = the scalar forms above, as before).
++ * Word lane i is the i-th most significant word, so a shift left by 1..7 bits is each word shifted left with the
++ * top bits of the next lane coming in below: lanes moved down by one (a rotate of the four for rotqbii, zero into
++ * the last for shlqbii), shifted right by 32 - n, or-ed. The scalar forms built the result from four 32-bit
++ * stores, which the 128-bit load of the next instruction could not take from the store buffer: a stall at every
++ * use (thirteen rotqbii in one pass of jobmod_9039b3cc346b's func_0000C8C8). */
++static inline u128 spu_shlqbii(u128 a, int sh) { sh &= 7; if (!sh) return a;
++    const __m128i x = spu__xl(a);
++    return spu__xs(_mm_or_si128(_mm_slli_epi32(x, sh), _mm_srli_epi32(_mm_srli_si128(x, 4), 32 - sh))); }
++static inline u128 spu_rotqbii(u128 a, int sh) { sh &= 7; if (!sh) return a;
++    const __m128i x = spu__xl(a);
++    return spu__xs(_mm_or_si128(_mm_slli_epi32(x, sh), _mm_srli_epi32(_mm_shuffle_epi32(x, 0x39), 32 - sh))); }
++#else
++static inline u128 spu_shlqbii(u128 a, int sh) { return spu_shlqbii_ref(a, sh); }
++static inline u128 spu_rotqbii(u128 a, int sh) { return spu_rotqbii_ref(a, sh); }
++#endif
+ 
+ /* ---- SPU floating point --------------------------------------------------------------
+  * Written from the Cell BE SPU ISA v1.2 (section 9 and the instruction pages).
+@@ -1768,8 +1804,23 @@ SPU__XE_INLINE __m128i spu__xe_cxflt(__m256d d, __m128i sign, __m128i nz, int i8
+     const __m128i flush = _mm_cmpgt_epi32(_mm_set1_epi32(1), biased);
+     return _mm_and_si128(_mm_andnot_si128(flush, r), nz);
+ }
++/* [GT6 0052] csflt / cuflt on a thread in the SPU float mode (MXCSR round toward zero, see spu__x8_rz): the host's
++ * own conversion truncates as the SPU's does, and the scale is a multiplication by a power of two, which is exact.
++ * Only for scales with which neither the smallest integer (1) falls below 2^-126 nor the largest reaches 2^128 -
++ * 29 <= i8 <= 250, every scale a program normally uses - so that no result is flushed, saturated or a negative
++ * zero; other scales and other threads take the exact forms below. An unsigned value goes in two exact halves,
++ * joined by one fused multiply-add (one truncation of the exact sum). SPU_CXFLT_EXACT_ONLY turns this off. */
++#if defined(__FMA__) && !defined(SPU_CXFLT_EXACT_ONLY)
++#define SPU__XE_CXFLT_FAST(i8) (__builtin_constant_p(i8) && ((i8) & 0xFF) >= 29 && ((i8) & 0xFF) <= 250 && spu__x8_rz())
++SPU__XE_INLINE __m128 spu__xe_pow2(int e) { return _mm_castsi128_ps(_mm_set1_epi32((e + 127) << 23)); }   /* 2^e, -126..127 */
++#else
++#define SPU__XE_CXFLT_FAST(i8) 0
++SPU__XE_INLINE __m128 spu__xe_pow2(int e) { (void)e; return _mm_setzero_ps(); }
++#endif
+ SPU__XE_INLINE u128 spu_csflt(u128 a, int i8) {
+     const __m128i v = spu__xe_ld(a);
++    if (SPU__XE_CXFLT_FAST(i8))
++        return spu__xe_st(_mm_castps_si128(_mm_mul_ps(_mm_cvtepi32_ps(v), spu__xe_pow2((i8 & 0xFF) - 155))));
+     const __m256d d = _mm256_andnot_pd(_mm256_set1_pd(-0.0), _mm256_cvtepi32_pd(v));          /* |v|, exact */
+     const __m128i sign = _mm_and_si128(v, _mm_set1_epi32((int)0x80000000u));
+     const __m128i nz = _mm_xor_si128(_mm_cmpeq_epi32(v, _mm_setzero_si128()), _mm_set1_epi32(-1));
+@@ -1777,6 +1828,12 @@ SPU__XE_INLINE u128 spu_csflt(u128 a, int i8) {
+ }
+ SPU__XE_INLINE u128 spu_cuflt(u128 a, int i8) {
+     const __m128i v = spu__xe_ld(a);
++#if defined(__FMA__) && !defined(SPU_CXFLT_EXACT_ONLY)
++    if (SPU__XE_CXFLT_FAST(i8)) {
++        const __m128 hi = _mm_cvtepi32_ps(_mm_srli_epi32(v, 16)), lo = _mm_cvtepi32_ps(_mm_and_si128(v, _mm_set1_epi32(0xFFFF)));
++        return spu__xe_st(_mm_castps_si128(_mm_mul_ps(_mm_fmadd_ps(hi, _mm_set1_ps(65536.0f), lo), spu__xe_pow2((i8 & 0xFF) - 155))));
++    }
++#endif
+     /* unsigned -> double: flip the top bit, convert as signed, add 2^31 back (all exact) */
+     const __m256d d = _mm256_add_pd(_mm256_cvtepi32_pd(_mm_xor_si128(v, _mm_set1_epi32((int)0x80000000u))),
+                                     _mm256_set1_pd(2147483648.0));

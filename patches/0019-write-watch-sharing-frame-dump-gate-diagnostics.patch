@@ -1,0 +1,110 @@
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2365,9 +2365,19 @@
+ 
+ /* Harvest and reset the written bits of [p, p+n) into g_ww_page_gen. Returns
+  * the generation the harvest left (writes after it show up in a later one),
+- * or 0 when GetWriteWatch failed (the caller then hashes). */
++ * or 0 when GetWriteWatch failed (the caller then hashes). The match thread's
++ * pose interpolation harvests too (rsx_ww_harvest_low), hence the lock. */
++static SRWLOCK g_ww_lock = SRWLOCK_INIT;
++static u32 ld_ww_harvest_locked(const u8* p, u32 n);
+ static u32 ld_ww_harvest(const u8* p, u32 n)
+ {
++    AcquireSRWLockExclusive(&g_ww_lock);
++    const u32 gen = ld_ww_harvest_locked(p, n);
++    ReleaseSRWLockExclusive(&g_ww_lock);
++    return gen;
++}
++static u32 ld_ww_harvest_locked(const u8* p, u32 n)
++{
+     static PVOID addrs[LD_WW_CHUNK];
+     if (!n || p < vm_base) return 0;
+     uintptr_t a = (uintptr_t)p & ~(uintptr_t)4095u;
+@@ -2400,6 +2410,71 @@
+     return 1;
+ }
+ 
++/* For the match thread's pose interpolation (saka_hooks.c): the write watch
++ * over the guest's committed memory below 0x40000000, sharing the generation
++ * table (so the texture and vertex caches still see every write). */
++static u32 ld_ww_low_regions(u32* ea, u32* n, u32 max)
++{
++    u32 k = 0;
++    u8* p = vm_base + 0x10000u;
++    u8* const end = vm_base + 0x40000000ull;
++    while (p < end && k < max) {
++        MEMORY_BASIC_INFORMATION mi;
++        if (!VirtualQuery(p, &mi, sizeof mi)) break;
++        u8* rb = (u8*)mi.BaseAddress;
++        u8* re = rb + mi.RegionSize;
++        if (re > end) re = end;
++        if (rb < p) rb = p;
++        if (mi.State == MEM_COMMIT) { ea[k] = (u32)(rb - vm_base); n[k] = (u32)(re - rb); k++; }
++        p = re;
++    }
++    return k;
++}
++
++/* Harvests every committed page below 0x40000000; returns the generation
++ * after it (writes from now on get a later one), 0 when unavailable. */
++u32 rsx_ww_harvest_low(void)
++{
++    if (g_ww_state != 1) return 0;
++    u32 ea[128], n[128];
++    const u32 k = ld_ww_low_regions(ea, n, 128);
++    u32 gen = g_ww_gen;
++    for (u32 i = 0; i < k; i++) {
++        const u32 g2 = ld_ww_harvest(vm_base + ea[i], n[i]);
++        if (!g2) return 0;
++        gen = g2;
++    }
++    return gen;
++}
++
++/* Guest addresses of the pages below 0x40000000 written after generation
++ * `since` (as far as harvested; call rsx_ww_harvest_low first). */
++u32 rsx_ww_written_pages_low(u32 since, u32* out, u32 max)
++{
++    if (g_ww_state != 1 || !g_ww_page_gen) return 0;
++    u32 ea[128], n[128];
++    const u32 k = ld_ww_low_regions(ea, n, 128);
++    u32 m = 0;
++    for (u32 i = 0; i < k && m < max; i++)
++        for (u32 pg = ea[i] >> 12; pg < (ea[i] + n[i]) >> 12 && m < max; pg++)
++            if (g_ww_page_gen[pg] > since) out[m++] = pg << 12;
++    return m;
++}
++
++/* Pages below 0x40000000 whose last harvested write has a generation in
++ * (lo, hi]. */
++u32 rsx_ww_written_pages_between(u32 lo, u32 hi, u32* out, u32 max)
++{
++    if (g_ww_state != 1 || !g_ww_page_gen) return 0;
++    u32 ea[128], n[128];
++    const u32 k = ld_ww_low_regions(ea, n, 128);
++    u32 m = 0;
++    for (u32 i = 0; i < k && m < max; i++)
++        for (u32 pg = ea[i] >> 12; pg < (ea[i] + n[i]) >> 12 && m < max; pg++)
++            if (g_ww_page_gen[pg] > lo && g_ww_page_gen[pg] <= hi) out[m++] = pg << 12;
++    return m;
++}
++
+ static void ld_ww_stats(void)
+ {
+     static LONGLONG t0, f;
+@@ -10641,7 +10716,13 @@
+      * late scene, e.g. frames for a GIF, without thousands of early files). */
+     static long dump_from = -1;
+     if (dump_from < 0) { const char* e = getenv("LD_FRAME_DUMP_FROM"); dump_from = e ? atol(e) : 0; }
+-    const int dump_now = dump_every > 0 && (long)g_ld_frames >= dump_from &&
++    /* LD_FRAME_DUMP_GATE=<file>: dump only while <file> exists (consecutive
++     * frames around one moment; the game's own hooks open and close it). */
++    static const char* dump_gate = (const char*)-1;
++    if (dump_gate == (const char*)-1) dump_gate = getenv("LD_FRAME_DUMP_GATE");
++    int dump_gate_open = 1;
++    if (dump_every > 0 && dump_gate) { FILE* gf = fopen(dump_gate, "rb"); dump_gate_open = gf != NULL; if (gf) fclose(gf); }
++    const int dump_now = dump_every > 0 && dump_gate_open && (long)g_ld_frames >= dump_from &&
+                          (dump_n++ % (unsigned)dump_every) == 0;
+     /* A flip names a registered display buffer. The current color target may
+      * be an offscreen shadow/postprocess surface at that instant; copying it

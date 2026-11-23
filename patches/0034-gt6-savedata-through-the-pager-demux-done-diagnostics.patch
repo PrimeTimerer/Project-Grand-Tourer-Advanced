@@ -1,0 +1,420 @@
+diff --git a/libs/codec/cellDmux.c b/libs/codec/cellDmux.c
+index 8f917c9..2e7aae1 100644
+--- a/libs/codec/cellDmux.c
++++ b/libs/codec/cellDmux.c
+@@ -11,6 +11,7 @@
+ #include <string.h>
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+ #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
++#include "../system/cellSysutil.h"   /* cellSysutilQueueGuestCallbackArgs: a guest callback at the title's next poll */
+ 
+ /* ---------------------------------------------------------------------------
+  * Internal state
+@@ -26,6 +27,7 @@ typedef struct {
+     u32 streamSize;
+     u64 userData;
+     u32 auSeqNo;        /* running AU sequence counter */
++    u32 memAddr;        /* the title's work memory for the demuxer (resource.memAddr): messages are built there */
+ } DmuxSlot;
+ 
+ typedef struct {
+@@ -66,6 +68,7 @@ s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
+             s_dmux[i].streamSize = 0;
+             s_dmux[i].userData = 0;
+             s_dmux[i].auSeqNo = 0;
++            s_dmux[i].memAddr = res ? vm_read32(GUEST_EA(res)) : 0;      /* CellDmuxResource[Ex].memAddr */
+             vm_write32((u32)(uintptr_t)handle, (u32)i);
+             printf("[cellDmux] Open -> handle=%u\n", i);
+             return CELL_OK;
+@@ -172,44 +175,31 @@ s32 cellDmuxSetStream(CellDmuxHandle handle, u32 streamAddr, u32 streamSize,
+     }
+ 
+     /*
+-     * Synthesize one AU per enabled ES from the entire stream buffer.
+-     * Real demux would parse PES/MPEG-TS headers; here we present the
+-     * whole input as a single Access Unit per elementary stream, which
+-     * is sufficient for games that simply shuttle data through the
+-     * demux -> vdec/adec pipeline.
++     * No access units are produced. This stub used to hand the whole input to every enabled ES as one access unit
++     * and call cbFunc / esCbFunc directly -- but those are the title's own functions (guest descriptor addresses),
++     * not host code: the call jumped to a guest address and the process died with an access violation (Gran Turismo
++     * 6's opening movie: 0xC0000005 executing 0x01629460). cellDmuxGetAu likewise stored a host pointer where the
++     * title expects a guest address.
++     *
++     * Until there is a real demuxer the stream is accepted, nothing comes out of it, and the one message every
++     * title waits for is still sent: DEMUX_DONE for this input -- as the real library sends it, from outside the
++     * call (the title's next callback poll), to cbMsg(handle, const CellDmuxMsg* { msgType, supplementalInfo },
++     * cbArg) with the message in the work memory the title gave at open. Without it GT6's movie thread waits for
++     * ever on the first 256 KB and the script that wants to stop the movie waits for that thread.
+      */
+-    for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-        if (!s_es[i].in_use || s_es[i].dmuxId != handle)
+-            continue;
+-
+-        DmuxEsSlot* es = &s_es[i];
+-
+-        /* Fill in AU info — treat entire stream as one AU */
+-        es->currentAu.auAddr = streamAddr;
+-        es->currentAu.auSize = streamSize;
+-        es->currentAu.pts    = (u64)dmux->auSeqNo * 3003; /* ~29.97 fps tick */
+-        es->currentAu.dts    = es->currentAu.pts;
+-        es->currentAu.userData = userData;
+-        es->currentAu.isRap  = (dmux->auSeqNo == 0) ? 1 : 0;
+-        es->currentAu.reserved = 0;
+-        es->hasAu = 1;
+-
+-        printf("[cellDmux] ES %d: AU_FOUND (addr=0x%X, size=%u, pts=%llu)\n",
+-               i, streamAddr, streamSize, (unsigned long long)es->currentAu.pts);
+-
+-        /* Fire AU_FOUND callback */
+-        if (es->esCbFunc)
+-            es->esCbFunc(handle, (u32)i,
+-                         CELL_DMUX_ES_MSG_TYPE_AU_FOUND,
+-                         0, es->esCbArg);
+-    }
+-
++    { static int said = 0;
++      if (!said++) printf("[cellDmux] no demuxer in this runtime: the stream is accepted, no access units are produced\n"); }
+     dmux->auSeqNo++;
+-
+-    /* Signal demux completion after all ES callbacks have fired */
+-    if (dmux->cbFunc)
+-        dmux->cbFunc(handle, CELL_DMUX_MSG_TYPE_DEMUX_DONE,
+-                     0, dmux->cbArg);
++    {
++        const u32 opd = (u32)(uintptr_t)dmux->cbFunc;
++        if (opd && dmux->memAddr) {
++            vm_write32(dmux->memAddr + 0, CELL_DMUX_MSG_TYPE_DEMUX_DONE);
++            vm_write32(dmux->memAddr + 4, 0);
++            vm_write64(dmux->memAddr + 8, userData);                      /* supplementalInfo: the caller's userData */
++            const u64 args[8] = { handle, dmux->memAddr, (u32)(uintptr_t)dmux->cbArg, 0, 0, 0, 0, 0 };
++            cellSysutilQueueGuestCallbackArgs(opd, args);
++        }
++    }
+ 
+     return CELL_OK;
+ }
+@@ -250,8 +240,9 @@ s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInf
+     if (!s_es[esHandle].hasAu)
+         return (s32)CELL_DMUX_ERROR_EMPTY;
+ 
+-    if (auInfo)
+-        *auInfo = &s_es[esHandle].currentAu;
++    /* hasAu is never set (see cellDmuxSetStream), so this is not reached; a host pointer must not be stored
++     * for the title in any case. */
++    (void)auInfo;
+     if (auInfoNum)
+         vm_write32((u32)(uintptr_t)auInfoNum, (u32)1);
+ 
+@@ -281,10 +272,7 @@ s32 cellDmuxFlushEs(CellDmuxEsHandle esHandle)
+ 
+     s_es[esHandle].hasAu = 0;
+ 
+-    if (s_es[esHandle].esCbFunc)
+-        s_es[esHandle].esCbFunc(s_es[esHandle].dmuxId, esHandle,
+-                                 CELL_DMUX_ES_MSG_TYPE_FLUSH_DONE,
+-                                 0, s_es[esHandle].esCbArg);
++    /* FLUSH_DONE is not reported: esCbFunc is a guest function (see cellDmuxSetStream). */
+ 
+     return CELL_OK;
+ }
+@@ -313,12 +301,12 @@ s32 cellDmuxQueryAttr2(const CellDmuxType* type, void* attr)
+ 
+ s32 cellDmuxOpenEx(const CellDmuxType* type, const void* resourceEx, const void* cb, CellDmuxHandle* handle)
+ {
+-    (void)resourceEx;
+     if (!cb)
+         return (s32)CELL_DMUX_ERROR_ARG;
+     const u32 func = vm_read32(GUEST_EA(cb) + 0);
+     const u32 arg  = vm_read32(GUEST_EA(cb) + 4);
+-    return cellDmuxOpen(type, NULL, (CellDmuxCbMsg)(uintptr_t)func, (void*)(uintptr_t)arg, handle);
++    /* CellDmuxResourceEx starts as CellDmuxResource does: memAddr, memSize. */
++    return cellDmuxOpen(type, (const CellDmuxResource*)resourceEx, (CellDmuxCbMsg)(uintptr_t)func, (void*)(uintptr_t)arg, handle);
+ }
+ 
+ s32 cellDmuxOpen2(const CellDmuxType* type, const void* resource2, const void* cb, CellDmuxHandle* handle)
+diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
+index 7f255c4..bac88bc 100644
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -245,6 +245,21 @@ static s32 marshal_cbresult_read_result(uint32_t addr)
+ #define SAVEDATA_FILEGET_SIZE   0x44u
+ #define SAVEDATA_FILESET_SIZE   0x30u
+ 
++/* The kernel copies for fread/fwrite and cannot fault a guest page in, so each page of a transfer is touched here
++ * first, in user mode (read-then-write: nothing in the buffer changes). A page that is not there is then brought in
++ * the way the title expects -- demand-committed, or, in a region the title pages itself (sys_mmapper page-fault
++ * notification), mapped by the title's own pager. Committing the buffer directly (vm_commit) put memory there that
++ * the title's pager knew nothing of: Gran Turismo 6 loads its save into a buffer in such a region, frees it, and
++ * later maps its car database (SPECDB) over the same addresses; the pages never faulted, the database read the save
++ * data left there instead of the file, every query came back empty and the menu script failed at load. */
++static void savedata_touch(void* buf, size_t len)
++{
++    volatile uint8_t* p = (volatile uint8_t*)buf;
++    if (!p || !len) return;
++    for (size_t o = 0; o < len; o += 0x1000) p[o] = p[o];
++    p[len - 1] = p[len - 1];
++}
++
+ /* Preserve callback-updated userdata and read the requested operation back
+  * before scratch is reused. FileGet reports the previous operation's byte count. */
+ static s32 dispatch_func_file(uint32_t func_opd, uint32_t* userdata_ea,
+@@ -270,9 +285,8 @@ static s32 dispatch_func_file(uint32_t func_opd, uint32_t* userdata_ea,
+     out->fileSize = vm_read32(set_ea + 36);
+     out->fileBufSize = vm_read32(set_ea + 40);
+     out->fileBuf = buffer ? vm_base + buffer : NULL;
+-    /* fread/fwrite on fileBuf go through the kernel, which cannot fault in a
+-     * demand-committed guest page (see sys_fs_read). Commit it first. */
+-    if (buffer && out->fileBufSize) vm_commit(buffer, out->fileBufSize);
++    /* fread/fwrite on fileBuf go through the kernel, which cannot fault in a guest page that is not there:
++     * savedata_touch() brings the pages of each transfer in, where the transfer is made. */
+     return marshal_cbresult_read_result(cb_ea);
+ }
+ 
+@@ -702,6 +716,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
+         }
+         size_t read_size = (size_t)set->fileSize;
+         if (read_size > set->fileBufSize) read_size = set->fileBufSize;
++        savedata_touch(set->fileBuf, read_size);
+         size_t got = fread(set->fileBuf, 1, read_size, fp);
+         int failed = ferror(fp);
+         if (fclose(fp) != 0) failed = 1;
+@@ -734,6 +749,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
+         }
+         size_t write_size = (size_t)set->fileSize;
+         if (write_size > set->fileBufSize) write_size = set->fileBufSize;
++        savedata_touch(set->fileBuf, write_size);
+         size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
+         int failed = wrote != write_size;
+         if (fclose(fp) != 0) failed = 1;
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index dace967..14e1762 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2548,6 +2548,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                    * patch time to arrive, and resync only for a park that
+                    * has stood with the same put for longer than any title
+                    * takes between the two stores. */
++                  /* GCM_PARK_LOG=<n> (diagnostic): the first n times the walker comes to stand at a park it was
++                   * not standing at before, and what it read just before it. */
++                  { static int want = -1, n = 0; static u32 last_park = 0;
++                    if (want < 0) { const char* e = getenv("GCM_PARK_LOG"); want = e ? atoi(e) : 0; }
++                    if (want > 0 && last_park != s_fifo_getoff && n < want) {
++                        n++; last_park = s_fifo_getoff;
++                        fprintf(stderr, "[park] walker stands at io 0x%08X (ea 0x%08X) put=0x%08X t=%llu ms\n",
++                                s_fifo_getoff, gcm_io2ea(s_fifo_getoff), put, ps3_ms_now());
++                    } }
+                   if (put != s_fifo_getoff) {
+                       extern unsigned long long ps3_ms_now(void);
+                       const unsigned long long now = ps3_ms_now();
+@@ -2662,6 +2671,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         vm_write32(la, v);
+                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
+                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
++                        /* GCM_LABEL_LOG=<hex offset> (diagnostic): every release of that label (first 400). */
++                        { static long want = -2; static int n = 0;
++                          if (want == -2) { const char* e = getenv("GCM_LABEL_LOG"); want = e ? strtol(e, NULL, 16) : -1; }
++                          if (want >= 0 && (u32)want == s_sema_offset && n++ < 400)
++                              fprintf(stderr, "[SEMA-REL] label off 0x%X := 0x%08X at get=0x%08X (was 0x%08X) t=%llu ms\n", s_sema_offset, v,
++                                      s_fifo_getoff, vm_read32(GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu)), ps3_ms_now()); }
++                        /* The first release of each label, whenever it comes (the 40 lines above go to the first
++                         * label a title releases every frame). */
++                        { static u32 seen[96]; static int ns = 0; int k = 0;
++                          for (; k < ns; k++) if (seen[k] == s_sema_offset) break;
++                          if (k == ns && ns < 96) { seen[ns++] = s_sema_offset;
++                              fprintf(stderr, "[SEMA-REL] first release of label 0x%X (off 0x%X) = 0x%08X at get=0x%08X\n",
++                                      s_sema_offset >> 4, s_sema_offset, v, s_fifo_getoff); } }
+                     }
+                     else if (m == 0x68u && vm_read32(la) != v) {
+             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index 01b4417..278a4a5 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -522,6 +522,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+               fprintf(stderr, "[RSX] semaphore context dma = 0x%08X\n", data); }
+           s_sem_ctx = data;
+       }
++      /* RSX_SEM_LOG=<n> (diagnostic): the first n semaphore methods other than the frame fence at offset 0xFF0 --
++       * which labels the title's command stream releases, through which context, with what value. */
++      { static int want = -1, n = 0;
++        if (want < 0) { const char* e = getenv("RSX_SEM_LOG"); want = e ? atoi(e) : 0; }
++        if (want > 0 && n < want && (method == 0x01A4 || method == 0x1D6C || method == 0x1D70 || method == 0x1D74) &&
++            !((method == 0x1D70 || method == 0x1D74) && s_sem_off == 0xFF0) && !(method == 0x1D6C && data == 0xFF0)) {
++            n++;
++            fprintf(stderr, "[rsx-sem] method 0x%04X data 0x%08X (offset 0x%X, context 0x%08X)\n", method, data, s_sem_off, s_sem_ctx);
++        } }
+       if (method == 0x1D6C) { s_sem_off = data; return 0; }
+       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
+         extern void vm_write32(uint32_t a, uint32_t v);
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 79c3755..3f85549 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -246,6 +246,38 @@ static int fs_strict_error(const char* g)
+ static FILE* g_files[FS_MAX];
+ static uint8_t g_fd_usm[FS_MAX];
+ static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
++/* FS_GUEST_BT=<substr> (diagnostic): for the opens, and the first 24 reads per descriptor, of a file whose path contains
++ * it: the callers, read from the ABI back chain ([frame] = caller's frame, [caller's frame + 0x10] = return address). */
++static unsigned g_fs_bt_reads[FS_MAX];
++static const char* fs_bt_want(void)
++{
++    static const char* want = (const char*)-1;
++    if (want == (const char*)-1) want = getenv("FS_GUEST_BT");
++    return (want && *want) ? want : NULL;
++}
++static void fs_guest_chain(ppu_context* ctx, const char* head)
++{
++    const uint32_t sp = (uint32_t)ctx->gpr[1];
++    char b[1500]; int p = snprintf(b, sizeof b, "[fs-bt] %s tid=%llu sp=0x%08X:", head, (unsigned long long)ctx->thread_id, sp);
++    uint32_t frame = sp;
++    for (int depth = 0; depth < 110 && p < 1480; depth++) {
++        const uint32_t up = vm_read32(frame + 4);
++        if (up <= frame || up - frame > 0x100000u) break;
++        const uint32_t lr = vm_read32(up + 0x14);
++        if (lr >= 0x00010200u && lr < 0x010C2000u) p += snprintf(b + p, sizeof(b) - p, " %08X", lr);
++        frame = up;
++    }
++    fprintf(stderr, "%s\n", b);
++}
++static void fs_guest_chain_read(ppu_context* ctx, int fd, long long pos, uint64_t want_bytes, size_t got, uint32_t buf)
++{
++    const char* want = fs_bt_want();
++    if (!want || fd < 0 || fd >= FS_MAX || !g_fd_path[fd][0] || !strstr(g_fd_path[fd], want) || g_fs_bt_reads[fd]++ >= 24) return;
++    char head[360];
++    snprintf(head, sizeof head, "read '%s' fd=%d pos=0x%llX want=0x%llX got=0x%zX buf=0x%08X", g_fd_path[fd], fd,
++             (unsigned long long)pos, (unsigned long long)want_bytes, got, buf);
++    fs_guest_chain(ctx, head);
++}
+ static DIR*  g_dirs[FS_MAX];
+ /* Last transfer direction on each fd's stream: 0 none, 1 read, 2 write.
+  *
+@@ -378,6 +410,11 @@ static void cellFsOpen(ppu_context* ctx)
+           } }
+       else { fprintf(stderr, "[fs] open '%s' -> fd %d  t=%.3f tid=%llu\n", gpath, fd,
+                      ps3_qpc_us() / 1e6, (unsigned long long)ctx->thread_id); } }
++    if (fd >= 0 && fd < FS_MAX) g_fs_bt_reads[fd] = 0;
++    if (fs_bt_want() && strstr(gpath, fs_bt_want())) {
++        char head[300]; snprintf(head, sizeof head, "open '%s' fd=%d", gpath, fd);
++        fs_guest_chain(ctx, head);
++    }
+     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
+         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
+          * which criMv/criFs function opened the movie, so the reader-attach path
+@@ -530,6 +567,7 @@ static void cellFsRead(ppu_context* ctx)
+     fs_prefault(buf, nbytes);
+     fs_set_dir(fd, f, 1);
+     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, f);   /* raw bytes, no swap */
++    fs_guest_chain_read(ctx, fd, fpos_before, nbytes, n, buf);
+     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
+      * The intro cinematic is 28 seconds and this port renders it at a few frames
+      * a second, so it cannot be watched to its end -- truncating the stream makes
+@@ -1068,6 +1106,7 @@ static void fs_rw_with_offset(ppu_context* ctx, int writing)
+     if (pos >= 0) HOST_FSEEK64(f, pos);
+     HOST_UNLOCKFILE(f);
+     if (done_p) { vm_write32(done_p, (uint32_t)((uint64_t)n >> 32)); vm_write32(done_p + 4, (uint32_t)n); }
++    if (!writing) fs_guest_chain_read(ctx, fd, (long long)offset, size, n, buf);
+     if (getenv("PS3_FSLOG")) { static int _n = 0; if (PS3_LOG_FIRST(_n, 40))
+         fprintf(stderr, "[fs] %s fd=%d off=0x%llX size=0x%llX -> 0x%zX\n", writing ? "write@" : "read@",
+                 fd, (unsigned long long)offset, (unsigned long long)size, n); }
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index c97fc26..3827046 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -793,6 +793,28 @@ static void sys_mmapper_allocate_memory(ppu_context* ctx)
+     if (getenv("PS3_MEMTRACE"))
+         fprintf(stderr, "[mmapper] allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+                 size, (unsigned long long)ctx->gpr[4], mem_id_ptr, id);
++    /* PS3_MEMTRACE_BT=<n> [PS3_MEMTRACE_BT_MAX=<lines, default 4000>]  (diagnostic): who asks for the block --
++     * the first n words on the guest stack that point into the executable's code (not an exact call chain). */
++    {
++        static int want = -1, max_lines = 4000; static unsigned lines;
++        if (want < 0) {
++            const char* e = getenv("PS3_MEMTRACE_BT"); const char* m = getenv("PS3_MEMTRACE_BT_MAX");
++            if (m) max_lines = atoi(m);
++            want = e ? atoi(e) : 0;
++        }
++        if (want > 0 && lines < (unsigned)max_lines) {
++            lines++;
++            const uint32_t sp = (uint32_t)ctx->gpr[1];
++            char b[1024]; int p = snprintf(b, sizeof b, "[mmapper-bt] size=0x%X tid=%llu sp=0x%08X:", size,
++                                           (unsigned long long)ctx->thread_id, sp);
++            int found = 0;
++            for (uint32_t a = sp; a < sp + 0x2000 && found < want && p < 1000; a += 4) {
++                const uint32_t v = vm_read32(a);
++                if (v >= 0x00010200u && v < 0x010C2000u && !(v & 3)) { p += snprintf(b + p, sizeof(b) - p, " %08X", v); found++; }
++            }
++            fprintf(stderr, "%s\n", b);
++        }
++    }
+     if (!id) {                                  /* the user memory pool is used up (sys_memory.c) */
+         static unsigned n;
+         if (n++ < 4) fprintf(stderr, "[mmapper] allocate_memory(size=0x%X) -> ENOMEM (user memory used up)\n", size);
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index bf31d56..7405912 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1975,6 +1975,62 @@ void spu_thread_publish_ctx(uint32_t tid, void* c)
+     if (t) t->live_ctx = c;
+ }
+ 
++/* Diagnostic (a port's thread report calls it): one line per SPU thread -- where it is, which events it has and
++ * waits for, and the SPURS kernel's own words in its local store (LS 0x1C0: the SPURS instance, 0x1C8: this SPU's
++ * number, 0x1DC: the workload it runs) -- then the first 0x80 bytes of each SPURS instance seen there (ready
++ * counts, contention, signals, idle flags). Reads only; a context may change while it is read. */
++void ps3_spu_threads_report(void)
++{
++    extern uint8_t* vm_base;
++    uint32_t spurs_seen[4]; int n_seen = 0;
++    for (int i = 0; i < MAX_SPU_THREADS; i++) {
++        const spu_thread_t* t = &s_spu_threads[i];
++        if (!t->in_use) continue;
++        const spu_context* c = (const spu_context*)t->live_ctx;
++        if (!c) c = t->sctx;
++        if (!c) {
++            fprintf(stderr, "[spu-threads] tid=0x%X group=0x%X running=%d (no context)\n", t->tid, t->group_id, t->running);
++            continue;
++        }
++        const uint8_t* ls = c->ls;
++        char k[160] = "";
++        if (ls) {
++            int p = 0;
++            for (int o = 0x1C0; o < 0x1E0; o += 4)
++                p += snprintf(k + p, sizeof k - p, " %02X%02X%02X%02X", ls[o], ls[o + 1], ls[o + 2], ls[o + 3]);
++        }
++        fprintf(stderr, "[spu-threads] tid=0x%X group=0x%X running=%d live=%d img=%d pc=0x%05X status=0x%X events=0x%X mask=0x%X int=%u LS[1C0]:%s\n",
++                t->tid, t->group_id, t->running, t->live_ctx ? 1 : 0, c->image_id, (unsigned)(c->pc & SPU_LS_MASK), c->status,
++                c->event_status, c->event_mask, c->int_enable, k);
++        if (ls) {
++            const uint32_t spurs = ((uint32_t)ls[0x1C4] << 24) | ((uint32_t)ls[0x1C5] << 16) | ((uint32_t)ls[0x1C6] << 8) | ls[0x1C7];
++            int dup = 0;
++            for (int j = 0; j < n_seen; j++) if (spurs_seen[j] == spurs) dup = 1;
++            if (!dup && spurs >= 0x10000u && n_seen < 4) spurs_seen[n_seen++] = spurs;
++        }
++    }
++    for (int j = 0; j < n_seen && vm_base; j++) {
++        const uint8_t* s = vm_base + spurs_seen[j];
++#ifdef _WIN32
++        MEMORY_BASIC_INFORMATION mbi;
++        if (!VirtualQuery(s, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) continue;
++#endif
++        /* +0x00..0xFF: counts, signals, workload states and status; +0xB00: the first eight workload descriptors
++         * (policy module address, argument, size, id, per-SPU priority), 0x20 bytes each. */
++        for (int row = 0; row < 0x100; row += 0x10) {
++            char b[80]; int p = 0;
++            for (int o = 0; o < 0x10; o++) p += snprintf(b + p, sizeof b - p, "%02X%s", s[row + o], (o & 3) == 3 ? " " : "");
++            fprintf(stderr, "[spu-threads] spurs 0x%08X +%02X: %s\n", spurs_seen[j], row, b);
++        }
++        for (int w = 0; w < 8; w++) {
++            const uint8_t* d = s + 0xB00 + w * 0x20;
++            char b[120]; int p = 0;
++            for (int o = 0; o < 0x20; o++) p += snprintf(b + p, sizeof b - p, "%02X%s", d[o], (o & 3) == 3 ? " " : "");
++            fprintf(stderr, "[spu-threads] spurs 0x%08X workload %d: %s\n", spurs_seen[j], w, b);
++        }
++    }
++}
++
+ /* Public: consume the pending inbound-mailbox command for a SPU thread, if any.
+  * Read-and-clear: one PPU write is delivered to exactly one SPU run. */
+ uint32_t spu_thread_take_pending_inmbox(uint32_t tid)

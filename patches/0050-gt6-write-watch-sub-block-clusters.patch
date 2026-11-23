@@ -1,0 +1,306 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 2b13f36..7400817 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -3071,13 +3071,29 @@ static int ld_ww_enabled(void)
+  * pose interpolation harvests too (rsx_ww_harvest_low), hence the lock. */
+ static SRWLOCK g_ww_lock = SRWLOCK_INIT;
+ static u32 ld_ww_harvest_locked(const u8* p, u32 n);
+-static u32 ld_ww_harvest(const u8* p, u32 n)
++/* LD_WW_BLOCKSTAT=1 [GT6 0054]: where the GetWriteWatch calls go, with the [ww] line every 5 s - the sixteen 4 MB
++ * blocks of guest memory that took the most time (calls, how many of them found a written page, how many were
++ * narrow second looks, pages scanned and found written) and the source lines that asked. Off: one test a harvest. */
++static int g_ww_bs = -1;
++static int g_ww_ask_line;
++static struct { u32 calls, dirty, narrow; unsigned long long pages, written, ticks; } g_ww_bs_block[8192];
++static struct { int line; unsigned long long asks, sys, ticks; } g_ww_bs_line[32];
++static unsigned long long g_ww_bs_wide, g_ww_bs_narrow, g_ww_bs_span, g_ww_bs_zero, g_ww_bs_sub;
++static u32 ld_ww_harvest_at(const u8* p, u32 n, int line)
+ {
+     AcquireSRWLockExclusive(&g_ww_lock);
++    g_ww_ask_line = line;
+     const u32 gen = ld_ww_harvest_locked(p, n);
+     ReleaseSRWLockExclusive(&g_ww_lock);
+     return gen;
+ }
++#define ld_ww_harvest(p, n) ld_ww_harvest_at((p), (n), __LINE__)
++static void ld_ww_bs_note(int line, int sys, unsigned long long ticks)
++{
++    int k = 0;
++    while (k < 31 && g_ww_bs_line[k].line && g_ww_bs_line[k].line != line) k++;
++    g_ww_bs_line[k].line = line; g_ww_bs_line[k].asks += sys ? 0u : 1u; g_ww_bs_line[k].sys += (unsigned)sys; g_ww_bs_line[k].ticks += ticks;
++}
+ /* One harvest of a page per "epoch" [GT6 0036]. Each check of a cached vertex range, texture or fragment program
+  * was a GetWriteWatch call of its own - about 3,000 a frame in a Gran Turismo 6 drive, 7.5% of the drawing thread
+  * (sampled). The data a command reads was written before the command was published, and a FIFO pass works on the
+@@ -3219,6 +3235,69 @@ void rsx_ww_note_write(u32 ea, u32 bytes)
+             g_ww_block_clean_frame[b] = 0; g_ww_block_clean_run[b] = 0;
+         }
+ }
++/* [GT6 0054] "wwsub" (mode 3; LD_WW_SUB=0 or GT6_AB wwsub=0 = whole blocks, as before). The first question about a
++ * page in a FIFO pass harvested the whole 4 MB block it lies in: 1,024 pages scanned and reset, whatever was asked.
++ * In a twelve-car race that was 82,000 pages a frame in about 110 calls, 1.9 ms of the drawing thread (ww1: 372 ms
++ * of 5 s), and most of it for pages nobody asks about: the block at 0x80000000 holds the game's SPURS instance and
++ * job lists next to a few textures, and each of its 416 harvests in 5 s returned 304 written pages (122 us a call).
++ * Every reset page that is written again also costs the thread that writes it a write-watch fault (544,000 in 5 s,
++ * two thirds of them in five such blocks).
++ * Now a block is cut into sixteen 256 KB sub-blocks. A request that lies in one block harvests the sub-blocks it
++ * touches together with those the last two frames asked about in that block (so a block that is used all over
++ * still takes one call), in runs; a later request for another part of the block harvests that part then. What a
++ * request is told is what it was told before - its own pages are harvested, after the pass began - and a page
++ * nobody asked about keeps its written bit until somebody does. Requests that span blocks go as before.
++ * That alone (mode 1) scanned a third fewer pages and halved the faults but made half as many calls again, and a
++ * call costs about 7 us whatever it covers (ww2: 395 -> 371 ms of 5 s). So the harvest also takes the wanted
++ * sub-blocks of the blocks next to the asked one with it, up to sixteen blocks in one range, and scans through a
++ * gap rather than making a second call: gaps of up to 3 sub-blocks in mode 2, up to 15 in mode 3. One race, the
++ * four modes in seven-second turns, a frame of the pack (ww3):
++ *     mode 0 (whole blocks)  106 calls  82,000 pages  2,300 pages found written  1.74 ms in GetWriteWatch
++ *     mode 1                 162        55,000        1,200                      1.71
++ *     mode 2                 120        51,000          900                      1.27
++ *     mode 3 (the default)    67        64,000        1,060                      1.11
++ * and no texture write missed in any of them (the [ww-miss] safety net). LD_WW_SUB=<0..3> / GT6_AB wwsub=<0..3>. */
++#define LD_WW_SUB_PAGES 64u
++int g_ld_wwsub_ab = 3;
++static u16 g_ww_mask_cur[1100], g_ww_mask_prev[1100], g_ww_mask_prev2[1100];
++static u32 g_ww_mask_frame[1100];
++static u32 g_ww_sub_epoch[1100u * 16u];        /* by block * 16 + sub-block: the pass (+1) that harvested it */
++static unsigned long long g_ww_sub_runs;
++static int g_ww_cluster_off;
++/* The sub-blocks of block b that a harvest in frame fr takes with it: what this frame and the two before asked. */
++static u16 ld_ww_block_predicted(u32 b, u32 fr)
++{
++    if (g_ww_mask_frame[b] == fr) return (u16)(g_ww_mask_prev[b] | g_ww_mask_prev2[b] | g_ww_mask_cur[b]);
++    if (g_ww_mask_frame[b] + 1u == fr) return (u16)(g_ww_mask_cur[b] | g_ww_mask_prev[b]);
++    return 0;
++}
++static u16 ld_ww_mask_bits(u32 pg0, u32 pg1)       /* the sub-blocks of [pg0, pg1), which lies in one 1,024-page block */
++{
++    const u32 s0 = (pg0 & 1023u) / LD_WW_SUB_PAGES, s1 = ((pg1 - 1u) & 1023u) / LD_WW_SUB_PAGES;
++    return (u16)(((1u << (s1 - s0 + 1u)) - 1u) << s0);
++}
++/* One harvest of pages [h0, h1): their written pages get the generation, which moves on at the first one a request
++ * finds. 0 = GetWriteWatch refused the range. */
++static int ld_ww_scan_run(u32 h0, u32 h1, int* found, unsigned long long* written, PVOID* addrs)
++{
++    uintptr_t a = (uintptr_t)vm_base + ((uintptr_t)h0 << 12);
++    const uintptr_t hend = (uintptr_t)vm_base + ((uintptr_t)h1 << 12);
++    while (a < hend) {
++        uintptr_t len = hend - a;
++        if (len > (uintptr_t)LD_WW_CHUNK * 4096u) len = (uintptr_t)LD_WW_CHUNK * 4096u;
++        ULONG_PTR count = LD_WW_CHUNK; DWORD gran = 0;
++        g_ww_sys++;
++        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (PVOID)a, (SIZE_T)len, addrs, &count, &gran) != 0) return 0;
++        g_ww_pages_asked += (unsigned long long)(len >> 12);
++        g_ww_pages_written += (unsigned long long)count;
++        *written += (unsigned long long)count;
++        if (count && !*found) { g_ww_gen++; *found = 1; }
++        for (ULONG_PTR i = 0; i < count; i++)
++            g_ww_page_gen[(u32)(((uintptr_t)addrs[i] - (uintptr_t)vm_base) >> 12)] = g_ww_gen;
++        a += len;
++    }
++    return 1;
++}
+ static u32 ld_ww_harvest_locked(const u8* p, u32 n)
+ {
+     static PVOID addrs[LD_WW_CHUNK];
+@@ -3230,10 +3309,28 @@ static u32 ld_ww_harvest_locked(const u8* p, u32 n)
+     const int batch = ld_ww_batch_on();
+     const u32 pg0 = (u32)((a - (uintptr_t)vm_base) >> 12), pg1 = (u32)((end - (uintptr_t)vm_base) >> 12);
+     g_ww_calls++;
++    if (g_ww_bs < 0) { const char* e = getenv("LD_WW_BLOCKSTAT"); g_ww_bs = (e && *e == '1') ? 1 : 0; }
++    if (g_ww_bs) ld_ww_bs_note(g_ww_ask_line, 0, 0);
++    unsigned long long written_total = 0;
+     u32 hp0 = pg0, hp1 = pg1;                 /* the pages harvested: the span, or the blocks it lies in */
+     int widened = 0;
+     u32 bp = 0;
++    const u32 mb = pg0 >> 10;                 /* [GT6 0054] the 1,024-page block, when the request lies in one */
++    const int one_block = mb == ((pg1 - 1u) >> 10) && mb < 1100u;
++    { static int sub_env = -1;
++      if (sub_env < 0) { const char* e = getenv("LD_WW_SUB"); sub_env = 1; if (e && *e >= '0' && *e <= '3') g_ld_wwsub_ab = *e - '0'; } }
+     if (batch) {
++        if (one_block && g_ld_wwsub_ab) {     /* what this frame asks about in the block, for the next frames' harvests */
++            const u32 fr = g_ld_frames + 1u;
++            if (g_ww_mask_frame[mb] != fr) {
++                const int next = g_ww_mask_frame[mb] + 1u == fr;
++                g_ww_mask_prev2[mb] = next ? g_ww_mask_prev[mb] : 0;
++                g_ww_mask_prev[mb] = next ? g_ww_mask_cur[mb] : 0;
++                g_ww_mask_cur[mb] = 0;
++                g_ww_mask_frame[mb] = fr;
++            }
++            g_ww_mask_cur[mb] |= ld_ww_mask_bits(pg0, pg1);
++        }
+         u32 pg = pg0;
+         while (pg < pg1 && g_ww_page_epoch[pg] == ep) pg++;
+         if (pg == pg1) return g_ww_gen;      /* all of it was harvested in this epoch */
+@@ -3270,6 +3367,89 @@ static u32 ld_ww_harvest_locked(const u8* p, u32 n)
+                 widened = 0;
+                 g_ww_narrow_reharvests++;
+             }
++            if (widened && one_block && g_ld_wwsub_ab && bp == 1024u) {      /* [GT6 0054] by sub-block */
++                const u32 base = mb << 10, sb = base / LD_WW_SUB_PAGES;
++                const u16 ask = ld_ww_mask_bits(pg0, pg1);
++                int second = 0;
++                for (u32 s = 0; s < 16u; s++) if ((ask >> s & 1u) && g_ww_sub_epoch[sb + s] == ep) second = 1;
++                if (second) {                 /* harvested in this pass, then written by this side: by span, below */
++                    widened = 0;
++                    g_ww_narrow_reharvests++;
++                } else {
++                    /* Mode 1: this block's sub-blocks. Modes 2 and 3: with them those of the blocks next to it that
++                     * the last frames asked about (up to sixteen blocks in a row: one GetWriteWatch range), because a
++                     * call costs about what scanning 700 pages does (ww2: 7 us a call, 10 ns a page); two wanted
++                     * sub-blocks up to 3 (mode 2) or 15 (mode 3) apart are scanned through instead of two calls. */
++                    const u32 fr = g_ld_frames + 1u;
++                    const int mode = g_ld_wwsub_ab;
++                    LARGE_INTEGER s0q, s1q; QueryPerformanceCounter(&s0q);
++                    int ok = 1, found_sub = 0;
++                    u32 runs = 0, scanned = 0;
++                    for (int attempt = 0; attempt < 2; attempt++) {
++                        u32 c0 = mb, c1 = mb;
++                        if (mode >= 2 && !g_ww_cluster_off && attempt == 0) {
++                            while (c0 > 0u && mb - (c0 - 1u) < 8u && !g_ww_block_bad[c0 - 1u] && ld_ww_block_predicted(c0 - 1u, fr)) c0--;
++                            while (c1 + 1u < 1100u && (c1 + 1u) - c0 < 16u && !g_ww_block_bad[c1 + 1u] && ld_ww_block_predicted(c1 + 1u, fr)) c1++;
++                        }
++                        const u32 nsub = (c1 - c0 + 1u) * 16u;
++                        u8 want[256];
++                        for (u32 b = c0; b <= c1; b++) {
++                            const u16 m = ld_ww_block_predicted(b, fr);
++                            for (u32 s = 0; s < 16u; s++)
++                                want[(b - c0) * 16u + s] = (u8)((m >> s & 1u) && g_ww_sub_epoch[b * 16u + s] != ep);
++                        }
++                        { const u32 gap = c0 == c1 ? 1u : mode >= 3 ? 15u : 3u;
++                          int last = -1;
++                          for (u32 i = 0; i < nsub; i++)
++                              if (want[i]) {
++                                  if (last >= 0 && i - (u32)last - 1u <= gap)
++                                      for (u32 k = (u32)last + 1u; k < i; k++) want[k] = 1;
++                                  last = (int)i;
++                              } }
++                        ok = 1;
++                        for (u32 i = 0; i < nsub && ok; ) {
++                            if (!want[i]) { i++; continue; }
++                            u32 e2 = i;
++                            while (e2 < nsub && want[e2]) e2++;
++                            u32 h0 = (c0 << 10) + i * LD_WW_SUB_PAGES, h1 = (c0 << 10) + e2 * LD_WW_SUB_PAGES;
++                            if (h1 > LD_WW_PAGES) h1 = LD_WW_PAGES;
++                            ok = h0 < h1 && ld_ww_scan_run(h0, h1, &found_sub, &written_total, addrs);
++                            if (ok) {
++                                for (u32 q = h0; q < h1; q++) g_ww_page_epoch[q] = ep;
++                                for (u32 k = i; k < e2; k++) g_ww_sub_epoch[c0 * 16u + k] = ep;
++                                runs++; scanned += h1 - h0;
++                            }
++                            i = e2;
++                        }
++                        if (ok) {
++                            for (u32 b = c0; b <= c1; b++) {
++                                int all = 1;
++                                for (u32 s = 0; s < 16u && all; s++) all = g_ww_sub_epoch[b * 16u + s] == ep;
++                                if (all) g_ww_block_epoch[b] = ep;       /* the whole block: a second look goes by span */
++                            }
++                            break;
++                        }
++                        if (c0 == c1) break;                             /* this block itself was refused */
++                        g_ww_cluster_off = 1;                            /* a range over several blocks was: one block at a time */
++                        fprintf(stderr, "[ww] a harvest over blocks 0x%X-0x%X was refused: one block at a time from now on\n", c0, c1);
++                    }
++                    QueryPerformanceCounter(&s1q);
++                    g_ww_ticks += (unsigned long long)(s1q.QuadPart - s0q.QuadPart);
++                    g_ww_sub_runs += runs;
++                    if (g_ww_bs) {
++                        const unsigned long long dt = (unsigned long long)(s1q.QuadPart - s0q.QuadPart);
++                        g_ww_bs_block[mb].calls += runs; g_ww_bs_block[mb].ticks += dt; g_ww_bs_block[mb].pages += scanned;
++                        g_ww_bs_block[mb].written += written_total;
++                        if (written_total) g_ww_bs_block[mb].dirty++;
++                        g_ww_bs_sub += runs;
++                        if (!written_total) g_ww_bs_zero++;
++                        ld_ww_bs_note(g_ww_ask_line, (int)runs, dt);
++                    }
++                    if (ok) return g_ww_gen;
++                    g_ww_block_bad[mb] = 1;   /* refused: not all watched memory. By span, now and from now on */
++                    widened = 0;
++                }
++            }
+             if (widened) { hp0 = b0 * bp; hp1 = (b1 + 1u) * bp; if (hp1 > LD_WW_PAGES) hp1 = LD_WW_PAGES; }
+         }
+     }
+@@ -3298,6 +3478,7 @@ again:
+         }
+         g_ww_pages_asked += (unsigned long long)(len >> 12);
+         g_ww_pages_written += (unsigned long long)count;
++        written_total += (unsigned long long)count;
+         if (count && !found) { g_ww_gen++; found = 1; }
+         for (ULONG_PTR i = 0; i < count; i++) {
+             const u32 wpg = (u32)(((uintptr_t)addrs[i] - (uintptr_t)vm_base) >> 12);
+@@ -3306,7 +3487,20 @@ again:
+         }
+         a += len;
+       } }
+-    { LARGE_INTEGER q1; QueryPerformanceCounter(&q1); g_ww_ticks += (unsigned long long)(q1.QuadPart - q0.QuadPart); }
++    { LARGE_INTEGER q1; QueryPerformanceCounter(&q1); g_ww_ticks += (unsigned long long)(q1.QuadPart - q0.QuadPart);
++      if (g_ww_bs) {
++          const unsigned long long dt = (unsigned long long)(q1.QuadPart - q0.QuadPart);
++          const u32 b = hp0 >> 10;
++          if (b < 8192u) {
++              g_ww_bs_block[b].calls++; g_ww_bs_block[b].ticks += dt; g_ww_bs_block[b].pages += hp1 - hp0;
++              g_ww_bs_block[b].written += written_total;
++              if (written_total) g_ww_bs_block[b].dirty++;
++              if (!widened) g_ww_bs_block[b].narrow++;
++          }
++          if (widened) g_ww_bs_wide++; else if (bp) g_ww_bs_narrow++; else g_ww_bs_span++;
++          if (!written_total) g_ww_bs_zero++;
++          ld_ww_bs_note(g_ww_ask_line, 1, dt);
++      } }
+     if (widened) {
+         const u32 fr = g_ld_frames + 1u;
+         for (u32 b = hp0 / bp; b <= (hp1 - 1u) / bp; b++) {
+@@ -3591,17 +3785,46 @@ u32 rsx_ww_written_pages_between(u32 lo, u32 hi, u32* out, u32 max)
+ static void ld_ww_stats(void)
+ {
+     static LONGLONG t0, f;
++    static int state; static u32 frame0;
+     LARGE_INTEGER now; QueryPerformanceCounter(&now);
+-    if (!f) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); f = q.QuadPart; t0 = now.QuadPart; }
+-    if (now.QuadPart - t0 < 5 * f) return;
++    if (!f) { LARGE_INTEGER q; QueryPerformanceFrequency(&q); f = q.QuadPart; t0 = now.QuadPart; state = g_ld_wwsub_ab; frame0 = g_ld_frames; }
++    /* every 5 s, and at once when GT6_AB switches the sub-block mode: each line is then one mode's alone */
++    if (state == g_ld_wwsub_ab && now.QuadPart - t0 < 5 * f) return;
++    const double secs = (double)(now.QuadPart - t0) / (double)f;
+     t0 = now.QuadPart;
+     static u32 last_epoch;
+     const u32 epoch_now = (u32)g_gcm_ww_epoch;
+-    fprintf(stderr, "[ww] last 5 s: texture checks=%llu skipped-hash=%llu misses=%llu fails=%llu  harvests=%llu syscalls=%llu epochs=%u in-GetWriteWatch=%.0fms  pages asked=%llu written=%llu narrow-reharvest=%llu static-skips=%llu (wws %d)\n",
+-            g_ww_checks, g_ww_skips, g_ww_misses, g_ww_fails, g_ww_calls, g_ww_sys, epoch_now - last_epoch,
++    fprintf(stderr, "[ww] last %.1f s: texture checks=%llu skipped-hash=%llu misses=%llu fails=%llu  harvests=%llu syscalls=%llu epochs=%u in-GetWriteWatch=%.0fms  pages asked=%llu written=%llu narrow-reharvest=%llu static-skips=%llu (wws %d) sub-block runs=%llu (wwsub %d) frames %u\n",
++            secs, g_ww_checks, g_ww_skips, g_ww_misses, g_ww_fails, g_ww_calls, g_ww_sys, epoch_now - last_epoch,
+             (double)g_ww_ticks * 1000.0 / (double)f, g_ww_pages_asked, g_ww_pages_written, g_ww_narrow_reharvests,
+-            g_ww_static_skips, g_ld_wws_ab);
++            g_ww_static_skips, g_ld_wws_ab, g_ww_sub_runs, state, g_ld_frames - frame0);
++    state = g_ld_wwsub_ab; frame0 = g_ld_frames;
+     g_ww_static_skips = 0;
++    g_ww_sub_runs = 0;
++    if (g_ww_bs > 0) {
++        fprintf(stderr, "[ww-blocks] calls: %llu block, %llu sub-block run, %llu second look, %llu by span; %llu found nothing written. Frames %u. By asking line:",
++                g_ww_bs_wide, g_ww_bs_sub, g_ww_bs_narrow, g_ww_bs_span, g_ww_bs_zero, g_ld_frames);
++        for (int k = 0; k < 32 && g_ww_bs_line[k].line; k++)
++            fprintf(stderr, " %d: %llu asks -> %llu calls %.1f ms;", g_ww_bs_line[k].line, g_ww_bs_line[k].asks, g_ww_bs_line[k].sys,
++                    (double)g_ww_bs_line[k].ticks * 1000.0 / (double)f);
++        fprintf(stderr, "\n");
++        for (int r = 0; r < 16; r++) {
++            int best = -1;
++            for (int b = 0; b < 8192; b++)
++                if (g_ww_bs_block[b].ticks && (best < 0 || g_ww_bs_block[b].ticks > g_ww_bs_block[best].ticks)) best = b;
++            if (best < 0) break;
++            fprintf(stderr, "[ww-blocks]  ea 0x%08X: %u calls (%u found writes, %u second looks), %llu pages scanned, %llu found written, %.1f ms\n",
++                    (u32)best << 22, g_ww_bs_block[best].calls, g_ww_bs_block[best].dirty, g_ww_bs_block[best].narrow,
++                    g_ww_bs_block[best].pages, g_ww_bs_block[best].written, (double)g_ww_bs_block[best].ticks * 1000.0 / (double)f);
++            g_ww_bs_block[best].ticks = 0;
++        }
++        { unsigned nb = 0; unsigned long long rest = 0;
++          for (int b = 0; b < 8192; b++) if (g_ww_bs_block[b].calls) { nb++; rest += g_ww_bs_block[b].ticks; }
++          fprintf(stderr, "[ww-blocks]  %u blocks had calls; the ones not listed took %.1f ms\n", nb, (double)rest * 1000.0 / (double)f); }
++        memset(g_ww_bs_block, 0, sizeof g_ww_bs_block);
++        memset(g_ww_bs_line, 0, sizeof g_ww_bs_line);
++        g_ww_bs_wide = g_ww_bs_narrow = g_ww_bs_span = g_ww_bs_zero = g_ww_bs_sub = 0;
++    }
+     /* "written" is also how many write-watch faults the title's threads took in the watched pages that were asked
+      * about: a page is reported once for each time it is first written after a harvest. */
+     g_ww_pages_asked = g_ww_pages_written = 0;

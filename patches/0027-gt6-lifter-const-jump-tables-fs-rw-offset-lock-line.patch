@@ -1,0 +1,228 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 8cb2e88..b946a37 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -988,8 +988,47 @@ static void cellFsAioRead(ppu_context* ctx)
+                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+ }
+ 
++/* cellFsReadWithOffset / cellFsWriteWithOffset(fd, u64 offset, buf, u64 size, u64* done):
++ * an absolute read or write that leaves the fd's own position alone. Gran
++ * Turismo 6 reads its volume (GT.VOL) and every PDIPFS file this way and never
++ * calls cellFsRead on them; unresolved, the volume header read back as zeros.
++ * Same stream-lock discipline as cellFsAioRead above. */
++static void fs_rw_with_offset(ppu_context* ctx, int writing)
++{
++    int      fd     = (int)(uint32_t)ctx->gpr[3];
++    uint64_t offset = ctx->gpr[4];
++    uint32_t buf    = (uint32_t)ctx->gpr[5];
++    uint64_t size   = ctx->gpr[6];
++    uint32_t done_p = (uint32_t)ctx->gpr[7];
++
++    FILE* f = fd_file(fd);
++    if (!f) {
++        if (done_p) { vm_write32(done_p, 0); vm_write32(done_p + 4, 0); }
++        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;   /* as cellFsRead answers a bad fd here */
++    }
++    if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
++    if (!writing) fs_prefault(buf, size);
++    size_t n = 0;
++    HOST_LOCKFILE(f);
++    const int64_t pos = (int64_t)HOST_FTELL64(f);
++    if (HOST_FSEEK64(f, offset) == 0)
++        n = writing ? fwrite(vm_base + buf, 1, (size_t)size, f)
++                    : fread(vm_base + buf, 1, (size_t)size, f);
++    if (pos >= 0) HOST_FSEEK64(f, pos);
++    HOST_UNLOCKFILE(f);
++    if (done_p) { vm_write32(done_p, (uint32_t)((uint64_t)n >> 32)); vm_write32(done_p + 4, (uint32_t)n); }
++    if (getenv("PS3_FSLOG")) { static int _n = 0; if (PS3_LOG_FIRST(_n, 40))
++        fprintf(stderr, "[fs] %s fd=%d off=0x%llX size=0x%llX -> 0x%zX\n", writing ? "write@" : "read@",
++                fd, (unsigned long long)offset, (unsigned long long)size, n); }
++    ctx->gpr[3] = CELL_OK;
++}
++static void cellFsReadWithOffset(ppu_context* ctx)  { fs_rw_with_offset(ctx, 0); }
++static void cellFsWriteWithOffset(ppu_context* ctx) { fs_rw_with_offset(ctx, 1); }
++
+ extern "C" void ppu_fs_register(void)
+ {
++    ps3_hle_register_ctx(0x0D5B4A14u, "cellFsReadWithOffset",  cellFsReadWithOffset);
++    ps3_hle_register_ctx(0x8CB722D5u, "cellFsWriteWithOffset", cellFsWriteWithOffset);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
+     /* Register by the literal import NID: LBP imports 0xB1840B53 for
+      * cellFsSdataOpen, which ps3_compute_nid("cellFsSdataOpen") does NOT match
+diff --git a/runtime/syscalls/lv2_lock_line.c b/runtime/syscalls/lv2_lock_line.c
+index a013267..6e8bba1 100644
+--- a/runtime/syscalls/lv2_lock_line.c
++++ b/runtime/syscalls/lv2_lock_line.c
+@@ -73,6 +73,12 @@ int64_t lv2_spu_lock_line_classify(uint32_t addr, uint64_t flags)
+                 return (int64_t)(int32_t)CELL_EINVAL;   /* hole in the region */
+             }
+         }
+-        return (int64_t)(int32_t)CELL_EINVAL;           /* unmapped */
++        /* Anything else is a sys_mmapper region (or unmapped): RPCS3 falls out
++         * of its switch to CELL_OK here ("TODO: respect sys_mmapper region's
++         * access rights"). Gran Turismo 6 keeps its 5-SPU "PDI" SPURS instance
++         * in its sys_mmapper heap; answered EINVAL, libsre's
++         * cellSpursInitializeWithAttribute2 gave up before creating the thread
++         * group and the game went on with a NULL instance. */
++        return 0;
+     }
+ }
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index a657ba6..7d72630 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -4368,7 +4368,7 @@ def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
+     means this is not the idiom. Returns every address from the base through
+     the first unconditional terminator (at most 64), or None.
+     """
+-    const, have_add = 0, False
++    const, have_add, sub = 0, False, False
+     for w in reversed(win):
+         ops = [x.strip() for x in w.operands.split(',')]
+         if w.mnemonic == 'mtctr' or not ops or ops[0] != rC:
+@@ -4377,6 +4377,13 @@ def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
+         try:
+             if m == 'add' and not have_add and rC in ops[1:3]:
+                 have_add = True
++            elif m == 'subf' and not have_add and len(ops) == 3 and ops[2] == rC and ops[1] != rC:
++                # `subf rC,rOff,rC`: base MINUS the offset. The run sits between
++                # the dispatcher and the base and is entered from its far end
++                # (Gran Turismo 6's memset, 0xB1194C: `lis r8,0xB1; addi r8,r8,
++                # 6564; subf r8,r9,r8; mtctr r8; bctr`, then 15 `std` and the
++                # base). Unhandled, every memset under 128 bytes stored nothing.
++                have_add = True; sub = True
+             elif m in ('addis', 'addi') and have_add and len(ops) == 3 and ops[1] == rC:
+                 const += int(ops[2], 0) << (16 if m == 'addis' else 0)
+             elif m in ('li', 'lis') and have_add and len(ops) == 2:
+@@ -4392,6 +4399,11 @@ def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
+     # A real landing run sits right next to its dispatcher.
+     if not (text_lo <= base < text_hi) or base & 3 or abs(base - bctr_addr) > 0x1000:
+         return None
++    if sub:
++        # every instruction after the dispatcher up to and including the base
++        if not (bctr_addr < base <= bctr_addr + 0x100):
++            return None
++        return list(range(bctr_addr + 4, base + 4, 4))
+     targets = []
+     for k in range(64):
+         a = base + 4 * k
+@@ -4405,6 +4417,55 @@ def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
+     return None
+ 
+ 
++def _fold_const_reg(reg, seq):
++    """The constant `reg` holds after `seq`, when it was built without the TOC:
++    `lis`/`li` followed by any `addi`/`addis`/`ori` of the register onto itself
++    (`lis r9,hi; addi r9,r9,lo`). Instructions that only read the register are
++    skipped; any other definition means it is not a constant. None otherwise.
++
++    Gran Turismo 6 (EMAIN, BCES01893 1.22) addresses every switch table this
++    way -- `lis r9,0xA1; rldic r11,r10,2,30; addi r9,r9,-22080; lwzx r0,r11,r9;
++    extsw r0,r0; add r0,r0,r9; mtctr r0; bctr`, the offset table inline right
++    after the bctr -- so with TOC loads alone 45 of its dispatchers resolved and
++    the rest lifted to unresolved indirect calls.
++    """
++    acc, val = [], None
++    for w in reversed(seq):
++        a = [x.strip() for x in w.operands.split(',')]
++        m = w.mnemonic
++        if not a or a[0] != reg or m.startswith(('st', 'lf', 'cmp', 'mt', 'tw', 'td')):
++            continue
++        try:
++            # `addi rD,rS,lo` with rS != rD keeps the constant in another
++            # register: a base hoisted out of a loop (`lis r9,hi; addi r21,r9,lo`
++            # ahead of the script interpreter's opcode loop). Follow rS from here.
++            if m == 'addi' and len(a) == 3:
++                acc.append(('add', int(a[2], 0))); reg = a[1]
++            elif m == 'addis' and len(a) == 3:
++                v = int(a[2], 0)
++                acc.append(('add', (v - 0x10000 if v & 0x8000 else v) << 16)); reg = a[1]
++            elif m == 'ori' and len(a) == 3:
++                acc.append(('or', int(a[2], 0))); reg = a[1]
++            elif m == 'or' and len(a) == 3 and a[1] == a[2]:
++                reg = a[1]                      # mr rD,rS
++            elif m == 'lis' and len(a) == 2:
++                v = int(a[1], 0)
++                val = (v - 0x10000 if v & 0x8000 else v) << 16
++                break
++            elif m == 'li' and len(a) == 2:
++                val = int(a[1], 0)
++                break
++            else:
++                return None
++        except ValueError:
++            return None
++    if val is None:
++        return None
++    for op, v in reversed(acc):
++        val = (val + v) if op == 'add' else (val | v)
++    return val & 0xFFFFFFFF
++
++
+ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts=None):
+     """Find `mtctr rX; bctr` switch dispatchers and read their jump tables.
+ 
+@@ -4632,6 +4693,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+         for cand in _cands:
+             disp = None; r_base = None; base_is_ld = False
+             disp2 = None; disp2_is_ld = False
++            const_base = None       # table address built without the TOC (lis/addi)
+             # Walk backward to the NEAREST instruction that defines `cand`, and
+             # accept it as the table base only if that definition is a TOC load
+             # (`lwz`/`ld cand, disp(r2)`). Stopping at the first definition is
+@@ -4666,6 +4728,12 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+                 if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
+                     disp = mem_disp(a[1]); r_base = cand
+                     base_is_ld = (w.mnemonic == 'ld')
++                elif w.mnemonic in ('addi', 'addis', 'ori', 'lis', 'li'):
++                    # CONSTANT base, no TOC: `lis r9,hi; addi r9,r9,lo` (see
++                    # _fold_const_reg). The table address is the constant.
++                    _cv = _fold_const_reg(cand, [x for x in win_cand if x.addr <= w.addr])
++                    if _cv is not None and text_lo <= _cv and not _cv & 3:
++                        const_base = _cv; r_base = cand; disp = 0
+                 elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r1)' in a[1]:
+                     # SPILLED base: the table address was TOC-loaded earlier,
+                     # stored to a stack slot, and reloaded at the dispatch
+@@ -4732,14 +4800,14 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+                         _scan = _live(_scan_lo(i), i)
+                 break                           # first definition of cand wins/loses
+             if disp is not None:
+-                _bases.append((r_base, disp, base_is_ld, disp2, disp2_is_ld))
++                _bases.append((r_base, disp, base_is_ld, disp2, disp2_is_ld, const_base))
+         _dbg(all_insns[i].addr, f"bases={_bases} toc={toc}")
+-        if not _bases or not toc:
++        if not _bases or (not toc and all(b[5] is None for b in _bases)):
+             continue
+         toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
+         best = []
+         best_key = (0, 0)
+-        for r_base, disp, base_is_ld, disp2, disp2_is_ld in _bases:
++        for r_base, disp, base_is_ld, disp2, disp2_is_ld, const_base in _bases:
+             # offset table iff an `add rC, *, r_base` combines the loaded value + base
+             is_offset = any(
+                 w.mnemonic == 'add' and
+@@ -4821,8 +4889,8 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+             # with. We don't track per-function TOCs here, so try each candidate
+             # and keep the one whose table decodes to the most in-text case
+             # targets (a wrong TOC reads unrelated data and validates 0 targets).
+-            for cand in toc_candidates:
+-                if not cand:
++            for cand in ([None] if const_base is not None else toc_candidates):
++                if not cand and const_base is None:
+                     continue
+                 def _read_ptr(_ea, _is_ld):
+                     # ELFv1 TOC entries are 64-bit; a table address always fits the
+@@ -4833,10 +4901,10 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+                     if read_u32(_ea):
+                         return None
+                     return read_u32((_ea + 4) & 0xFFFFFFFF)
+-                table_base = _read_ptr(cand + disp, base_is_ld)
++                table_base = const_base if const_base is not None else _read_ptr(cand + disp, base_is_ld)
+                 if table_base is not None and disp2 is not None:
+                     table_base = _read_ptr(table_base + disp2, disp2_is_ld)
+-                _dbg(all_insns[i].addr, f"r_base={r_base} cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
++                _dbg(all_insns[i].addr, f"r_base={r_base} cand_toc={cand} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
+                 if table_base is None:
+                     continue
+                 targets = []

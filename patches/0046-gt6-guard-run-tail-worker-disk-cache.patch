@@ -1,0 +1,542 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index e21a3f1..7edde73 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -128,10 +128,14 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ /* The compile queue keeps every job's source and blob until it stops. With the asynchronous pipeline path every
+  * new shader of a session goes through it, so the limits are those of a long session (a fragment program's
+  * source is 20-50 KB): past them a request is refused and that draw compiles on the renderer as before. */
+-#define LD_SCJ_MAX_JOBS 8192u
+-#define LD_SCJ_MAX_READY 8192u
+-#define LD_SCJ_MAX_SOURCE_BYTES (192u * 1024u * 1024u)
+-#define LD_SCJ_MAX_BLOB_BYTES (256u * 1024u * 1024u)
++/* [GT6 0050] The workers read the disk cache too now (ld_scj_disk_load), so a scene whose shaders are all cached
++ * also goes through the queue - about a thousand requests in the first frame of a race, each kept for the
++ * session: more jobs, more of them waiting at once. */
++#define LD_SCJ_MAX_JOBS 32768u
++#define LD_SCJ_MAX_READY 32768u
++#define LD_SCJ_MAX_PENDING 4096u
++#define LD_SCJ_MAX_SOURCE_BYTES (1536u * 1024u * 1024u)
++#define LD_SCJ_MAX_BLOB_BYTES (1024u * 1024u * 1024u)
+ #include "rsx_shader_compile_jobs.h"
+ #include "rsx_shader_prepare.h"
+ #include "rsx_texture_typed.h"
+@@ -2663,6 +2667,27 @@ static int ld_texture_copy_level(ID3D12Resource* tex, u32 subresource,
+     return 1;
+ }
+ 
++/* A texture made by the two functions below has every level of every face written before anything reads it, so
++ * its memory need not come zeroed [GT6 0050]: the first frames of a race make about 1,200 textures, 0.29 s in the
++ * system's allocation calls (b11_guard1). Measured with the flag (b11_cold1): 0.3 ms a texture as before - the
++ * time is not the zeroing - so it stays OFF; LD_TEX_NOT_ZEROED=1 asks for it. If the flag is refused once, it is
++ * not asked for again. */
++static int g_ld_tex_not_zeroed = -1;
++static HRESULT ld_tex_create_committed(const D3D12_HEAP_PROPERTIES* hp, const D3D12_RESOURCE_DESC* rd, ID3D12Resource** tex)
++{
++    if (g_ld_tex_not_zeroed < 0) { const char* e = getenv("LD_TEX_NOT_ZEROED"); g_ld_tex_not_zeroed = e && *e == '1'; }
++    if (g_ld_tex_not_zeroed) {
++        const HRESULT hr = g.dev->lpVtbl->CreateCommittedResource(g.dev, hp, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, rd,
++                                                                  D3D12_RESOURCE_STATE_COPY_DEST, NULL,
++                                                                  &IID_ID3D12Resource, (void**)tex);
++        if (SUCCEEDED(hr)) return hr;
++        g_ld_tex_not_zeroed = 0; *tex = NULL;
++        fprintf(stderr, "[live-draw] a texture heap that is not zeroed was refused (0x%08lX): zeroed heaps from here on\n",
++                (unsigned long)hr);
++    }
++    return g.dev->lpVtbl->CreateCommittedResource(g.dev, hp, D3D12_HEAP_FLAG_NONE, rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
++                                                  &IID_ID3D12Resource, (void**)tex);
++}
+ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
+ {
+     if (n == 0) return NULL;
+@@ -2673,10 +2698,7 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
+     rd.MipLevels = (u16)n; rd.Format = fmt; rd.SampleDesc.Count = 1;
+     ID3D12Resource* tex = ld_tex_reuse_take(D3D12_RESOURCE_DIMENSION_TEXTURE2D, fmt, lv[0].w, lv[0].h, 1, n);
+     const int reused = tex != NULL && !g_tex_pool_took;
+-    if (!tex &&
+-        FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+-                                                      D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+-                                                      &IID_ID3D12Resource, (void**)&tex)))
++    if (!tex && FAILED(ld_tex_create_committed(&hp, &rd, &tex)))
+         return NULL;
+     for (u32 m = 0; m < n; m++) {
+         if (!ld_texture_copy_level(tex, m, fmt, &lv[m])) {
+@@ -2706,11 +2728,7 @@ static ID3D12Resource* create_texture_cube(
+     rd.MipLevels = (u16)n_mips; rd.Format = fmt; rd.SampleDesc.Count = 1;
+     ID3D12Resource* tex = ld_tex_reuse_take(D3D12_RESOURCE_DIMENSION_TEXTURE2D, fmt, lv[0].w, lv[0].h, 6, n_mips);
+     const int reused = tex != NULL && !g_tex_pool_took;      /* refreshed in place: the cache still owns it [GT6 0036] */
+-    if (!tex &&
+-        FAILED(g.dev->lpVtbl->CreateCommittedResource(
+-            g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+-            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+-            &IID_ID3D12Resource, (void**)&tex)))
++    if (!tex && FAILED(ld_tex_create_committed(&hp, &rd, &tex)))
+         return NULL;
+     for (u32 face = 0; face < 6; face++) {
+         for (u32 mip = 0; mip < n_mips; mip++) {
+@@ -3150,9 +3168,20 @@ static int ld_ww_batch_on(void)
+                   if (!g_ww_page_epoch) on = 0; }
+     return on;
+ }
++/* The last guest ranges this side wrote itself (blit destinations, surface downloads), for the surface guard's
++ * question "who wrote that page" [GT6 0049]. A record only: nothing is decided from it. */
++static struct { u32 ea, bytes, frame; } g_ww_own_ring[32];
++static u32 g_ww_own_n;
++static void ld_ww_own_note(u32 ea, u32 bytes)
++{
++    if (!bytes) return;
++    const u32 k = g_ww_own_n++ & 31u;
++    g_ww_own_ring[k].ea = ea; g_ww_own_ring[k].bytes = bytes; g_ww_own_ring[k].frame = g_ld_frames;
++}
+ /* This thread wrote guest bytes [ea, ea+bytes) itself in the middle of a FIFO pass. */
+ void rsx_ww_note_write(u32 ea, u32 bytes)
+ {
++    ld_ww_own_note(ea, bytes);
+     if (!g_ww_page_epoch || !bytes) return;
+     const u32 p0 = ea >> 12, p1 = (u32)(((u64)ea + bytes - 1u) >> 12);
+     for (u32 pg = p0; pg <= p1 && pg < LD_WW_PAGES; pg++) g_ww_page_epoch[pg] = 0;
+@@ -3327,6 +3356,63 @@ static int ld_surface_guard_written(const surface_t* s, const u8* p, u32 n)
+     }
+     return 0;
+ }
++/* A run that ends inside the surface's bytes - a texture that is the first megabyte of a taller target, the
++ * remembered rectangle of one - shares its last page with bytes of the surface it does not cover, and the write
++ * watch cannot tell a write to those from a write to the run. While the run has whole pages of its own, that page
++ * does not decide [GT6 0049]: Gran Turismo 6 draws a 512x512 picture into the top of a 512x1023 target (Tokyo
++ * R246, Mid-Field) and the page with its last 1.3 rows is written every frame for long stretches. The target was
++ * declared overwritten in each of those frames, and its picture went down into guest memory and up again as a
++ * texture (b10_city1: 2,086 frames of a race, one synchronous 512x512 download each). Returns the bytes of the
++ * run that decide; LD_SURFACE_GUARD_TAIL=1 = all of them, as before. */
++static unsigned long long g_ld_guard_tail_left_out;
++static u32 ld_surface_guard_decisive(const surface_t* s, const u8* p, u32 n)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_SURFACE_GUARD_TAIL"); on = !(e && *e == '1'); }
++    if (!on || !s->guard_base || p < s->guard_base || n < 8192u) return n;
++    const u8* const end = p + n;
++    if (end >= s->guard_base + s->guard_bytes) return n;        /* ends with the surface: its last page goes by content */
++    const u32 part = (u32)((uintptr_t)end & 4095u);
++    if (!part) return n;
++    const uintptr_t first_whole = ((uintptr_t)p + 4095u) & ~(uintptr_t)4095u;
++    if ((uintptr_t)end - part < first_whole + 4096u) return n;  /* no whole page of its own: that page decides */
++    return n - part;
++}
++/* The page left out was written: count it, and for the first few say what else of the surface was written since
++ * the stamp and whether this side wrote there itself (the question is who writes that page). */
++static void ld_surface_guard_tail_note(const surface_t* s, const u8* p, u32 n, u32 decisive, const char* what)
++{
++    if (decisive >= n) return;
++    const u32 tail_pg = (u32)(((uintptr_t)(p + decisive) - (uintptr_t)vm_base) >> 12);
++    if (g_ww_page_gen[tail_pg] <= s->guard_gen) return;
++    g_ld_guard_tail_left_out++;
++    static u32 said;
++    if (!PS3_LOG_FIRST(said, 12)) return;
++    ld_ww_harvest(s->guard_base, s->guard_bytes);
++    const u32 p0 = (u32)(((uintptr_t)s->guard_base - (uintptr_t)vm_base) >> 12);
++    const u32 p1 = (u32)(((uintptr_t)s->guard_base + s->guard_bytes - 1u - (uintptr_t)vm_base) >> 12);
++    u32 written = 0, first = 0, last = 0, runs = 0, prev = 0;
++    for (u32 pg = p0; pg <= p1; pg++)
++        if (g_ww_page_gen[pg] > s->guard_gen) {
++            if (!written) first = pg;
++            if (!written || pg != prev + 1u) runs++;
++            last = prev = pg; written++;
++        }
++    char own[256]; int at = 0; own[0] = 0;
++    for (u32 k = 0; k < 32u && at < (int)sizeof own - 48; k++) {
++        const u32 ea = g_ww_own_ring[k].ea, nb = g_ww_own_ring[k].bytes;
++        if (!nb || g_ww_own_ring[k].frame + 2u < g_ld_frames) continue;
++        const u32 a = ea >> 12, b = (u32)(((u64)ea + nb - 1u) >> 12);
++        if (a > tail_pg || b < tail_pg) continue;
++        at += snprintf(own + at, sizeof own - (size_t)at, " 0x%X+0x%X(frame %u)", ea, nb, g_ww_own_ring[k].frame);
++    }
++    fprintf(stderr, "[surface-guard] surface %u:0x%X %ux%u, last drawn in frame %u: page 0x%X at the end of %s 0x%X bytes was "
++                    "written since, its whole pages were not - it stays the surface's. Pages of the surface written since "
++                    "the stamp: %u of %u in %u run(s), pages 0x%X..0x%X (the surface starts in page 0x%X); own writes on "
++                    "that page in the last frames:%s, frame %u\n",
++            s->location, s->offset, s->w, s->h, s->guard_frame - 1u, tail_pg, what, n, written, p1 - p0 + 1u, runs,
++            first, last, p0, at ? own : " none", g_ld_frames);
++}
+ static void ld_surface_guard_kill(surface_t* s, const char* what, u32 lo, u32 hi)
+ {
+     s->guard_dead = 1;
+@@ -3352,7 +3438,9 @@ static int ld_surface_alias_ok(u32 si, const rsx_dsp_texture* t)
+     const u8* p = guest_ptr(t->location, t->offset, span);
+     if (!p || !ld_ww_harvest(p, span)) return 1;
+     g_ld_guard_checks++;
+-    if (p != s->guard_base || !ld_surface_guard_written(s, p, span)) {
++    const u32 decisive = p == s->guard_base ? ld_surface_guard_decisive(s, p, span) : span;
++    if (p != s->guard_base || !ld_surface_guard_written(s, p, decisive)) {
++        if (p == s->guard_base) ld_surface_guard_tail_note(s, p, span, decisive, "a texture's");
+         s->guard_ok_frame = g_ld_frames + 1u; s->guard_ok_span = span;
+         return 1;
+     }
+@@ -3364,11 +3452,13 @@ static void ld_surface_guard_report(void)
+ {
+     static unsigned long long told;
+     static u32 at;
+-    if (g_ld_frames - at < 1800u || told == g_ld_guard_kills + g_ld_guard_refused) return;
+-    at = g_ld_frames; told = g_ld_guard_kills + g_ld_guard_refused;
++    if (g_ld_frames - at < 1800u || told == g_ld_guard_kills + g_ld_guard_refused + g_ld_guard_tail_left_out) return;
++    at = g_ld_frames; told = g_ld_guard_kills + g_ld_guard_refused + g_ld_guard_tail_left_out;
+     fprintf(stderr, "[surface-guard] up to frame %u: %llu surface(s) found overwritten by the guest, %llu texture binds "
+-                    "taken from guest memory instead, %llu bytes of the guest kept under stale surface pixels, %llu checks\n",
+-            g_ld_frames, g_ld_guard_kills, g_ld_guard_refused, g_ld_guard_kept_bytes, g_ld_guard_checks);
++                    "taken from guest memory instead, %llu bytes of the guest kept under stale surface pixels, %llu checks, "
++                    "%llu time(s) a written page at the end of a run inside a surface did not decide\n",
++            g_ld_frames, g_ld_guard_kills, g_ld_guard_refused, g_ld_guard_kept_bytes, g_ld_guard_checks,
++            g_ld_guard_tail_left_out);
+ }
+ 
+ /* For the match thread's pose interpolation (saka_hooks.c): the write watch
+@@ -5343,7 +5433,8 @@ static void ld_mirror_sync_one(surface_t* s)
+     if (dst && ld_surface_guard_on() && s->guard_gen && ld_ww_enabled() && ld_ww_harvest(dst, bytes) &&
+         dst >= s->guard_base && dst + bytes <= s->guard_base + s->guard_bytes && ld_surface_guard_written(s, dst, bytes)) {
+         u8* tmp = (u8*)malloc(bytes);
+-        u32 kept = 0, copied = 0;
++        u32 kept = 0, copied = 0, kept_decisive = 0;
++        const u32 decisive = ld_surface_guard_decisive(s, dst, bytes);   /* [GT6 0049] */
+         if (tmp && ld_surface_download(s, gx0, gy0, w, h, tmp, s->pitch)) {
+             for (u32 r = 0; r < h; r++) {
+                 u8* row = dst + (size_t)r * s->pitch;
+@@ -5354,16 +5445,20 @@ static void ld_mirror_sync_one(surface_t* s)
+                     u32 n = 4096u - (u32)(at & 4095u);
+                     if (n > len - k) n = len - k;
+                     if (!ld_surface_guard_chunk_written(s, row + k, n)) { memcpy(row + k, from + k, n); copied += n; }
+-                    else kept += n;
++                    else { kept += n; if ((u32)(row + k - dst) < decisive) kept_decisive += n; }
+                     k += n;
+                 }
+             }
+             if (copied) rsx_ww_note_write((u32)((uintptr_t)dst - (uintptr_t)vm_base), bytes);
+-        } else kept = bytes;
++        } else kept = kept_decisive = bytes;
+         free(tmp);
+         g_ld_guard_kept_bytes += kept;
+-        ld_surface_guard_kill(s, "under pixels it was remembered to hold,", s->offset + gy0 * s->pitch + gx0 * 4u,
+-                              s->offset + gy0 * s->pitch + gx0 * 4u + bytes);
++        /* (written bytes are kept either way; only a write to pages that are the rectangle's alone says the
++         * surface is not what is at that address any more) */
++        if (kept_decisive)
++            ld_surface_guard_kill(s, "under pixels it was remembered to hold,", s->offset + gy0 * s->pitch + gx0 * 4u,
++                                  s->offset + gy0 * s->pitch + gx0 * 4u + bytes);
++        else ld_surface_guard_tail_note(s, dst, bytes, decisive, "its remembered");
+     } else
+     if (dst) ld_surface_download(s, gx0, gy0, w, h, dst, s->pitch);
+     g_ld_mirror_syncs++;
+@@ -5414,7 +5509,7 @@ static void ld_mirror_seed(u32 ti, u32 maxpx)
+             const u32 pb = p->pitch * (p->gy1 - p->gy0 - 1u) + (p->gx1 - p->gx0) * 4u;
+             const u32 pa = p->offset + p->gy0 * p->pitch + p->gx0 * 4u;
+             const u8* pp = guest_ptr(p->location, pa, pb);
+-            if (pp && ld_ww_harvest(pp, pb) && ld_surface_guard_written(p, pp, pb)) {
++            if (pp && ld_ww_harvest(pp, pb) && ld_surface_guard_written(p, pp, ld_surface_guard_decisive(p, pp, pb))) {
+                 ld_surface_guard_kill(p, "under pixels a new target would have been seeded with,", pa, pa + pb);
+                 continue;
+             }
+@@ -7245,6 +7340,85 @@ static void shader_disk_cache_store(
+     shader_disk_cache_progress(value);
+ }
+ 
++/* The same two for the compile workers [GT6 0050] (g_ld_scj_load / g_ld_scj_store, set when the asynchronous
++ * pipeline path is on): file work only, nothing of the renderer's. In the first frame of a race the renderer read
++ * the cached blobs of about five hundred pipelines itself, one file after the other - 0.72 s of a 1.31 s frame
++ * (b11_guard1, a track visited before). A file that does not check out is left for the renderer to judge; a
++ * compiled blob goes to the name the renderer would give it, through a temporary of the thread's own.
++ * LD_ASYNC_PSO_DISK=0 = the renderer reads and writes them, as before. */
++static u32 g_ld_scj_vs_cache_flags;      /* ld_sp_cache_flags(ld_vs_compile_flags()), taken on the renderer owner */
++static volatile LONG g_ld_scj_stored;
++static int ld_ap_disk_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_ASYNC_PSO_DISK"); on = !(e && *e == '0'); }
++    return on && g_ld_scj_load != NULL;
++}
++static ID3DBlob* ld_scj_disk_load(unsigned stage, const char* source, uint32_t length, uint64_t hash)
++{
++    char path[MAX_PATH];
++    if (g_ld_shader_disk_ready <= 0 || length > 256u * 1024u) return NULL;
++    const int n = snprintf(path, MAX_PATH, "%s\\%c_%016llX_%08X.bin", g_ld_shader_disk_dir, (char)stage,
++                           (unsigned long long)hash, length);
++    if (n <= 0 || n >= MAX_PATH) return NULL;
++    FILE* file = fopen(path, "rb");
++    if (!file) return NULL;
++    shader_disk_cache_header header;
++    memset(&header, 0, sizeof(header));
++    int valid = fread(&header, sizeof(header), 1, file) == 1 &&
++        header.magic == SHADER_DISK_CACHE_MAGIC && header.version == SHADER_DISK_CACHE_VERSION &&
++        header.stage == stage && header.source_hash == hash &&
++        (stage != 'V' || !header.reserved || header.reserved == g_ld_scj_vs_cache_flags) &&
++        header.source_length == length && header.blob_length > 0 && header.blob_length <= SHADER_DISK_CACHE_MAX_BLOB;
++    char* stored = NULL;
++    ID3DBlob* blob = NULL;
++    if (valid) {
++        stored = (char*)malloc(length ? length : 1u);
++        valid = stored != NULL && fread(stored, 1, length, file) == length && memcmp(stored, source, length) == 0;
++    }
++    if (valid)
++        valid = SUCCEEDED(D3DCreateBlob(header.blob_length, &blob)) && blob &&
++            fread(blob->lpVtbl->GetBufferPointer(blob), 1, header.blob_length, file) == header.blob_length;
++    free(stored);
++    fclose(file);
++    if (!valid && blob) { blob->lpVtbl->Release(blob); blob = NULL; }
++    return blob;
++}
++static void ld_scj_disk_store(unsigned stage, const char* source, uint32_t length, uint64_t hash, ID3DBlob* blob)
++{
++    if (g_ld_shader_disk_ready <= 0 || !blob || length > 256u * 1024u) return;
++    const size_t blob_length = blob->lpVtbl->GetBufferSize(blob);
++    if (!blob_length || blob_length > SHADER_DISK_CACHE_MAX_BLOB) return;
++    char path[MAX_PATH], temporary[MAX_PATH];
++    int n = snprintf(path, MAX_PATH, "%s\\%c_%016llX_%08X.bin", g_ld_shader_disk_dir, (char)stage,
++                     (unsigned long long)hash, length);
++    if (n <= 0 || n >= MAX_PATH) return;
++    n = snprintf(temporary, sizeof(temporary), "%s.tmp.%lu.%lu", path, (unsigned long)GetCurrentProcessId(),
++                 (unsigned long)GetCurrentThreadId());
++    if (n <= 0 || n >= (int)sizeof(temporary)) return;
++    shader_disk_cache_header header;
++    memset(&header, 0, sizeof(header));
++    header.magic = SHADER_DISK_CACHE_MAGIC;
++    header.version = SHADER_DISK_CACHE_VERSION;
++    header.stage = stage;
++    header.source_length = length;
++    header.blob_length = (u32)blob_length;
++    if (stage == 'V') header.reserved = g_ld_scj_vs_cache_flags;
++    header.source_hash = hash;
++    FILE* file = fopen(temporary, "wb");
++    if (!file) return;
++    const int wrote = fwrite(&header, sizeof(header), 1, file) == 1 &&
++        fwrite(source, 1, length, file) == length &&
++        fwrite(blob->lpVtbl->GetBufferPointer(blob), 1, blob_length, file) == blob_length &&
++        fflush(file) == 0;
++    fclose(file);
++    if (!wrote || !MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
++        DeleteFileA(temporary);
++        return;
++    }
++    InterlockedIncrement(&g_ld_scj_stored);
++}
++
+ static u64 ld_hash_structural_render_state(
+     const render_state_t* state, u64 hash)
+ {
+@@ -7769,10 +7943,13 @@ typedef struct {
+     int have_layout, packed, point, pull;
+     int vs_ok, ps_ok;         /* the blob is in the memory or disk cache, or its compile job is ready */
+     int submitted;            /* the pipeline workers have its descriptor */
++    const ld_scj_job *vs_job, *ps_job;   /* the compile queue's jobs for the two sources (valid while scj_gen is) */
++    u64 scj_gen;
+ } ld_ap_job;
+ #define LD_AP_JOBS 2048u
+ #define LD_AP_LIMIT_FRAMES 600u
+-#define LD_AP_BUDGET_US 1500     /* of the drawing thread, a frame, for looking at pending jobs */
++#define LD_AP_BUDGET_US 1500     /* of the drawing thread, a frame, for looking again at jobs that wait for a pipeline */
++#define LD_AP_BURST_US 40000     /* ... and for the first step of jobs whose two blobs have just come [GT6 0050] */
+ static ld_ap_job g_ld_ap_jobs[LD_AP_JOBS];
+ static u32 g_ld_ap_count, g_ld_ap_cursor;
+ static u8  g_ld_ap_pending[MAX_PSOS];   /* this g.psos entry is NULL because its pipeline is being made */
+@@ -7860,11 +8037,14 @@ static ID3D12PipelineState* build_pso(
+         g_ld_profile.total.vs_blob_misses++;
+ #endif
+         int vs_defer_cache = 0;
+-        vs = shader_disk_cache_load_ex('V', vs_hlsl, vs_length, vs_hash, g_ld_la_mode==0);
++        /* [GT6 0050] a worker that has this source has read its file or written it: its blob first, no file here */
++        const int vs_worker_files = ld_ap_disk_on();
++        vs = vs_worker_files ? ld_scj_acquire(&g_ld_compile_jobs,'V',vs_hlsl,vs_length,vs_hash,0) : NULL;
++        if (!vs) vs = shader_disk_cache_load_ex('V', vs_hlsl, vs_length, vs_hash, g_ld_la_mode==0);
+         if (!vs) {
+             vs=ld_scj_acquire(&g_ld_compile_jobs,'V',vs_hlsl,vs_length,vs_hash,g_ld_la_mode==0);
+-            vs_defer_cache = vs && g_ld_la_mode==2;
+-            if (vs && !vs_defer_cache) shader_disk_cache_store('V',vs_hlsl,vs_length,vs_hash,vs);
++            vs_defer_cache = vs && g_ld_la_mode==2 && !vs_worker_files;
++            if (vs && !vs_defer_cache && !vs_worker_files) shader_disk_cache_store('V',vs_hlsl,vs_length,vs_hash,vs);
+             if (vs_defer_cache) ++g_ld_la_deferred_writes;
+         }
+         /* Predictions may publish ready blobs, but must not wait for future
+@@ -7945,11 +8125,13 @@ static ID3D12PipelineState* build_pso(
+         g_ld_profile.total.ps_blob_misses++;
+ #endif
+         int ps_defer_cache = 0;
+-        ps = shader_disk_cache_load_ex('P', ps_hlsl, ps_length, ps_hash, g_ld_la_mode==0);
++        const int ps_worker_files = ld_ap_disk_on();       /* [GT6 0050], as for the vertex shader */
++        ps = ps_worker_files ? ld_scj_acquire(&g_ld_compile_jobs,'P',ps_hlsl,ps_length,ps_hash,0) : NULL;
++        if (!ps) ps = shader_disk_cache_load_ex('P', ps_hlsl, ps_length, ps_hash, g_ld_la_mode==0);
+         if (!ps) {
+             ps=ld_scj_acquire(&g_ld_compile_jobs,'P',ps_hlsl,ps_length,ps_hash,g_ld_la_mode==0);
+-            ps_defer_cache = ps && g_ld_la_mode==2;
+-            if (ps && !ps_defer_cache) shader_disk_cache_store('P',ps_hlsl,ps_length,ps_hash,ps);
++            ps_defer_cache = ps && g_ld_la_mode==2 && !ps_worker_files;
++            if (ps && !ps_defer_cache && !ps_worker_files) shader_disk_cache_store('P',ps_hlsl,ps_length,ps_hash,ps);
+             if (ps_defer_cache) ++g_ld_la_deferred_writes;
+         }
+         if (!ps && g_ld_la_mode) { vs->lpVtbl->Release(vs); return NULL; }
+@@ -9262,17 +9444,33 @@ static ID3D12PipelineState* ld_la_build(const char* vs, const char* ps, const re
+  * there). g_ld_pw_front puts that descriptor before the start-up recipes. */
+ /* What a source is to the workers: 2 = its blob is there (memory or disk cache), 1 = a compile worker has it,
+  * 0 = the compile queue is full or stopped. */
+-static int ld_ap_request(char stage, const char* source, u32 size, u64 hash)
++static int ld_ap_request(char stage, const char* source, u32 size, u64 hash, const ld_scj_job** token)
+ {
+     shader_blob_cache_t* cache = stage == 'V' ? &g.vs_blobs : &g.ps_blobs;
+     int post = 0, seen = 0;
++    *token = NULL;
+     ID3DBlob* blob = shader_blob_cache_find(cache, source, size, hash, &post, &seen);
+     if (!blob) {
+-        blob = shader_disk_cache_load_ex(stage, source, size, hash, 0);
++        if (!ld_ap_disk_on()) blob = shader_disk_cache_load_ex(stage, source, size, hash, 0);
++        /* [GT6 0050] no file is read here: a prepared pull variant is in memory, anything else a worker reads
++         * (or compiles) while this frame goes on */
++        else if (stage == 'V') blob = ld_sp_take_ex(source, size, hash, 0);
+         if (blob) shader_blob_cache_insert_accounted(cache, source, size, hash, blob, stage, seen);
+     }
+     if (blob) { blob->lpVtbl->Release(blob); return 2; }
+-    return ld_scj_request(&g_ld_compile_jobs, stage, source, size, hash) != NULL ? 1 : 0;
++    *token = ld_scj_request(&g_ld_compile_jobs, stage, source, size, hash);
++    return *token != NULL ? 1 : 0;
++}
++/* What a source's job says: 2 = its blob is ready, 1 = queued or with a worker, 0 = failed or cancelled, -1 = no
++ * such job. With the job at hand it is one read (a job lives until the queue stops, and the queue is stopped by
++ * this thread only); without it the queue is asked by source. */
++static int ld_ap_source_state(const ld_scj_job* token, char stage, const char* source, u32 size, u64 hash)
++{
++    if (token) {
++        const unsigned st = *(const volatile unsigned*)&token->status;
++        return st == LD_SCJ_READY ? 2 : (st == LD_SCJ_QUEUED || st == LD_SCJ_WORKING) ? 1 : 0;
++    }
++    return ld_scj_status(&g_ld_compile_jobs, stage, source, size, hash);
+ }
+ /* One step for a job whose two blobs are there: take the pipeline if it is ready (mode -1 never waits and never
+  * compiles); else, once, hand the descriptor to the pipeline workers (mode 2), before the start-up recipes
+@@ -9305,8 +9503,9 @@ static ID3D12PipelineState* ld_ap_begin(const char* vs, const char* ps, const re
+     *pending = 0;
+     const u32 nv = (u32)strlen(vs), np = (u32)strlen(ps);
+     const u64 hv = fnv1a(vs, nv, 1469598103934665603ull), hp = fnv1a(ps, np, 1469598103934665603ull);
+-    const int rv = ld_ap_request('V', vs, nv, hv);
+-    const int rp = rv ? ld_ap_request('P', ps, np, hp) : 0;
++    const ld_scj_job *jv = NULL, *jp = NULL;
++    const int rv = ld_ap_request('V', vs, nv, hv, &jv);
++    const int rp = rv ? ld_ap_request('P', ps, np, hp, &jp) : 0;
+     char* v = (rv && rp) ? (char*)malloc((size_t)nv + 1u) : NULL;
+     char* p = (rv && rp) ? (char*)malloc((size_t)np + 1u) : NULL;
+     if (!v || !p) {
+@@ -9321,6 +9520,7 @@ static ID3D12PipelineState* ld_ap_begin(const char* vs, const char* ps, const re
+     job->vs_len = nv; job->ps_len = np; job->vs_hash = hv; job->ps_hash = hp;
+     job->packed = packed; job->point = point; job->pull = pull;
+     job->vs_ok = rv == 2; job->ps_ok = rp == 2;
++    job->vs_job = jv; job->ps_job = jp; job->scj_gen = g_ld_compile_jobs.generation;
+     if (layout) { job->layout = *layout; job->have_layout = 1; }
+     if (job->vs_ok && job->ps_ok) {
+         ID3D12PipelineState* pso = ld_ap_step(job);
+@@ -9344,26 +9544,37 @@ static void ld_ap_pump(void)
+     LARGE_INTEGER q0, q;
+     if (!freq) { QueryPerformanceFrequency(&q); freq = q.QuadPart; }
+     QueryPerformanceCounter(&q0);
+-    const LONGLONG budget = freq * LD_AP_BUDGET_US / 1000000;
++    /* [GT6 0050] Every job is looked at in every frame - with its queue jobs at hand that is two reads. What costs
++     * (about 0.1 ms) is a step: the first one of a job, when its two blobs have come, takes the pipeline that was
++     * prepared at start-up or hands the descriptor to the workers, and gets the larger share, so that a scene whose
++     * shaders were all on disk is whole a frame or two after its first frame; looking again at a job that waits
++     * for a pipeline worker stays within the small share, in turns. */
++    const LONGLONG budget = freq * LD_AP_BUDGET_US / 1000000, burst = freq * LD_AP_BURST_US / 1000000;
+     const u32 n = g_ld_ap_count;
++    const int queue_same = g_ld_compile_jobs.state == LD_SCJ_RUNNING;
++    int resume = -1;     /* the first job that had to wait for its turn: the next frame starts with it */
+     for (u32 looked = 0; looked < n && g_ld_ap_count; ) {
+         if (g_ld_ap_cursor >= g_ld_ap_count) g_ld_ap_cursor = 0;
+         ld_ap_job* job = &g_ld_ap_jobs[g_ld_ap_cursor];
+         const u32 age = g_ld_frames - job->born;
+         ID3D12PipelineState* pso = NULL;
+         int done = 0, failed = 0;
++        const int tokens = queue_same && job->scj_gen == g_ld_compile_jobs.generation;
+         if (!job->vs_ok) {
+-            const int st = ld_scj_status(&g_ld_compile_jobs, 'V', job->vs, job->vs_len, job->vs_hash);
++            const int st = ld_ap_source_state(tokens ? job->vs_job : NULL, 'V', job->vs, job->vs_len, job->vs_hash);
+             if (st == 2) job->vs_ok = 1; else if (st != 1) failed = 1;
+         }
+         if (!failed && !job->ps_ok) {
+-            const int st = ld_scj_status(&g_ld_compile_jobs, 'P', job->ps, job->ps_len, job->ps_hash);
++            const int st = ld_ap_source_state(tokens ? job->ps_job : NULL, 'P', job->ps, job->ps_len, job->ps_hash);
+             if (st == 2) job->ps_ok = 1; else if (st != 1) failed = 1;
+         }
+         if (!failed && job->vs_ok && job->ps_ok) {
+-            pso = ld_ap_step(job);
+-            if (pso) { done = 1; g_ld_ap.finished++; if (age > g_ld_ap.max_frames) g_ld_ap.max_frames = age; }
+-            else if (g_ld_ap_refused) failed = 1;
++            QueryPerformanceCounter(&q);
++            if (q.QuadPart - q0.QuadPart <= (job->submitted ? budget : burst)) {
++                pso = ld_ap_step(job);
++                if (pso) { done = 1; g_ld_ap.finished++; if (age > g_ld_ap.max_frames) g_ld_ap.max_frames = age; }
++                else if (g_ld_ap_refused) failed = 1;
++            } else if (resume < 0) resume = (int)g_ld_ap_cursor;
+         }
+         if (!done && (failed || age > LD_AP_LIMIT_FRAMES || g_ld_compile_jobs.state != LD_SCJ_RUNNING || !g_ld_pw.active)) {
+             /* a compile that failed, a full recipe table, a stopped worker, or too long: the synchronous path decides */
+@@ -9387,17 +9598,15 @@ static void ld_ap_pump(void)
+             free(job->vs); free(job->ps);
+             *job = g_ld_ap_jobs[--g_ld_ap_count];
+         } else g_ld_ap_cursor++;
+-        if ((looked & 7u) == 0u) {
+-            QueryPerformanceCounter(&q);
+-            if (q.QuadPart - q0.QuadPart > budget) break;
+-        }
+     }
++    if (resume >= 0) g_ld_ap_cursor = (u32)resume < g_ld_ap_count ? (u32)resume : 0u;
+     if (g_ld_frames - g_ld_ap.report_frame >= 300u) {
+         g_ld_ap.report_frame = g_ld_frames;
+         fprintf(stderr, "[async-pso] frame=%u pending=%u started=%llu finished=%llu ready-at-once=%llu sync-final=%llu "
+-                        "refused=%llu draws-left-out=%llu longest=%u frames\n",
++                        "refused=%llu draws-left-out=%llu longest=%u frames; blobs the workers read from disk %ld, "
++                        "wrote %ld\n",
+                 g_ld_frames, g_ld_ap_count, g_ld_ap.started, g_ld_ap.finished, g_ld_ap.immediate, g_ld_ap.sync_final,
+-                g_ld_ap.refused, g_ld_ap.skipped_draws, g_ld_ap.max_frames);
++                g_ld_ap.refused, g_ld_ap.skipped_draws, g_ld_ap.max_frames, (long)g_ld_scj_loaded, (long)g_ld_scj_stored);
+     }
+ }
+ 
+@@ -15492,6 +15701,13 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+               if (ld_ap_on())
+                   fprintf(stderr, "[async-pso] on: depth-tested draws wait for their pipeline off the renderer "
+                                   "(compile workers %u; LD_ASYNC_PSO=0 = the synchronous path)\n", g_ld_scj_threads); }
++            { const char* d = getenv("LD_ASYNC_PSO_DISK");          /* [GT6 0050] */
++              if (ld_ap_on() && !(d && *d == '0')) {
++                  g_ld_scj_vs_cache_flags = ld_sp_cache_flags(ld_vs_compile_flags());
++                  g_ld_scj_load = ld_scj_disk_load; g_ld_scj_store = ld_scj_disk_store;
++                  fprintf(stderr, "[async-pso] the compile workers read and write the shader disk cache "
++                                  "(LD_ASYNC_PSO_DISK=0 = the renderer does)\n");
++              } }
+             if (ld_scj_begin(&g_ld_compile_jobs,!(trim && *trim=='0'),!(scalar && *scalar=='0'),ld_vs_compile_flags()))
+                 fprintf(stderr,"[pipeline-lookahead] enabled: bounded read-only FIFO hints, exact shader/descriptor validation\n");
+         }
+diff --git a/libs/video/rsx_shader_compile_jobs.h b/libs/video/rsx_shader_compile_jobs.h
+index 86fe864..16b9d75 100644
+--- a/libs/video/rsx_shader_compile_jobs.h
++++ b/libs/video/rsx_shader_compile_jobs.h
+@@ -44,6 +44,14 @@
+ /* Workers a begin starts: 2 unless the owner asks for more before ld_scj_begin (the renderer's asynchronous
+  * pipeline path, where every pending draw is waiting on this queue). */
+ static unsigned g_ld_scj_threads = 2u;
++/* Optional, set by the owner before ld_scj_begin and left alone while the queue runs: a worker asks the owner's
++ * blob store for its job before it compiles, and hands a freshly compiled blob to that store. Both are called on
++ * worker threads, so they may touch nothing but their arguments and files of their own (the renderer's disk
++ * cache: reading a cached blob costs a millisecond of file work, which on the drawing thread was 0.7 s in the
++ * first frame of a race - b11_guard1). */
++static ID3DBlob* (*g_ld_scj_load)(unsigned stage, const char* source, uint32_t length, uint64_t hash);
++static void (*g_ld_scj_store)(unsigned stage, const char* source, uint32_t length, uint64_t hash, ID3DBlob* blob);
++static volatile LONG g_ld_scj_loaded;     /* jobs answered by g_ld_scj_load */
+ #ifndef LD_SCJ_ALLOC
+ #define LD_SCJ_ALLOC malloc
+ #endif
+@@ -198,8 +206,13 @@ static DWORD WINAPI ld_scj_worker(LPVOID argument)
+         LARGE_INTEGER begin, end; QueryPerformanceCounter(&begin);
+         HRESULT error = E_FAIL;
+         unsigned attempts = 0, scalar_fallback = 0;
+-        ID3DBlob* blob = ld_scj_compile_private(job, trim, scalar, vs_flags,
+-                                               &error, &attempts, &scalar_fallback);
++        ID3DBlob* blob = g_ld_scj_load ? g_ld_scj_load(job->stage, job->source, job->length, job->hash) : NULL;
++        if (blob) { error = S_OK; InterlockedIncrement(&g_ld_scj_loaded); }
++        else {
++            blob = ld_scj_compile_private(job, trim, scalar, vs_flags,
++                                          &error, &attempts, &scalar_fallback);
++            if (blob && g_ld_scj_store) g_ld_scj_store(job->stage, job->source, job->length, job->hash, blob);
++        }
+         QueryPerformanceCounter(&end);
+         const SIZE_T bytes = blob ? blob->lpVtbl->GetBufferSize(blob) : 0;
+         AcquireSRWLockExclusive(&state->lock);

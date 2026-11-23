@@ -1,0 +1,800 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index f89e59a..ae6efea 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2614,7 +2614,7 @@ static int gcm_method_run_on(void)
+     return g_gcm_method_run;
+ }
+ /* The methods gcm_3d_method acts on. */
+-static const u32 s_walker_methods[] = { 0x0050u, 0x0104u, 0x0180u, 0x01A4u, 0x01A8u, 0x1800u, 0x1D6Cu, 0x1D70u, 0x1D74u };
++static const u32 s_walker_methods[] = { 0x0050u, 0x0104u, 0x0180u, 0x01A4u, 0x01A8u, 0x17C8u, 0x1800u, 0x1D6Cu, 0x1D70u, 0x1D74u };
+ /* 1 when a run of `n` words for the methods m0, m0 + 4, ... holds a method gcm_3d_method acts on. */
+ static int gcm_run_has_walker_method(u32 m0, u32 n)
+ {
+@@ -2677,6 +2677,48 @@ static int gcm_word_diag(void)
+     return on;
+ }
+ 
++/* ZPASS pixel count measured by the live engine [GT6 0056] (rsx_live_draw.c, "ZPASS pixel count"): it registers
++ * these two when it can run occlusion queries. report: NV4097_GET_REPORT of type 1 - 1 = taken, the engine writes the
++ * count through gcm_zpass_report_store, at once or when the GPU has it; 0 = not measured, the walker answers as it
++ * always did. clear: NV4097_CLEAR_REPORT_VALUE. */
++int  (*g_gcm_live_zpass_report)(int main_mem, u32 off) = NULL;
++void (*g_gcm_live_zpass_clear)(u32 type) = NULL;
++/* One report into the title's report area: CellGcmReportData, big-endian u64 timer, u32 value, u32 padding. */
++void gcm_zpass_report_store(int main_mem, u32 off, u32 value)
++{
++    const u64 ts = gcm_report_timestamp();
++    if (main_mem) {
++        const u32 rea = gcm_io2ea(off);
++        if (!rea) return;
++        vm_write32(rea, (u32)(ts >> 32));
++        vm_write32(rea + 4u, (u32)ts);
++        vm_write32(rea + 8u, value);
++        vm_write32(rea + 12u, 0u);
++    } else if (off / 16u < CELL_GCM_MAX_REPORT_COUNT) {
++        s_report_data[off / 16u].timestamp = ts;
++        s_report_data[off / 16u].value = value;
++    }
++}
++
++/* GCM_ZPASS_TEST=1 (tests) [GT6 0056]: the value an unmeasured ZPASS report is answered with goes 0xFFFF / 0 in
++ * turn, 4 s each, with a line at every change. A paused scene dumped in both turns shows what a title does with the
++ * answer - whether anything in the picture depends on it at all. */
++static u32 gcm_zpass_unmeasured(void)
++{
++    static int on = -1, last = -1;
++    if (on < 0) on = getenv("GCM_ZPASS_TEST") != NULL;
++    if (!on) return 0xFFFFu;
++    const int zero = (int)((GetTickCount64() / 4000u) & 1u);
++    if (zero != last) {
++        LARGE_INTEGER q, f;
++        QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
++        last = zero;
++        fprintf(stderr, "[zpass-test] reports answered %s from qpc_s=%.3f\n", zero ? "0" : "0xFFFF",
++                (double)q.QuadPart / (double)f.QuadPart);
++    }
++    return zero ? 0u : 0xFFFFu;
++}
++
+ /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
+  * plus the methods whose answer the walker writes itself. */
+ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+@@ -2699,12 +2741,15 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+      * reports "visible" -- the conservative answer; reading 0
+      * tells the title every queried object is occluded. */
+     if (m == 0x1A8) s_report_dma = v;
++    if (m == 0x17C8 && g_gcm_live_zpass_clear) g_gcm_live_zpass_clear(v);
+     if (m == 0x1800) {
+         const u32 off = v & 0xFFFFFFu, idx = off / 16u;
+-        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+-        const u64 ts = gcm_report_timestamp();
++        const u32 val = (v >> 24) == 1u ? gcm_zpass_unmeasured() : 0u;
+         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
+         { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
++        /* measured [GT6 0056]: the live engine writes the count itself */
++        if ((v >> 24) == 1u && g_gcm_live_zpass_report && g_gcm_live_zpass_report(main_mem, off)) return;
++        const u64 ts = gcm_report_timestamp();
+         if (main_mem) {
+             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
+             const u32 rea = gcm_io2ea(off);
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 54ff926..c65ab09 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -38,6 +38,7 @@ void rsx_live_draw_set_display_buffer(
+ { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
+ void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
+ void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
++void rsx_live_draw_reports_tick(void) {}
+ void rsx_live_draw_set_preparation_paused(int paused) { (void)paused; }
+ void rsx_live_draw_set_video_active(int active) { (void)active; }
+ void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
+@@ -61,6 +62,7 @@ void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
+ u32  rsx_live_draw_get_last_draws(void) { return 0; }
+ unsigned long long rsx_live_draw_fence_wait_us(unsigned* w) { if (w) *w = 0; return 0; }
+ void rsx_live_draw_set_present_nowait(int on) { (void)on; }
++int rsx_live_draw_present_stretch = 0;
+ double rsx_live_draw_get_present_fps(void) { return 0.0; }
+ void rsx_live_draw_dump_present_samples(void) {}
+ void rsx_live_draw_a010_probe_begin(void) {}
+@@ -332,6 +334,16 @@ typedef struct {
+     } sview[LD_ZS_VIEWS];
+     ID3D12Resource* sview_src;/* the zeta resource the stencil-plane descriptor was written for */
+     u32 stencil_gen;          /* counts the draws and clears that may have changed depth or stencil */
++    /* The top-left part of the snapshot, as large as a smaller texture that reads it with normalised coordinates
++     * (zdepth_window) [GT6 0057]. */
++    struct {
++        ID3D12Resource* tex;  /* R32F */
++        u32 w, h;
++        u32 serial;           /* snap_serial it was copied at */
++        u32 last_use;         /* g_ld_frames of the last bind: the older one makes room for a new size */
++        D3D12_RESOURCE_STATES state;
++    } win[2];
++    u32 snap_serial;          /* counts the snapshots taken */
+ } zdepth_t;
+ typedef struct {
+     u32 location, offset, format, width, height, pitch, remap;
+@@ -837,6 +849,9 @@ static LONGLONG ld_slow_qpc(void);                 /* defined with ld_slow_note
+ static void ld_pso_library_save(int force);        /* defined before build_pso */
+ static volatile int g_ld_present_nowait = 0;       /* fast-forward: no vsync, show <= ~60/s */
+ void rsx_live_draw_set_present_nowait(int on) { g_ld_present_nowait = on ? 1 : 0; }
++/* The host's choice [GT6 0058]: a scanout of another size than the window is stretched over the whole window at the
++ * present, as the console's video output does (rsx_live_draw_present). 0 = copied as it is, as before. */
++int rsx_live_draw_present_stretch = 0;
+ static unsigned long long g_ld_fence_wait_us = 0;  /* GPU fence waits in flushes */
+ static unsigned g_ld_fence_waits = 0;
+ static double g_ld_setup_ms[4];
+@@ -1689,6 +1704,10 @@ static void rsx_live_draw_method_run(u32 method, int incrementing, const void* b
+ extern void (*g_gcm_live_method_run)(u32 method, int incrementing, const void* be_words, u32 count);   /* cellGcmSys.c */
+ static u32 rsx_live_draw_fifo_burst(const void* be, u32 max_bytes, rsx_fifo_burst* b);                  /* [GT6 0055] */
+ extern u32 (*g_gcm_live_fifo_burst)(const void* be, u32 max_bytes, rsx_fifo_burst* b);                  /* cellGcmSys.c */
++static int  ld_zq_report(int main_mem, u32 off);                                                         /* [GT6 0056] */
++static void ld_zq_clear(u32 type);
++extern int  (*g_gcm_live_zpass_report)(int main_mem, u32 off);                                           /* cellGcmSys.c */
++extern void (*g_gcm_live_zpass_clear)(u32 type);                                                         /* cellGcmSys.c */
+ #define LD_DYN_BIAS_MARK 0x7FC0D1A5u
+ static int   g_ld_draw_bias_on;             /* get_pso, for the draw being built: its bias comes from the list */
+ static float g_ld_draw_bias_units, g_ld_draw_bias_slope;
+@@ -2153,6 +2172,257 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
+     return h;
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * ZPASS pixel count [GT6 0056]: NV4097_CLEAR_REPORT_VALUE (0x17C8), SET_ZPASS_PIXEL_COUNT_ENABLE (0x17CC) and
++ * GET_REPORT (0x1800, type 1). A title asks the RSX how many pixels of what it drew passed the depth test - Gran
++ * Turismo 6 does it for the lights it draws a glow for, and shows the glow by the answer. Until now the walker
++ * answered 0xFFFF ("visible") without measuring, so at night the glows of lights behind walls and hills stood in
++ * the picture (owner, 2026-11-19: "야간 주행을 하면 벽을 뚫고 저 멀리의 빛이 보이거나").
++ * Measured with D3D12 occlusion queries: while the enable register is set, the draws of sink_end_impl run inside a
++ * query (one heap slot from the first such draw to the next GET_REPORT, CLEAR, uncounted draw or submit). The
++ * count is known only when the GPU has run that command list, so GET_REPORT hands the report over
++ * (ld_zq_report) and the value is written into the title's report area once the fence of the submit has passed
++ * (ld_zq_poll, at every submit and every report) - a frame late at most; on the console the RSX runs behind the
++ * PPU too. The counter is the RSX's: CLEAR starts it again (an "epoch"), GET_REPORT reads it without clearing. No
++ * counted draw since the CLEAR = 0, at once. Whenever the count cannot be trusted - a group that was left out
++ * while counting (pipeline still being made, a dropped group), no free slot, movie or debug-layer mode - the
++ * report falls back to the slot's last measured count, or to the old answer, "visible".
++ * LD_ZPASS_QUERY=1: on; =ab: measured and "visible" in turn, 4 s each (tests); unset or 0: OFF, everything as
++ * before - see ld_zq_mode for why it is not the default yet. */
++#define LD_ZQ_SLOTS   2048u
++#define LD_ZQ_REPORTS 1024u
++#define LD_ZQ_PER     12u
++enum { LD_ZQ_FREE = 0, LD_ZQ_OPEN, LD_ZQ_ENDED, LD_ZQ_RESOLVED };
++typedef struct { u8 state; u32 epoch; u64 fence; } ld_zq_slot;
++typedef struct { u8 used, main_mem, n; u32 off; u64 sum; u16 slot[LD_ZQ_PER]; } ld_zq_rep_t;
++static struct {
++    int mode;                               /* -1 not read yet, 0 off, 1 on, 2 measured / "visible" in turn */
++    int failed, open;                       /* open: the slot with a BeginQuery in the current list, -1 none */
++    ID3D12QueryHeap* heap;
++    ID3D12Resource* rb;                     /* one u64 a slot, read back */
++    const u64* rb_map;
++    ld_zq_slot slot[LD_ZQ_SLOTS];
++    ld_zq_rep_t rep[LD_ZQ_REPORTS];
++    u32 next, n_ended, n_resolved, n_rep, rep_hi;
++    u32 epoch, issued;                      /* issued: groups drawn inside a query */
++    u64 epoch_sum;                          /* the counts of this epoch that have been read back ... */
++    u16 epoch_slot[LD_ZQ_PER];              /* ... and its slots that have not */
++    u8 epoch_n, epoch_unsure;
++    u32 st_reports, st_now, st_later, st_unsure, st_hidden, st_visible, st_left_out, st_no_slot, st_draws;
++    LONGLONG st_t0;
++    u64 n_reports_total, idle_act;          /* rsx_live_draw_reports_tick: the traffic seen at the last look ... */
++    LONGLONG idle_since;                    /* ... and since when it has stood still with reports waiting (0 = not) */
++    u32 st_idle, st_kept, st_clears;
++    u64 polled_done;                        /* the fence value ld_zq_poll has read the counts up to */
++} zq = { -1, 0, -1 };
++extern void gcm_zpass_report_store(int main_mem, u32 off, u32 value);   /* cellGcmSys.c */
++
++static int ld_zq_mode(void)
++{
++    if (zq.mode < 0) {
++        /* OFF unless asked for [2026-11-20]: Gran Turismo 6 waits for the answer of every report before it goes on
++         * (garage and race, every frame), so an answer that comes when the GPU has the count costs frames - test
++         * drive z3: garage 36 fps, race 18..55 - and what it counts on a daytime track never came out "hidden".
++         * Next step before this may be the default: answer at once with the slot's last measured count. */
++        const char* e = getenv("LD_ZPASS_QUERY");
++        /* =count (mode 3): no query, no answer of ours - only the [zpass] line: how many reports, clears and
++         * counted groups the title sends in a scene (a measuring run costs nothing and changes nothing) */
++        zq.mode = !e ? 0 : *e == '0' ? 0 : (*e == 'a' || *e == 'A') ? 2 : (*e == 'c' || *e == 'C') ? 3 : 1;
++    }
++    return zq.mode;
++}
++
++/* LD_ZPASS_SEQ=<frame> (tests): from that frame on, the first 900 events of the title's pixel counting in the order
++ * they come - C a clear, D a counted group, R a report and what it was answered with, S a count stored when the GPU
++ * had it. How a title uses the counter (one clear a frame or one a light, the same report slots frame after frame)
++ * is read off this. */
++static int ld_zq_seq(void)
++{
++    static int from = -2;
++    static u32 left = 900;
++    if (from == -2) { const char* e = getenv("LD_ZPASS_SEQ"); from = e ? atoi(e) : -1; }
++    if (from < 0 || (int)g_ld_frames < from || !left) return 0;
++    left--;
++    return 1;
++}
++
++static int ld_zq_ready(void)
++{
++    if (zq.heap) return 1;
++    if (zq.failed) return 0;
++    D3D12_QUERY_HEAP_DESC qd; memset(&qd, 0, sizeof qd);
++    qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION; qd.Count = LD_ZQ_SLOTS;
++    D3D12_HEAP_PROPERTIES hp; memset(&hp, 0, sizeof hp);
++    hp.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC bd; memset(&bd, 0, sizeof bd);
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)LD_ZQ_SLOTS * 8u;
++    bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
++    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    void* p = NULL;
++    HRESULT hr = g.dev->lpVtbl->CreateQueryHeap(g.dev, &qd, &IID_ID3D12QueryHeap, (void**)&zq.heap);
++    if (SUCCEEDED(hr))
++        hr = g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
++                                                    NULL, &IID_ID3D12Resource, (void**)&zq.rb);
++    if (SUCCEEDED(hr)) hr = zq.rb->lpVtbl->Map(zq.rb, 0, NULL, &p);
++    if (FAILED(hr) || !p) {
++        fprintf(stderr, "[zpass] no occlusion queries (hr=0x%08lX): reports stay \"visible\"\n", (unsigned long)hr);
++        if (zq.rb) zq.rb->lpVtbl->Release(zq.rb);
++        if (zq.heap) zq.heap->lpVtbl->Release(zq.heap);
++        zq.rb = NULL; zq.heap = NULL; zq.failed = 1;
++        return 0;
++    }
++    zq.rb_map = (const u64*)p;
++    fprintf(stderr, "[zpass] occlusion queries on: %u slots, mode %d (LD_ZPASS_QUERY=0 turns them off)\n", LD_ZQ_SLOTS, zq.mode);
++    return 1;
++}
++
++static void ld_zq_end_open(void)
++{
++    if (zq.open < 0) return;
++    g.list->lpVtbl->EndQuery(g.list, zq.heap, D3D12_QUERY_TYPE_OCCLUSION, (UINT)zq.open);
++    zq.slot[zq.open].state = LD_ZQ_ENDED;
++    zq.n_ended++;
++    zq.open = -1;
++}
++
++/* Right before the draw call(s) of a group (sink_end_impl). */
++static void ld_zq_before_draw(void)
++{
++    if (zq.mode == 0) return;
++    if (!(g.rsx.regs[0x17CCu >> 2] & 1u)) { if (zq.open >= 0) ld_zq_end_open(); return; }
++    if (ld_zq_mode() == 0) return;
++    zq.issued++; zq.st_draws++;
++    if (ld_zq_seq()) fprintf(stderr, "[zseq] f%u D counted group %u epoch %u\n", g_ld_frames, zq.issued, zq.epoch);
++    if (zq.mode == 3) return;               /* counting only */
++    if (zq.open >= 0) {
++        if (zq.slot[zq.open].epoch == zq.epoch) return;
++        ld_zq_end_open();                   /* a CLEAR since: that count belongs to the epoch before */
++    }
++    if (zq.epoch_unsure) return;
++    if (zq.epoch_n >= LD_ZQ_PER || !ld_zq_ready()) { zq.epoch_unsure = 1; return; }
++    u32 k = zq.next, i;
++    for (i = 0; i < LD_ZQ_SLOTS && zq.slot[k].state != LD_ZQ_FREE; i++) k = (k + 1u) % LD_ZQ_SLOTS;
++    if (i == LD_ZQ_SLOTS) { zq.epoch_unsure = 1; zq.st_no_slot++; return; }
++    zq.next = (k + 1u) % LD_ZQ_SLOTS;
++    zq.slot[k].state = LD_ZQ_OPEN; zq.slot[k].epoch = zq.epoch;
++    zq.epoch_slot[zq.epoch_n++] = (u16)k;
++    g.list->lpVtbl->BeginQuery(g.list, zq.heap, D3D12_QUERY_TYPE_OCCLUSION, k);
++    zq.open = (int)k;
++}
++
++/* ld_flush, before the list is closed: a query cannot stay open across lists, and the counts taken in this list
++ * are resolved in it (a later counted draw of the same epoch takes a new slot). */
++static void ld_zq_before_close(void)
++{
++    if (!zq.heap) return;
++    ld_zq_end_open();
++    const u64 fence = g.fence_value + 1u;   /* what ld_flush signals after this list */
++    for (u32 k = 0; k < LD_ZQ_SLOTS && zq.n_ended; ) {
++        if (zq.slot[k].state != LD_ZQ_ENDED) { k++; continue; }
++        u32 n = 1;
++        while (k + n < LD_ZQ_SLOTS && zq.slot[k + n].state == LD_ZQ_ENDED) n++;
++        g.list->lpVtbl->ResolveQueryData(g.list, zq.heap, D3D12_QUERY_TYPE_OCCLUSION, k, n, zq.rb, (UINT64)k * 8u);
++        for (u32 j = 0; j < n; j++) { zq.slot[k + j].state = LD_ZQ_RESOLVED; zq.slot[k + j].fence = fence; }
++        zq.n_ended -= n; zq.n_resolved += n;
++        k += n;
++    }
++}
++
++/* (tests) LD_ZPASS_QUERY=ab: 1 while the old answer has its turn, 4 s each. */
++static int ld_zq_ab_old(void)
++{
++    if (zq.mode != 2) return 0;
++    static int last = -1;
++    const int old = (int)((GetTickCount64() / 4000u) & 1u);
++    if (old != last) {
++        last = old;
++        fprintf(stderr, "[zpass] ab: %s from frame %u\n", old ? "\"visible\" (as before)" : "measured", g_ld_frames);
++    }
++    return old;
++}
++
++/* The last measured count of a report slot (the title asks about the same lights at the same slots frame after
++ * frame): what a report that cannot be measured this once is answered with, so that a hidden light does not
++ * flash "visible" for a frame whenever a group is left out. */
++static struct { u32 key, value; } g_zq_last[8192];
++static u32 ld_zq_last_key(int main_mem, u32 off) { return ((off & 0x00FFFFFFu) | (main_mem ? 0x40000000u : 0u)) + 1u; }
++
++static void ld_zq_store(int main_mem, u32 off, u64 count)
++{
++    u32 value = count > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)count;
++    if (value) zq.st_visible++; else zq.st_hidden++;
++    if (ld_zq_seq()) fprintf(stderr, "[zseq] f%u S off 0x%X = %u\n", g_ld_frames, off, value);
++    g_zq_last[(off >> 4) & 8191u].key = ld_zq_last_key(main_mem, off);
++    g_zq_last[(off >> 4) & 8191u].value = value;
++    if (ld_zq_ab_old()) value = 0xFFFFu;
++    gcm_zpass_report_store(main_mem, off, value);
++}
++
++/* A report that cannot be measured: 1 = answered with the slot's last measured count, 0 = none known - the walker
++ * answers "visible", as it always did. */
++static int ld_zq_unsure(int main_mem, u32 off)
++{
++    zq.st_unsure++;
++    if (ld_zq_ab_old()) return 0;
++    const u32 i = (off >> 4) & 8191u;
++    if (g_zq_last[i].key != ld_zq_last_key(main_mem, off)) return 0;
++    zq.st_kept++;
++    gcm_zpass_report_store(main_mem, off, g_zq_last[i].value);
++    return 1;
++}
++
++/* The counts of the submits the GPU has finished: into their epoch and their reports. Costs one read of the
++ * fence while the GPU has finished nothing new. */
++static void ld_zq_poll(void)
++{
++    if (!zq.n_resolved) return;
++    const u64 done = g.fence->lpVtbl->GetCompletedValue(g.fence);
++    if (done == zq.polled_done) return;
++    zq.polled_done = done;
++    for (u32 k = 0; k < LD_ZQ_SLOTS && zq.n_resolved; k++) {
++        ld_zq_slot* s = &zq.slot[k];
++        if (s->state != LD_ZQ_RESOLVED || s->fence > done) continue;
++        const u64 count = zq.rb_map[k];
++        s->state = LD_ZQ_FREE; zq.n_resolved--;
++        if (s->epoch == zq.epoch)
++            for (u32 j = 0; j < zq.epoch_n; j++)
++                if (zq.epoch_slot[j] == k) { zq.epoch_slot[j] = zq.epoch_slot[--zq.epoch_n]; zq.epoch_sum += count; break; }
++        for (u32 r = 0; r < zq.rep_hi && zq.n_rep; r++) {
++            ld_zq_rep_t* p = &zq.rep[r];
++            if (!p->used) continue;
++            for (u32 j = 0; j < p->n; j++)
++                if (p->slot[j] == k) {
++                    p->slot[j] = p->slot[--p->n]; p->sum += count;
++                    if (!p->n) { p->used = 0; zq.n_rep--; ld_zq_store(p->main_mem, p->off, p->sum); }
++                    break;
++                }
++        }
++    }
++    while (zq.rep_hi && !zq.rep[zq.rep_hi - 1u].used) zq.rep_hi--;
++}
++
++static void ld_zq_stats(void)
++{
++    if (!(zq.st_reports | zq.st_draws)) return;
++    static LONGLONG freq;
++    LARGE_INTEGER now; QueryPerformanceCounter(&now);
++    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
++    if (!zq.st_t0) zq.st_t0 = now.QuadPart;
++    if (now.QuadPart - zq.st_t0 < 5 * freq) return;
++    fprintf(stderr, "[zpass] frame %u, %u clears; ", g_ld_frames, zq.st_clears);
++    zq.st_clears = 0;
++    fprintf(stderr, "last 5 s: %u reports (%u answered at once, %u when the GPU had the count, %u not measurable: %u of "
++                    "them answered with the slot's last count, the rest \"visible\") | measured: %u hidden, %u visible | %u "
++                    "groups counted, %u left out while counting, %u without a slot | %u submits because the title stood "
++                    "waiting | waiting: %u reports, %u slots\n",
++            zq.st_reports, zq.st_now, zq.st_later, zq.st_unsure, zq.st_kept, zq.st_hidden, zq.st_visible, zq.st_draws,
++            zq.st_left_out, zq.st_no_slot, zq.st_idle, zq.n_rep, zq.n_resolved + zq.n_ended);
++    zq.st_reports = zq.st_now = zq.st_later = zq.st_unsure = zq.st_hidden = zq.st_visible = 0;
++    zq.st_draws = zq.st_left_out = zq.st_no_slot = zq.st_idle = zq.st_kept = 0;
++    zq.st_t0 = now.QuadPart;
++}
++
+ /* ---------------------------------------------------------------------------
+  * command list submit/wait (simple synchronous model, like the harness)
+  * -----------------------------------------------------------------------*/
+@@ -2197,6 +2467,7 @@ static void ld_flush(ld_flush_reason reason)
+           memset(cnt, 0, sizeof cnt); t0 = now.QuadPart;
+           ld_pso_library_save(0);   /* new PSOs since the last save, at most every 10 s */
+       } }
++    ld_zq_poll(); ld_zq_before_close(); ld_zq_stats();   /* ZPASS pixel counts [GT6 0056] */
+     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+     if (FAILED(close_hr)) {
+         fprintf(stderr,
+@@ -6761,6 +7032,7 @@ static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
+      * would have invalidated both): resolve it again at the next read. */
+     if (z->snapshot_valid) z->had_write = 1;
+     z->snapshot_valid = 0;
++    z->snap_serial++;
+ }
+ 
+ /* Returns DSV slot 1+i. Slot 0 is the legacy shared depth fallback. */
+@@ -6812,6 +7084,10 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+             retire_texture(old->snapshot);
+             old->snapshot = NULL;
+         }
++        for (u32 k = 0; k < 2; k++) {
++            if (old->win[k].tex) retire_texture(old->win[k].tex);
++            memset(&old->win[k], 0, sizeof old->win[k]);
++        }
+         for (u32 k = 0; k < LD_ZS_VIEWS; k++) {
+             if (old->sview[k].tex) retire_texture(old->sview[k].tex);
+             memset(&old->sview[k], 0, sizeof old->sview[k]);
+@@ -7014,9 +7290,109 @@ static int zdepth_snapshot(u32 slot)
+     z->snapshot_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+     z->snapshot_valid = 1;
+     z->had_write = 0;
++    z->snap_serial++;
+     return 1;
+ }
+ 
++/* A depth texture smaller than the zeta's snapshot, read with NORMALISED coordinates [GT6 0057]. The snapshot is as
++ * large as the largest pass that has bound the zeta; a texture declared smaller reads, on the console, the top-left
++ * part of the depth buffer over its whole 0..1 range. Bound to the snapshot as it is, 0..1 ran over the whole
++ * snapshot and every read came from another place of the picture, or from outside it.
++ * Gran Turismo 6 draws the glow of each street lamp at night with the depth test OFF (one group of 325 quads at the
++ * end of the scene) and lets the fragment program decide, from the scene's depth read as a 1280x720 texture, whether
++ * the lamp is covered. The zeta is the one its reflection faces, mirror and 2D layer use as well, so the snapshot
++ * stood at 2048x3174: the glows of lamps behind walls and under the road were in the picture (owner, 2026-11-19:
++ * "야간 주행을 하면 벽을 뚫고 저 멀리의 빛이 보이거나").
++ * The window is a copy of that top-left part, as large as the texture, made anew when the snapshot has changed; two
++ * sizes a zeta are kept. Texel-addressed reads need none - their coordinates are divided by the snapshot's size
++ * (unnorm_dim). LD_ZDEPTH_WINDOW=0: off, the snapshot as before.
++ * Returns the resource to bind; call after zdepth_snapshot has said the snapshot can be read. */
++static ID3D12Resource* zdepth_window(u32 i, const rsx_dsp_texture* t)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_ZDEPTH_WINDOW"); on = (e && *e == '0') ? 0 : (e && (*e == 'a' || *e == 'A')) ? 2 : 1; }
++    zdepth_t* z = &g.zdepths[i];
++    if (on == 2) {      /* (tests) =ab: the window and the whole snapshot in turn, 4 s each, a line at every change */
++        static int last = -1;
++        const int off = (int)((GetTickCount64() / 4000u) & 1u);
++        if (off != last) {
++            LARGE_INTEGER q, f;
++            QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
++            last = off;
++            fprintf(stderr, "[ab-test] depth window %s from qpc_s=%.3f\n", off ? "OFF" : "ON", (double)q.QuadPart / (double)f.QuadPart);
++        }
++        if (off) return z->snapshot;
++    }
++    if (!on || !z->snapshot || (t->format & TEX_FMT_UNNORM) || !t->width || !t->height) return z->snapshot;
++    if (t->width >= z->snapshot_w && t->height >= z->snapshot_h) return z->snapshot;
++    const u32 w = t->width < z->snapshot_w ? t->width : z->snapshot_w;
++    const u32 h = t->height < z->snapshot_h ? t->height : z->snapshot_h;
++    u32 k = 0;
++    if (!(z->win[0].tex && z->win[0].w == w && z->win[0].h == h)) {
++        if (z->win[1].tex && z->win[1].w == w && z->win[1].h == h) k = 1;
++        else {
++            k = !z->win[0].tex ? 0u : !z->win[1].tex ? 1u : z->win[0].last_use <= z->win[1].last_use ? 0u : 1u;
++            D3D12_HEAP_PROPERTIES hp = {0};
++            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++            D3D12_RESOURCE_DESC rd = {0};
++            rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++            rd.Width = w; rd.Height = h;
++            rd.DepthOrArraySize = 1; rd.MipLevels = 1;
++            rd.Format = DXGI_FORMAT_R32_FLOAT;
++            rd.SampleDesc.Count = 1;
++            ID3D12Resource* tex = NULL;
++            if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
++                                                              NULL, &IID_ID3D12Resource, (void**)&tex)))
++                return z->snapshot;
++            if (z->win[k].tex) retire_texture(z->win[k].tex);   /* the open list may still read it */
++            z->win[k].tex = tex; z->win[k].w = w; z->win[k].h = h;
++            z->win[k].state = D3D12_RESOURCE_STATE_COPY_DEST;
++            z->win[k].serial = z->snap_serial - 1u;
++            { static u32 n = 0;
++              if (PS3_LOG_FIRST(n, 12))
++                  fprintf(stderr, "[zetatrack] window %ux%u of the %ux%u snapshot of %u:0x%X for a texture of that size read "
++                                  "with normalised coordinates (fmt 0x%02X)\n", w, h, z->snapshot_w, z->snapshot_h, z->location,
++                          z->offset, t->format & 0xFFu); }
++        }
++    }
++    z->win[k].last_use = g_ld_frames;
++    if (z->win[k].serial != z->snap_serial) {
++        D3D12_RESOURCE_BARRIER b[2] = {0};
++        u32 nb = 0;
++        b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[nb].Transition.pResource = z->snapshot;
++        b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[nb].Transition.StateBefore = z->snapshot_state;
++        b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        nb++;
++        if (z->win[k].state != D3D12_RESOURCE_STATE_COPY_DEST) {
++            b[nb].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++            b[nb].Transition.pResource = z->win[k].tex;
++            b[nb].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++            b[nb].Transition.StateBefore = z->win[k].state;
++            b[nb].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++            nb++;
++        }
++        g.list->lpVtbl->ResourceBarrier(g.list, nb, b);
++        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
++        dst.pResource = z->win[k].tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++        src.pResource = z->snapshot;   src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++        D3D12_BOX box = {0, 0, 0, w, h, 1};
++        g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &box);
++        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        b[0].Transition.StateAfter = z->snapshot_state;
++        b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[1].Transition.pResource = z->win[k].tex;
++        b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++        z->win[k].state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        z->win[k].serial = z->snap_serial;
++    }
++    return z->win[k].tex;
++}
++
+ /* A zeta read as an A8R8G8B8 texture at its own address (Gran Turismo 6, 2026-11-15: no text anywhere in its
+  * menus). The game draws each string into the stencil buffer -- colour writes off, a rectangle that zeroes the
+  * stencil, then the glyph outlines as triangle fans with INVERT on stencil bit 7 -- and then draws the string's
+@@ -14823,13 +15199,18 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                         break;
+                     }
+             if (sampled_depth >= 0) {
++                /* (the snapshot, or its top-left part for a smaller texture read with normalised coordinates) */
++                ID3D12Resource* const zres = zdepth_window((u32)sampled_depth, &t);
+                 slots[u] = SRV_ZDEPTH_BASE + sampled_depth;
+                 if (ld_typed_textures_on()) {
+                     /* Each unit can view the same depth resource with a different
+                      * crossbar. The GPU table captures this CPU descriptor before
+                      * the next draw reuses it; no resource or GPU pass is added. */
+                     slots[u] = SRV_ZDEPTH_VIEW_BASE + u;
+-                    srv_write_zdepth_view(slots[u], g.zdepths[sampled_depth].snapshot, &t);
++                    srv_write_zdepth_view(slots[u], zres, &t);
++                } else if (zres != g.zdepths[sampled_depth].snapshot) {
++                    slots[u] = SRV_ZDEPTH_VIEW_BASE + u;
++                    srv_write_zdepth(slots[u], zres);
+                 }
+                 g_ld_zdepth_srv_binds++;
+                 int seen = 0;
+@@ -15214,6 +15595,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         ibv.Format = DXGI_FORMAT_R32_UINT;
+         g.list->lpVtbl->IASetIndexBuffer(g.list, &ibv);
+     }
++    ld_zq_before_draw();    /* ZPASS pixel count [GT6 0056]: inside an occlusion query while the title counts */
+     /* A quad at a time when the draw reads what it writes (ld_seq_feedback_on): a few quads into a small target. */
+     if (prim != PRIM_POINTS && g_ld_fb_bound_n && ld_seq_feedback_on() && n_tri > 6u && n_tri <= 96u && (n_tri % 6u) == 0u &&
+         (u64)g.surfaces[target].w * g.surfaces[target].h <= 400000ull) {
+@@ -15329,7 +15711,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
+     u32 imm_fmt[16], imm_bytes = 0;
+     const int imm = g_ld_imm.n && !dc.n_packets && ld_immediate_pack(imm_fmt, &imm_bytes);
+     if (imm) sink_inline_array(user, r, g_ld_imm.data, imm_bytes);
++    /* ZPASS pixel count [GT6 0056]: a group that is left out while the title counts makes the count worthless */
++    const u32 zq_issued = zq.issued;
++    const int zq_counting = zq.mode != 0 && dc.n_packets && (g.rsx.regs[0x17CCu >> 2] & 1u);
+     sink_end_impl(user, r);
++    if (zq_counting && zq.issued == zq_issued) { zq.epoch_unsure = 1; zq.st_left_out++; }
+     if (imm) for (u32 attr = 0; attr < 16; attr++) g.rsx.regs[(0x1740u >> 2) + attr] = imm_fmt[attr];
+     g_ld_imm.n = 0;
+ #if defined(YZ_PERF_PROFILE)
+@@ -15873,6 +16259,8 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     /* Consecutive state headers in one call (rsx_live_draw_fifo_burst) [GT6 0055]. LD_FIFO_BURST=0 = not offered. */
+     { const char* e = getenv("LD_FIFO_BURST");
+       g_gcm_live_fifo_burst = (e && *e == '0') ? NULL : rsx_live_draw_fifo_burst; }
++    /* ZPASS pixel counts measured (ld_zq_report) [GT6 0056]. LD_ZPASS_QUERY=0 = not offered: "visible", as before. */
++    if (ld_zq_mode()) { g_gcm_live_zpass_report = ld_zq_report; g_gcm_live_zpass_clear = ld_zq_clear; }
+     g.dev->lpVtbl->CreateFence(g.dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&g.fence);
+     g.fence_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+ 
+@@ -16125,6 +16513,71 @@ void rsx_live_draw_set_display_buffer(
+             buffer_id, location, offset, pitch, width, height);
+ }
+ 
++/* ZPASS pixel count [GT6 0056], the walker's side (cellGcmSys.c gcm_3d_method, on the thread that draws).
++ * NV4097_CLEAR_REPORT_VALUE: the counter starts again. Touches no D3D12 object - an open query of the epoch before
++ * is ended by the next counted draw or the next submit. */
++static void ld_zq_clear(u32 type)
++{
++    if (zq.mode != 0 && ld_zq_seq()) fprintf(stderr, "[zseq] f%u C type %u\n", g_ld_frames, type);
++    if (type != 1u || zq.mode == 0) return;     /* 1 = CELL_GCM_ZPASS_PIXEL_CNT */
++    zq.st_clears++;
++    zq.epoch++; zq.epoch_sum = 0; zq.epoch_n = 0; zq.epoch_unsure = 0;
++}
++/* NV4097_GET_REPORT of type 1. 1 = taken: the count is written now (nothing drawn since the CLEAR, or all of it read
++ * back already) or when the GPU has it; 0 = not measured, the walker answers "visible" as before. */
++static int ld_zq_report(int main_mem, u32 off)
++{
++    if (ld_zq_mode() == 0 || !g.ready) return 0;
++    zq.st_reports++; zq.n_reports_total++;
++    if (ld_zq_seq())
++        fprintf(stderr, "[zseq] f%u R off 0x%X %s epoch %u: %u counts waiting, %llu read%s\n", g_ld_frames, off, main_mem ? "main" : "local",
++                zq.epoch, (unsigned)zq.epoch_n, (unsigned long long)zq.epoch_sum, zq.epoch_unsure ? " (not measurable)" : "");
++    if (zq.mode == 3) { zq.st_unsure++; return 0; }     /* counting only: the walker answers as it always did */
++    /* (the modes in which another thread shares the command list, rsx_live_draw_method) */
++    if (g_ld_movie_mode || g_ld_debug_layer_enabled || ld_movie_composite_ui_enabled()) { zq.st_unsure++; return 0; }
++    ld_zq_end_open();
++    ld_zq_poll();
++    if (zq.epoch_unsure) return ld_zq_unsure(main_mem, off);
++    if (!zq.epoch_n) { zq.st_now++; ld_zq_store(main_mem, off, zq.epoch_sum); return 1; }
++    u32 r = 0;
++    while (r < LD_ZQ_REPORTS && zq.rep[r].used) r++;
++    if (r == LD_ZQ_REPORTS) return ld_zq_unsure(main_mem, off);
++    ld_zq_rep_t* p = &zq.rep[r];
++    p->used = 1; p->main_mem = (u8)(main_mem != 0); p->off = off; p->sum = zq.epoch_sum; p->n = zq.epoch_n;
++    memcpy(p->slot, zq.epoch_slot, sizeof p->slot);
++    zq.n_rep++;
++    if (r >= zq.rep_hi) zq.rep_hi = r + 1u;
++    zq.st_later++;
++    return 1;
++}
++/* The host's loop, after every FIFO pass (the thread that draws). A report that waits for its count gets it with
++ * the next submit - but only commands bring a submit, and a title may send none until it has the count: Gran
++ * Turismo 6 draws a car into the garage scene inside a query, asks, and waits (test drive z1: the game stood for
++ * good at the first such report, the drawing thread waiting for commands). So:
++ *  - counts whose submit is with the GPU already (the frame's present took them along) are read here as soon as
++ *    the GPU has finished, without waiting - test drive z2, first version: one wait for the GPU a frame in a race,
++ *    because the title's own pause after a frame looked like waiting;
++ *  - when reports wait for queries of the list that is still open and nothing has come for 8 ms - no group, no
++ *    clear, no report, no frame; longer than the pauses inside a frame - the list goes out now and is waited for.
++ * While commands keep coming nothing is done here: the counts arrive with the ordinary submits. */
++void rsx_live_draw_reports_tick(void)
++{
++    if (!zq.n_rep) { zq.idle_since = 0; return; }
++    if (!g.ready || g_ld_movie_mode || g_ld_debug_layer_enabled || ld_movie_composite_ui_enabled()) return;
++    if (zq.n_resolved) { ld_zq_poll(); if (!zq.n_rep) { zq.idle_since = 0; return; } }
++    if (!zq.n_ended) { zq.idle_since = 0; return; }     /* all that is asked for is with the GPU: the poll brings it */
++    const u64 act = (u64)g_ld_stats.groups_seen + (u64)g_ld_stats.clears + zq.n_reports_total + ((u64)g_ld_frames << 32);
++    static LONGLONG freq;
++    LARGE_INTEGER now; QueryPerformanceCounter(&now);
++    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
++    if (!zq.idle_since || act != zq.idle_act) { zq.idle_act = act; zq.idle_since = now.QuadPart; return; }
++    if ((now.QuadPart - zq.idle_since) * 1000 < 8 * freq) return;
++    zq.idle_since = 0;
++    zq.st_idle++;
++    ld_flush(LD_FLUSH_READBACK);
++    ld_zq_poll();
++}
++
+ void rsx_live_draw_method(u32 method, u32 arg)
+ {
+     /* Bounded ingress trace for the a010 live-vs-capture comparison.  Keep the
+@@ -17072,6 +17525,69 @@ void rsx_live_draw_present(u32 buffer_id)
+                 scanout_copy.width, scanout_copy.height, scanout_copy.clear_destination);
+     }
+ 
++    /* A scanout of another size than the window, stretched over it [GT6 0058] (rsx_live_draw_present_stretch, the
++     * host's choice). The console's video output scales such a buffer to the screen: Gran Turismo 6's 1080p mode
++     * renders 1440x1080 (resolution 11) for a 16:9 picture. Copied as it is, the picture stood in the left three
++     * quarters of a 1920x1080 window. One triangle with the scaled-blit pipeline, linear filter. */
++    ID3D12PipelineState* stretch_pso = NULL;
++    D3D12_GPU_DESCRIPTOR_HANDLE stretch_table = {0};
++    { static int env = -2;
++      if (env == -2) { const char* e = getenv("LD_PRESENT_STRETCH"); env = e ? (*e != '0') : -1; }
++      const int want = env >= 0 ? env : rsx_live_draw_present_stretch;
++      if (want && scanout && scanout->width && scanout->height &&
++          (scanout->width != g.width || scanout->height != g.height) &&
++          scanout->width <= presented_surface->w && scanout->height <= presented_surface->h &&
++          (stretch_pso = ld_scaled_blit_pso(DXGI_FORMAT_R8G8B8A8_UNORM)) != NULL) {
++          u32 slots[SRV_TABLE_SIZE];
++          for (u32 i = 0; i < SRV_TABLE_SIZE; i++) slots[i] = SRV_WHITE;
++          slots[0] = SRV_SURFACE_BASE + target;
++          stretch_table = srv_table(slots);
++          if (!stretch_table.ptr) stretch_pso = NULL;
++      } }
++    if (stretch_pso) {
++        static unsigned told;
++        if (PS3_LOG_FIRST(told, 2u))
++            fprintf(stderr, "[scanout-stretch] %ux%u of surface %ux%u over the %ux%u window\n", scanout->width, scanout->height,
++                    presented_surface->w, presented_surface->h, g.width, g.height);
++        ld_ls_invalidate();   /* sets list state the draw path caches */
++        D3D12_RESOURCE_BARRIER sb[2] = {0};
++        sb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        sb[0].Transition.pResource = srcimg;
++        sb[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        sb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        sb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        sb[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        sb[1].Transition.pResource = bb;
++        sb[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        sb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++        sb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        g.list->lpVtbl->ResourceBarrier(g.list, 2, sb);
++        D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(bbi);
++        g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
++        ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
++        g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
++        g.list->lpVtbl->SetPipelineState(g.list, stretch_pso);
++        g.list->lpVtbl->SetGraphicsRootSignature(g.list, g_sblit_rs);
++        const float r[4] = {0.0f, 0.0f, (float)scanout->width / (float)presented_surface->w,
++                            (float)scanout->height / (float)presented_surface->h};
++        g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, r, 0);
++        g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, stretch_table);
++        D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)g.width, (float)g.height, 0.0f, 1.0f};
++        D3D12_RECT sc = {0, 0, (LONG)g.width, (LONG)g.height};
++        g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
++        g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
++        g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
++        sb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        sb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &sb[0]);
++        /* (the back buffer is a render target now: the overlay draws into it as it is) */
++        if (rsx_live_draw_overlay_on && rsx_live_draw_overlay_draw && rsx_live_draw_overlay_on())
++            rsx_live_draw_overlay_draw(g.dev, g.queue, g.list, bb, (size_t)rtv_handle(bbi).ptr, g.width, g.height);
++        sb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        sb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &sb[1]);
++    } else {
+     /* A smaller scanout must not leave pixels from the previous backbuffer.
+      * GT6's usual 1440x1080 allocation contains a full 1280x720 scanout, so
+      * that path needs only the region copy and no extra clear. */
+@@ -17119,6 +17635,7 @@ void rsx_live_draw_present(u32 buffer_id)
+         bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+         g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar[1]);
+     }
++    }   /* (not stretched) */
+ 
+     ld_flush(LD_FLUSH_PRESENT);
+     {
+@@ -18237,6 +18754,8 @@ void rsx_live_draw_shutdown(void)
+         if (g.zdepths[i].snapshot)
+             g.zdepths[i].snapshot->lpVtbl->Release(
+                 g.zdepths[i].snapshot);
++        for (u32 k = 0; k < 2; k++)
++            if (g.zdepths[i].win[k].tex) g.zdepths[i].win[k].tex->lpVtbl->Release(g.zdepths[i].win[k].tex);
+     }
+     if (g.movie_upload) g.movie_upload->lpVtbl->Release(g.movie_upload);
+     if (g.movie_overlay_readback) g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index cb7a5ab..0506512 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -87,6 +87,11 @@ void rsx_live_draw_method(u32 method, u32 arg);
+  * pays no extra synchronization cost. */
+ void rsx_live_draw_set_fifo_position(u32 get, u32 put);
+ 
++/* ZPASS pixel counts [GT6 0056]: call from the host's loop after every FIFO pass, on the thread that draws. When
++ * reports wait for their counts and the title has sent nothing for 2 ms, the command list is submitted and waited
++ * for and the counts are written - a title may send no further command until it has them. Nothing otherwise. */
++void rsx_live_draw_reports_tick(void);
++
+ /* Record an NV308A inline-to-memory write that overlaps a registered color
+  * surface.  Guest memory changes are deliberately tracked separately from
+  * actual D3D render-target mutations. */
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 04dda0c..91b1c8a 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2364,6 +2364,22 @@ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+         for (unsigned i = 0; match && i < o->code_count; ++i)
+             match = !memcmp(ctx->ls + o->code[i].lsa, o->code[i].bytes, o->code[i].size);
+         *state = match ? SPU_OVERLAY_VERIFIED : SPU_OVERLAY_REJECTED;
++        /* A rejected load runs in the interpreter, at a fraction of the speed, and nothing said so [GT6 0057]: Gran
++         * Turismo 6's largest job module was rejected at every load because its verified bytes reached into data the
++         * job writes. Say it, with the first byte that differs (the first 16 times). */
++        if (!match && o->code && o->code_count) {
++            static int said = 0;
++            if (said < 16) {
++                said++;
++                uint32_t at = 0;
++                for (unsigned i = 0; i < o->code_count && !at; ++i)
++                    for (uint32_t b = 0; b < o->code[i].size; ++b)
++                        if (ctx->ls[o->code[i].lsa + b] != o->code[i].bytes[b]) { at = o->code[i].lsa + b; break; }
++                fprintf(stderr, "[spu-ovl] image %d at LS 0x%05X REJECTED: the loaded bytes differ from the lifted code, first at "
++                                "LS 0x%05X - this load runs interpreted\n",
++                        ctx->resident_code[slot].image_id, ctx->resident_code[slot].lsa, at);
++            }
++        }
+         spu_overlay_rebuild_code_pages(ctx);
+     }
+     return *state == SPU_OVERLAY_VERIFIED;
+diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
+index 60b52f1..64141c5 100644
+--- a/tools/lift_jobmods.py
++++ b/tools/lift_jobmods.py
+@@ -63,6 +63,11 @@ BASE   = 0x4000
+ CODE_END = {
+     "jobmod_ef33c6c99dc7_e0A40": 0xAE68,   # real code ends at br 0xA554 @ 0xAE60
+     "jobmod_6943e26934ea_e0A20": 0xAE48,   # real code ends at br 0xA534 @ 0xAE40
++    # Gran Turismo 6 (BCES01893 1.22) [GT6 0057]: the same shape - strings ("error ::") and the job's own, WRITTEN,
++    # data behind the code. With the data inside the verified bytes the runtime rejected every load and the module ran
++    # interpreted (the largest job of the game: a night race and the replay after it at 4..10 fps).
++    "jobmod_db01b31036e5_e0030": 0x1A1F8,  # last function 0x1A1E0 (il, stqa, stqa, bi $lr), two words of padding
++    "jobmod_3558823860af_e0030": 0xD6E0,   # last bi $lr at 0xD6DC
+ }
+ 
+ # Extra function entries, in LS addresses, applied to every module that

@@ -1,0 +1,6 @@
+# Files are stored byte for byte as they are on disk: the tree mixes LF and CRLF on purpose (generated code and its
+# patches are CRLF, the engine's are LF), and a conversion would make every patch fail to apply.
+* -text
+*.ico binary
+*.png binary
+*.bin binary

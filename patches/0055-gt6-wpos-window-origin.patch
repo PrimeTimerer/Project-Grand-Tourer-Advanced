@@ -1,0 +1,30 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index c65ab09..e86c92e 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -10328,6 +10328,25 @@ static int ld_upload_pixel_constants(u32* out_offset)
+     memcpy(
+         destination + value_slots * 16u,
+         &g.fp_alpha_ref, sizeof(g.fp_alpha_ref));
++    /* fp_alpha.y / .z: the window convention a fragment program's WPOS is in [GT6 0059] - SET_SHADER_WINDOW (0x1D88):
++     * the height in bits 0-11, the origin (1 = BOTTOM) in 12-15, the pixel centres (1 = INTEGER) in 16-19; _rsx_wpos
++     * in the generated shader turns the host's top-left position into it (rsx_fp_decompiler.c). The buffered draw
++     * engine has filled these since its WPOS work; this path left them 0, so every program here got the host's y.
++     * Gran Turismo 6 draws with the origin at the BOTTOM, and its glass - the covers of the headlights, the windows,
++     * panes beside the track - reads the picture behind it out of the colour target it is drawing into, at
++     * WPOS x (1/W, -1/H) with the texture set to repeat in t: with the real WPOS that is the pixel's own row, with
++     * the host's y it is the row mirrored about the middle of the screen. So a headlight showed the sky (owner,
++     * 2026-11-20: "헤드라이트가 제대로 보이지 않고 마냥 거울처럼 반사만"), and panes high on the screen showed pieces
++     * of the road. LD_WPOS_WINDOW=0 = as before. */
++    { static int on = -1;
++      if (on < 0) { const char* e = getenv("LD_WPOS_WINDOW"); on = (e && *e == '0') ? 0 : 1; }
++      if (on) {
++          const u32 win = rsx_dsp_reg(&g.rsx, 0x1D88);
++          float window[2];
++          window[0] = ((win >> 12) & 0xFu) ? (float)(win & 0xFFFu) : 0.0f;
++          window[1] = ((win >> 16) & 0xFu) ? -0.5f : 0.0f;
++          memcpy(destination + value_slots * 16u + sizeof(g.fp_alpha_ref), window, sizeof(window));
++      } }
+     g.ps_cb_used += allocation_bytes;
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.ps_constant_allocations++;

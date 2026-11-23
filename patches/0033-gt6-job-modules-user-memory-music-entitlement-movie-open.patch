@@ -1,0 +1,514 @@
+diff --git a/libs/codec/cellDmux.c b/libs/codec/cellDmux.c
+index b055385..8f917c9 100644
+--- a/libs/codec/cellDmux.c
++++ b/libs/codec/cellDmux.c
+@@ -288,3 +288,40 @@ s32 cellDmuxFlushEs(CellDmuxEsHandle esHandle)
+ 
+     return CELL_OK;
+ }
++
++/* ---------------------------------------------------------------------------
++ * The variants a title on a SPURS-driven demuxer uses.
++ * cellDmuxQueryAttr(type, attr): CellDmuxAttr { memSize, demuxerVerUpper, demuxerVerLower }.
++ * cellDmuxOpenEx(type, resourceEx, cb, handle): the callback comes as a pointer to
++ * CellDmuxCb { cbMsgFunc, cbArg } instead of two arguments; the resource (SPURS
++ * instance, priorities) is not used here.
++ * -----------------------------------------------------------------------*/
++s32 cellDmuxQueryAttr(const CellDmuxType* type, void* attr)
++{
++    if (!type || !attr)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    vm_write32(GUEST_EA(attr) + 0, 0x10000);       /* memSize */
++    vm_write32(GUEST_EA(attr) + 4, 0x00280000);    /* demuxer version, upper */
++    vm_write32(GUEST_EA(attr) + 8, 0x00000000);    /* ... lower */
++    return CELL_OK;
++}
++
++s32 cellDmuxQueryAttr2(const CellDmuxType* type, void* attr)
++{
++    return cellDmuxQueryAttr(type, attr);
++}
++
++s32 cellDmuxOpenEx(const CellDmuxType* type, const void* resourceEx, const void* cb, CellDmuxHandle* handle)
++{
++    (void)resourceEx;
++    if (!cb)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    const u32 func = vm_read32(GUEST_EA(cb) + 0);
++    const u32 arg  = vm_read32(GUEST_EA(cb) + 4);
++    return cellDmuxOpen(type, NULL, (CellDmuxCbMsg)(uintptr_t)func, (void*)(uintptr_t)arg, handle);
++}
++
++s32 cellDmuxOpen2(const CellDmuxType* type, const void* resource2, const void* cb, CellDmuxHandle* handle)
++{
++    return cellDmuxOpenEx(type, resource2, cb, handle);
++}
+diff --git a/libs/codec/cellPamf.c b/libs/codec/cellPamf.c
+index 1b6275d..c0cd62e 100644
+--- a/libs/codec/cellPamf.c
++++ b/libs/codec/cellPamf.c
+@@ -504,3 +504,55 @@ s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep)
+     vm_write32((u32)(uintptr_t)ep + 4, be32(epData + 4));
+     return CELL_OK;
+ }
++
++/* ---------------------------------------------------------------------------
++ * Whole-file helpers a title calls before it has a reader: header size, where the
++ * stream data lies, and a check that the buffer holds a PAMF header at all.
++ * In the header (big-endian) +0x08 is the offset of the stream data and +0x0C its
++ * size, both in 2048-byte sectors.
++ * Gran Turismo 6's movie player calls all three first; unregistered they answered
++ * CELL_OK with the outputs untouched, and it went on with whatever was on its stack.
++ * -----------------------------------------------------------------------*/
++static const u8* pamf_header(void* pAddr)
++{
++    if (!pAddr) return NULL;
++    const u8* base = (const u8*)GUEST_PTR(pAddr, void*);
++    return be32(base + PAMF_OFF_MAGIC) == CELL_PAMF_MAGIC ? base : NULL;
++}
++
++s32 cellPamfVerify(void* pAddr, u64 fileSize)
++{
++    (void)fileSize;
++    return pamf_header(pAddr) ? CELL_OK : (s32)CELL_PAMF_ERROR_INVALID_HEADER;
++}
++
++s32 cellPamfGetHeaderSize(void* pAddr, u64 fileSize, void* pSize)
++{
++    (void)fileSize;
++    const u8* base = pamf_header(pAddr);
++    if (!base || !pSize) return (s32)CELL_PAMF_ERROR_INVALID_HEADER;
++    vm_write64((u32)(uintptr_t)pSize, (u64)be32(base + PAMF_OFF_DATA_OFFSET) * 0x800u);
++    return CELL_OK;
++}
++
++s32 cellPamfGetHeaderSize2(void* pAddr, u64 fileSize, u32 attribute, void* pSize)
++{
++    (void)attribute;
++    return cellPamfGetHeaderSize(pAddr, fileSize, pSize);
++}
++
++s32 cellPamfGetStreamOffsetAndSize(void* pAddr, u64 fileSize, void* pOffset, void* pSize)
++{
++    (void)fileSize;
++    const u8* base = pamf_header(pAddr);
++    if (!base || !pOffset || !pSize) return (s32)CELL_PAMF_ERROR_INVALID_HEADER;
++    vm_write64((u32)(uintptr_t)pOffset, (u64)be32(base + PAMF_OFF_DATA_OFFSET) * 0x800u);
++    vm_write64((u32)(uintptr_t)pSize,   (u64)be32(base + PAMF_OFF_DATA_SIZE) * 0x800u);
++    return CELL_OK;
++}
++
++s32 cellPamfGetStreamOffsetAndSize2(void* pAddr, u64 fileSize, u32 attribute, void* pOffset, void* pSize)
++{
++    (void)attribute;
++    return cellPamfGetStreamOffsetAndSize(pAddr, fileSize, pOffset, pSize);
++}
+diff --git a/libs/misc/cellMusic.c b/libs/misc/cellMusic.c
+new file mode 100644
+index 0000000..991e85d
+--- /dev/null
++++ b/libs/misc/cellMusic.c
+@@ -0,0 +1,121 @@
++/*
++ * ps3recomp - cellMusicUtility (Music Utility 2) HLE implementation
++ *
++ * Background music from the system's music player while the title runs. There is no such player on the host, so
++ * the answers are those of a console whose user has chosen no music: initialisation succeeds, nothing is selected,
++ * nothing plays. What matters is HOW the answers arrive: every request reports its result through the title's
++ * callback, called from cellSysutilCheckCallback like the system's own, and a title waits for it.
++ *
++ * Gran Turismo 6 calls cellMusicInitialize2 during boot and does not open its main menu before the
++ * INITIALIZE_RESULT event has come. With the functions unregistered the call "succeeded" and the event never
++ * came: the game sat on its loading screen for good.
++ */
++
++#include "ps3emu/ps3types.h"
++#include "ps3emu/error_codes.h"
++#include <stdint.h>
++#include <stdio.h>
++#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
++
++/* cellSysutil.c: call a guest function at the title's next cellSysutilCheckCallback. */
++s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
++
++/* Events handed to the callback: void cb(u32 event, void* param, void* userData), param = the result. */
++#define CELL_MUSIC2_EVENT_STATUS_NOTIFICATION            0
++#define CELL_MUSIC2_EVENT_INITIALIZE_RESULT              1
++#define CELL_MUSIC2_EVENT_FINALIZE_RESULT                2
++#define CELL_MUSIC2_EVENT_SELECT_CONTENTS_RESULT         3
++#define CELL_MUSIC2_EVENT_SET_PLAYBACK_COMMAND_RESULT    4
++#define CELL_MUSIC2_EVENT_SET_VOLUME_RESULT              5
++#define CELL_MUSIC2_EVENT_SET_SELECTION_CONTEXT_RESULT   6
++
++#define CELL_MUSIC2_CANCELED                 1
++#define CELL_MUSIC2_ERROR_PARAM              0x8002C101u
++#define CELL_MUSIC2_ERROR_NO_ACTIVE_CONTENT  0x8002C103u
++#define CELL_MUSIC2_ERROR_INVALID_CONTEXT    0x8002C105u
++#define CELL_MUSIC2_ERROR_GENERIC            0x8002C1FFu
++
++#define CELL_MUSIC2_PB_STATUS_STOP           0
++#define CELL_MUSIC2_PB_CMD_STOP              0
++#define CELL_MUSIC2_PB_CMD_PAUSE             2
++
++static u32 s_music_cb;          /* the title's callback (guest function descriptor) */
++static u32 s_music_userdata;
++
++static void music_event(u32 event, u32 result)
++{
++    const u64 args[8] = { event, result, s_music_userdata, 0, 0, 0, 0, 0 };
++    if (s_music_cb) cellSysutilQueueGuestCallbackArgs(s_music_cb, args);
++}
++
++s32 cellMusicInitialize2(s32 mode, s32 spuPriority, u32 func, u32 userData)
++{
++    printf("[cellMusic] Initialize2(mode=%d, spuPriority=%d, func=0x%08X)\n", mode, spuPriority, func);
++    if (!func)
++        return (s32)CELL_MUSIC2_ERROR_PARAM;
++    s_music_cb = func;
++    s_music_userdata = userData;
++    music_event(CELL_MUSIC2_EVENT_INITIALIZE_RESULT, CELL_OK);
++    return CELL_OK;
++}
++
++s32 cellMusicInitialize2SystemWorkload(s32 mode, u32 func, u32 userData, u32 spurs, u32 priority, u32 attr)
++{
++    (void)spurs; (void)priority; (void)attr;
++    return cellMusicInitialize2(mode, 0, func, userData);
++}
++
++s32 cellMusicFinalize2(void)
++{
++    printf("[cellMusic] Finalize2()\n");
++    music_event(CELL_MUSIC2_EVENT_FINALIZE_RESULT, CELL_OK);
++    s_music_cb = 0;
++    return CELL_OK;
++}
++
++/* Nothing has been selected in the music player. */
++s32 cellMusicGetSelectionContext2(u32 context)
++{
++    (void)context;
++    return (s32)CELL_MUSIC2_ERROR_NO_ACTIVE_CONTENT;
++}
++
++/* A context the title kept from an earlier session names music this machine does not have. */
++s32 cellMusicSetSelectionContext2(u32 context)
++{
++    if (!context)
++        return (s32)CELL_MUSIC2_ERROR_PARAM;
++    music_event(CELL_MUSIC2_EVENT_SET_SELECTION_CONTEXT_RESULT, CELL_MUSIC2_ERROR_INVALID_CONTEXT);
++    return CELL_OK;
++}
++
++/* (float level): nothing plays, so the level is not kept. */
++s32 cellMusicSetVolume2(void)
++{
++    music_event(CELL_MUSIC2_EVENT_SET_VOLUME_RESULT, CELL_OK);
++    return CELL_OK;
++}
++
++s32 cellMusicGetPlaybackStatus2(u32 status)
++{
++    if (!status)
++        return (s32)CELL_MUSIC2_ERROR_PARAM;
++    vm_write32(status, CELL_MUSIC2_PB_STATUS_STOP);
++    return CELL_OK;
++}
++
++s32 cellMusicSetPlaybackCommand2(s32 command, u32 param)
++{
++    (void)param;
++    music_event(CELL_MUSIC2_EVENT_SET_PLAYBACK_COMMAND_RESULT,
++                command == CELL_MUSIC2_PB_CMD_STOP || command == CELL_MUSIC2_PB_CMD_PAUSE
++                    ? (u32)CELL_OK : CELL_MUSIC2_ERROR_NO_ACTIVE_CONTENT);
++    return CELL_OK;
++}
++
++/* The system's selection screen: closed without a choice. */
++s32 cellMusicSelectContents2(void)
++{
++    music_event(CELL_MUSIC2_EVENT_SELECT_CONTENTS_RESULT, CELL_MUSIC2_CANCELED);
++    return CELL_OK;
++}
+diff --git a/libs/network/sceNp.c b/libs/network/sceNp.c
+index 125835bc..0efa871 100644
+--- a/libs/network/sceNp.c
++++ b/libs/network/sceNp.c
+@@ -245,6 +245,20 @@ s32 sceNpManagerGetStatus(s32* status)
+     return CELL_OK;
+ }
+ 
++/* sceNpManagerGetEntitlementById(const char* entId, SceNpEntitlement* ent): the account's entitlements (bought or
++ * redeemed add-on content) come with its PSN ticket, and there is none here. Unregistered, the dispatcher answered
++ * CELL_OK with `ent` untouched, i.e. "this account owns it": Gran Turismo 6 asks about each of its bonus packs at
++ * boot and then handed out all of them ("Claim a Gift", 1,600,000 credits in three dialogs) on every start. */
++s32 sceNpManagerGetEntitlementById(const char* entId, void* ent)
++{
++    (void)ent;
++    if (!s_np_initialized)
++        return SCE_NP_ERROR_NOT_INITIALIZED;
++    if (!entId)
++        return SCE_NP_ERROR_INVALID_ARGUMENT;
++    return SCE_NP_ERROR_ID_NOT_FOUND;
++}
++
+ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
+ {
+     if (!s_np_initialized)
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index ed1f1de..048260d 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3372,6 +3372,7 @@ extern "C" int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size,
+ extern "C" int64_t ps3_mmapper_enable_page_fault_notification(uint32_t start, uint32_t queue_id);
+ extern "C" int64_t ps3_mmapper_recover_page_fault(uint64_t tid);
+ extern "C" int64_t ps3_mmapper_block_map(uint32_t addr, uint32_t id);
++extern "C" void ps3_user_memory_size(uint32_t* total, uint32_t* available);
+ 
+ /* lv2 syscall dispatch: r11 = syscall number, args in r3.. (PPC ABI).
+  * A few syscalls the CRT needs at boot are handled inline (boot-tuned); the
+@@ -3471,8 +3472,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+     case 352: {   /* sys_memory_get_user_memory_size(sys_memory_info_t* info)
+                    * info = { u32 total_user_memory; u32 available_user_memory } */
+         uint32_t info = (uint32_t)ctx->gpr[3];
+-        if (info) { vm_write32(info + 0, 0x10000000u);   /* 256 MB total */
+-                    vm_write32(info + 4, 0x0C000000u); } /* 192 MB available */
++        if (info) {   /* a retail console's 213 MB total, 208 MB of it available at start; what the title has taken
++                       * since comes off (sys_memory.c: mapper blocks and sys_memory_allocate) */
++            uint32_t total = 0, avail = 0;
++            ps3_user_memory_size(&total, &avail);
++            vm_write32(info + 0, total);
++            vm_write32(info + 4, avail);
++        }
+         ctx->gpr[3] = 0;
+         return;
+     }
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 9d76e2b..c97fc26 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -793,6 +793,12 @@ static void sys_mmapper_allocate_memory(ppu_context* ctx)
+     if (getenv("PS3_MEMTRACE"))
+         fprintf(stderr, "[mmapper] allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+                 size, (unsigned long long)ctx->gpr[4], mem_id_ptr, id);
++    if (!id) {                                  /* the user memory pool is used up (sys_memory.c) */
++        static unsigned n;
++        if (n++ < 4) fprintf(stderr, "[mmapper] allocate_memory(size=0x%X) -> ENOMEM (user memory used up)\n", size);
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004;
++        return;
++    }
+     if (mem_id_ptr) vm_write32(mem_id_ptr, id);
+     ctx->gpr[3] = 0;
+ }
+@@ -807,6 +813,7 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
+     if (getenv("PS3_MEMTRACE"))
+         fprintf(stderr, "[mmapper] alloc_from_container(size=0x%X cid=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+                 size, (uint32_t)ctx->gpr[4], (unsigned long long)ctx->gpr[5], mem_id_ptr, id);
++    if (!id) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004; return; }   /* ENOMEM */
+     if (mem_id_ptr) vm_write32(mem_id_ptr, id);
+     ctx->gpr[3] = 0;
+ }
+diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
+index c43cd49..9ce9e25 100644
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -617,9 +617,70 @@ static int mm_pages_ready(void)                         /* the lock is held */
+     return s_mm_page_id != NULL;
+ }
+ 
++/* User memory. On the console the blocks of sys_mmapper_allocate_memory come out of the pool that
++ * sys_memory_get_user_memory_size reports, and allocating past it fails with ENOMEM. A title that pages itself
++ * lives by both: Gran Turismo 6 fills its caches until the system says little is left, and its pager gives
++ * pages back (to its page file) when an allocation fails. Told "192 MB available" no matter what it had taken,
++ * and never refused, it took 431 MB, ran its 256 MB heap window full and then its pager went round every page
++ * for good, trying to free memory that by that number never became free.
++ *
++ * The total matters as well. A retail console gives a game 213 MB (0x0D500000) and Gran Turismo 6 compares with
++ * exactly that: more means a development machine with extra memory, and it lays its heap out for one
++ * (func_00B0D088: total > 0x0D500000 and a heap window over 256 MB). The 256 MB reported before put it there.
++ * The pool the title's own allocations come out of is 208 MB of those 213 (the rest stands for its stacks; the
++ * program image is not charged, and with it charged -- a pool of 170 MB -- the game's heap ran out 19 seconds
++ * into its boot: 114 MB of heap and 55 MB of paged memory). PS3_USER_MEMORY_MB=<n> sets another pool; above
++ * 208 the total grows with it (pool + 25 MB: 380 gives the 405 MB of a debug console).
++ *
++ * What the console cannot do and a PC can: go on past the pool. Gran Turismo 6 loads 114 MB into its heap and
++ * 55 MB into its paged memory in the first 19 seconds and its heap then asks for more; refused, it sleeps and
++ * asks again, for good, with its heap locked (nothing here gives memory back at that point). So by default an
++ * allocation is never refused, and the available size is reported truthfully down to a floor of 4 MB and no
++ * lower: the title sees "nearly full" -- its pager stops growing, its caches stay small -- and still gets the
++ * megabyte it needs. PS3_USER_MEMORY_STRICT=1 refuses past the pool and reports down to 0, as the console does. */
++#define MM_TOTAL_RETAIL 0x0D500000u
++#define MM_POOL_RETAIL  (208u << 20)
++#define MM_AVAIL_FLOOR  (4u << 20)
++static uint64_t s_mm_bytes;                 /* sizes of the blocks that exist */
++static int mm_strict(void)
++{
++    static int strict = -1;
++    if (strict < 0) { const char* e = getenv("PS3_USER_MEMORY_STRICT"); strict = e && *e == '1'; }
++    return strict;
++}
++static uint64_t mm_pool(void)
++{
++    static uint64_t pool;
++    if (!pool) {
++        const char* e = getenv("PS3_USER_MEMORY_MB");
++        const unsigned long mb = e ? strtoul(e, NULL, 10) : 0;
++        pool = mb ? (uint64_t)mb << 20 : MM_POOL_RETAIL;
++    }
++    return pool;
++}
++
++/* sys_memory_get_user_memory_size: { total, available }. */
++void ps3_user_memory_size(uint32_t* total, uint32_t* available)
++{
++    const uint64_t pool = mm_pool();
++    AcquireSRWLockShared(&s_mm_lock);
++    const uint64_t used = s_mm_bytes + s_total_allocated;
++    ReleaseSRWLockShared(&s_mm_lock);
++    const uint64_t tot = pool + (25u << 20);
++    *total = pool <= MM_POOL_RETAIL ? MM_TOTAL_RETAIL : (uint32_t)(tot > 0xFFF00000ull ? 0xFFF00000ull : tot);
++    uint64_t avail = used >= pool ? 0 : pool - used;
++    if (!mm_strict() && avail < MM_AVAIL_FLOOR) avail = MM_AVAIL_FLOOR;
++    *available = (uint32_t)avail;
++}
++
+ uint32_t ps3_mmapper_block_new(uint32_t size)
+ {
++    const uint32_t rounded = (size + MM_PAGE - 1u) & ~(MM_PAGE - 1u);
+     AcquireSRWLockExclusive(&s_mm_lock);
++    if (!rounded || (mm_strict() && s_mm_bytes + s_total_allocated + rounded > mm_pool())) {
++        ReleaseSRWLockExclusive(&s_mm_lock);
++        return 0;                                           /* ENOMEM */
++    }
+     uint32_t i = s_mm_hint;
+     while (i < s_mm_cap && s_mm_blocks[i].used) i++;
+     if (i >= s_mm_cap) {
+@@ -631,7 +692,8 @@ uint32_t ps3_mmapper_block_new(uint32_t size)
+     }
+     memset(&s_mm_blocks[i], 0, sizeof(mm_block));
+     s_mm_blocks[i].used = 1;
+-    s_mm_blocks[i].size = (size + MM_PAGE - 1u) & ~(MM_PAGE - 1u);
++    s_mm_blocks[i].size = rounded;
++    s_mm_bytes += rounded;
+     s_mm_hint = i + 1u;
+     ReleaseSRWLockExclusive(&s_mm_lock);
+     return MM_ID_BASE + i;
+@@ -711,6 +773,7 @@ int64_t ps3_mmapper_block_free(uint32_t id)
+     else if (b->mapped_at)  rc = (int64_t)(int32_t)CELL_EBUSY;
+     else {
+         free(b->backing);
++        s_mm_bytes -= b->size;
+         memset(b, 0, sizeof *b);
+         if (id - MM_ID_BASE < s_mm_hint) s_mm_hint = id - MM_ID_BASE;
+     }
+@@ -801,6 +864,11 @@ int64_t ps3_mmapper_recover_page_fault(uint64_t tid)
+     return rc;
+ }
+ #else   /* not implemented off Windows: blocks are ids over memory that is always there, as before */
++void ps3_user_memory_size(uint32_t* total, uint32_t* available)
++{
++    *total = 0x0D500000u;                                   /* a retail console's 213 MB, 208 MB of it free at start */
++    *available = s_total_allocated >= 0x0D000000u ? 0 : 0x0D000000u - s_total_allocated;
++}
+ static uint32_t s_mm_sizes[4096], s_mm_next = 0x1000u;
+ uint32_t ps3_mmapper_block_new(uint32_t size) { uint32_t id = s_mm_next++; if (id - 0x1000u < 4096u) s_mm_sizes[id - 0x1000u] = size; return id; }
+ uint32_t ps3_mmapper_block_size(uint32_t id) { return id - 0x1000u < 4096u ? s_mm_sizes[id - 0x1000u] : 0; }
+diff --git a/tools/lift_jobmods.py b/tools/lift_jobmods.py
+index f878379..60b52f1 100644
+--- a/tools/lift_jobmods.py
++++ b/tools/lift_jobmods.py
+@@ -200,6 +200,19 @@ def reachable(raw, entries, hi, base=BASE):
+     return seen
+ 
+ 
++# --entry-hints FILE: {"<module name>": [LS address, ...]} -- function entries a
++# module was seen to be entered at when it ran (addresses reached only through
++# indirect branches, which no static scan of the module finds). A title's port
++# keeps the file in its own tree; it is input like the ELF, the tool holds none.
++ENTRY_HINTS = {}
++
++
++def entry_hints(name, raw, base=BASE):
++    """The hinted entries of one module that lie inside its image."""
++    lo, hi = base + 0x30, base + len(raw)
++    return sorted({a for a in ENTRY_HINTS.get(name, ()) if lo <= a < hi and not a & 3})
++
++
+ def module_code_end(raw, name, base=BASE):
+     """End of a module's code: one past the highest instruction reachable from
+     its seeded entries, never past its CODE_END entry. The entry, +0x30 and
+@@ -211,6 +224,7 @@ def module_code_end(raw, name, base=BASE):
+     hi = min(base + len(raw), CODE_END.get(name, base + len(raw)))
+     seeds = {base + struct.unpack_from(">I", raw, 0x10)[0], base + 0x30}
+     seeds |= {int(a, 0) for a in EXTRA_FUNCS}
++    seeds |= set(entry_hints(name, raw, base))
+     derived = manual_link_sites(raw, base) + switch_table_sites(raw, base)
+     while True:
+         seen = reachable(raw, seeds, hi, base)
+@@ -269,6 +283,7 @@ def lift_module(raw, name, outdir, tmp_elf, merge_chunks, code_end=None,
+     if merge_chunks:
+         cmd += ["--merge-chunks"]
+     inside = module_seeds(raw, base)
++    inside += [hex(a) for a in entry_hints(name, raw, base)]
+     if code_end:
+         inside = [a for a in inside if int(a, 0) < code_end]
+     if inside:
+@@ -308,19 +323,25 @@ def elf_load_segments(elf):
+     return out
+ 
+ 
+-def find_engine_modules(elf):
++def find_engine_modules(elf, zero_base=False):
+     """Job module images embedded in an engine ELF: a 16-byte aligned header
+     with C0DEC0DE at +0x20 and the load base (0x4000) at +0x28, entry offset
+     at +0x10 and image size at +0x14. Like extract_jobmods.py, the module is
+     the initialised image, imageSize - 32 (the rest is bss), so a module gets
+     the same name, and CODE_END fixup, from either source.
++    zero_base (--engine-zero-base): also take a module whose base field is 0.
++    Gran Turismo 6 ships 51 of its 56 modules that way; they stream into the
++    same job code buffer at LS 0x4000 as the five that name it (the code that
++    ran from each of them was seen at 0x4000-based addresses).
+     Returns [(ea, raw)] sorted by EA."""
++    bases = (BASE, 0) if zero_base else (BASE,)
+     out = []
+     for vaddr, blob in elf_load_segments(elf):
+         at = blob.find(b"\xc0\xde\xc0\xde")
+         while at != -1:
+             h = at - 0x20
+-            if h >= 0 and h % 16 == 0 and struct.unpack_from(">I", blob, h + 0x28)[0] == BASE:
++            if h >= 0 and h % 16 == 0 and struct.unpack_from(">I", blob, h + 0x28)[0] in bases and \
++                    (not zero_base or blob[h] in (0x42, 0x43)):      # zero base: insist on the ila header
+                 entry_off, image = struct.unpack_from(">II", blob, h + 0x10)
+                 size = image - 32
+                 if 0x30 <= entry_off < size and image <= 0x40000 - BASE and h + size <= len(blob):
+@@ -349,9 +370,21 @@ def main():
+                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks "
+                          "between call targets becomes one C function with gotos "
+                          "instead of chunks linked by trampolines.")
++    ap.add_argument("--engine-zero-base", action="store_true",
++                    help="With --engine-elf: also lift modules whose header base field "
++                         "(+0x28) is 0; they are streamed to LS 0x4000 like the others.")
++    ap.add_argument("--entry-hints", default=None, metavar="FILE",
++                    help='JSON {"<module name>": [LS address, ...]}: extra function '
++                         "entries per module (entries seen at run time).")
+     args = ap.parse_args()
+     OUTDIR  = args.out
+     register_c = args.register or os.path.join(OUTDIR, "jobmods_register.c")
++    if args.entry_hints:
++        with open(args.entry_hints) as f:
++            ENTRY_HINTS.update({k: [int(a, 0) if isinstance(a, str) else int(a) for a in v]
++                                for k, v in json.load(f).items()})
++        print(f"  entry hints: {sum(len(v) for v in ENTRY_HINTS.values())} address(es) "
++              f"for {len(ENTRY_HINTS)} module(s)")
+ 
+     if EXTRA_FUNCS:
+         print(f"  extra function entries: {', '.join(EXTRA_FUNCS)}")
+@@ -386,7 +419,7 @@ def lift_engine_elf(args, register_c):
+     """--engine-elf: lift each module found in the ELF once (byte-identical
+     copies at several EAs share one lift) with its code bounded at code_end,
+     and register every EA as a verified streamed region."""
+-    found = find_engine_modules(open(args.engine_elf, "rb").read())
++    found = find_engine_modules(open(args.engine_elf, "rb").read(), args.engine_zero_base)
+     if not found:
+         sys.exit(f"no job modules found in {args.engine_elf}")
+     by_name = {}

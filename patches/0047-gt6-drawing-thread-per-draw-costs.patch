@@ -1,0 +1,386 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 1b18765..b4a457e 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1219,6 +1219,25 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
+         if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
+     spu_lockline_unlock();
+ }
++/* The same for a row that was put together on the host (the scaled blit below). */
++static void gcm_row_store(u32 d, const u8* bytes, u32 n)
++{
++    extern u8* vm_base;
++    rsx_ww_note_write(d, n);
++    const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
++    int reserved = 0;
++    for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
++    if (!reserved) { memcpy(vm_base + d, bytes, n); return; }
++    spu_lockline_lock();
++    memcpy(vm_base + d, bytes, n);
++    for (u32 a = l0; a <= l1; a += 128)
++        if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
++    spu_lockline_unlock();
++}
++/* GCM_FAST_BLIT (g_gcm_fast_blit, default 1; GT6_AB "fast"): a scaled NV3089 blit gathers each destination row on
++ * the host and stores it once, instead of a vm_read32 and a vm_write32 per pixel. Gran Turismo 6 sends about six
++ * scaled 200x48 blits a frame in a race (its drivers' name labels): 58,000 pixels, 0.5 ms of the FIFO thread. */
++int g_gcm_fast_blit = 1;
+ 
+ static void nv3089_blit(void)
+ {
+@@ -1465,6 +1484,34 @@ static void nv3089_blit(void)
+                 gcm_row_copy((u32)da, (u32)sa, n);
+             }
+         }
++    } else if (g_gcm_fast_blit && out_w && out_w <= 4096u && src >= 0x10000u && dst >= 0x10000u) {
++        /* scaled, by row: the source texel of each destination pixel as the loop below finds it (20-bit fixed
++         * point from IMAGE_IN_POINT), the bytes verbatim - the two byte swaps of a read and a write cancel */
++        extern u8* vm_base;
++        static u8 row[4096u * 4u];
++        nv3089_stat(3, (u64)out_w * out_h);
++        u32 xa = 0, xb = out_w;                       /* destination x range inside the clip */
++        if (out_x < cx0) xa = cx0 - out_x;
++        if ((u64)out_x + xb > cx1) xb = cx1 > out_x ? cx1 - out_x : 0;
++        if (xa < xb) {
++            const u64 u_org = nv3089_origin(u0), v_org = nv3089_origin(v0);
++            const u32 n = (xb - xa) * bpp;
++            for (u32 y = 0; y < out_h; y++) {
++                const u32 dy = out_y + y;
++                if (dy < cy0 || dy >= cy1) continue;
++                const u32 sy = (u32)((v_org + (u64)y * s_nv3089.dt_dy) >> 20);
++                const u32 srow = src + sy * in_pitch;
++                u64 su = u_org + (u64)xa * s_nv3089.ds_dx;
++                u8* o = row;
++                if (bpp == 4u)
++                    for (u32 x = xa; x < xb; x++, su += s_nv3089.ds_dx, o += 4) memcpy(o, vm_base + (u32)(srow + (u32)(su >> 20) * 4u), 4);
++                else if (bpp == 2u)
++                    for (u32 x = xa; x < xb; x++, su += s_nv3089.ds_dx, o += 2) memcpy(o, vm_base + (u32)(srow + (u32)(su >> 20) * 2u), 2);
++                else
++                    for (u32 x = xa; x < xb; x++, su += s_nv3089.ds_dx, o += 1) *o = vm_base[(u32)(srow + (u32)(su >> 20))];
++                gcm_row_store(dst + dy * dst_pitch + (out_x + xa) * bpp, row, n);
++            }
++        }
+     } else
+     for (u32 y = 0; y < out_h; y++) {
+         if (y == 0) nv3089_stat(3, (u64)out_w * out_h);
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 7edde73..2b13f36 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -653,6 +653,20 @@ static const char* ld_fp_constant_mode_name(void)
+ 
+ static int g_ld_dred_dumped = 0;
+ static u32 g_ld_frames = 0;
++/* [GT6 0051] Two switches (GT6_AB "fast" / "wws" to compare inside one run). In the pack of a twelve-car race the
++ * drawing thread was busy 15 of a 60 Hz frame's 16.6 ms (b11_final1, sampled by source line), spread over many
++ * small things done for every draw:
++ *   fast (on; LD_FAST=0 = off): the descriptor signature mixed by words (it was hashed byte by byte, 0.25 ms a
++ *         frame), the index scan of ld_vs_prepare_inner by eight (0.48 ms), no count of the named elements where
++ *         the group is pulled on the GPU anyway (0.3 ms), the scaled 2D copy by row (cellGcmSys.c, 0.5 ms).
++ *         Measured, b12_ab2 (Tokyo R246, six-second turns in one race): the thread's own code 9.3 -> 8.3 ms a
++ *         frame, all its busy time 15.1 -> 14.0 ms; where the race ran below 60 it went from 46-55 to 52-57.
++ *   wws  (OFF; LD_WW_STATIC=1 = on): a block of guest memory that has had no write for LD_WW_STATIC_FRAMES frames
++ *         is asked about once a frame instead of once a FIFO pass. No gain measured (b12_ab1, b12_ab2: the
++ *         GetWriteWatch calls a frame did not go down - they are for the blocks that ARE written, about six of
++ *         them, asked once a pass), and it gives something up, so it stays off. */
++int g_ld_fast_ab = 1;
++int g_ld_wws_ab = 0;
+ static ID3D12InfoQueue* g_ld_info_queue = NULL;
+ static int g_ld_debug_layer_enabled = 0;
+ 
+@@ -2509,6 +2523,9 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
+ #if defined(__SSSE3__)
+ #include <tmmintrin.h>
+ #endif
++#if defined(__SSE4_1__)
++#include <smmintrin.h>
++#endif
+ static int ld_texel_rows_on(void)
+ {
+     static int on = -1;
+@@ -3110,6 +3127,18 @@ static u8 g_ww_block_bad[8192];
+ static u32 g_ww_block_epoch[8192];
+ static u32 g_ww_block_epoch_pages;
+ static u64 g_ww_narrow_reharvests;
++/* [GT6 0051] "wws": what a block harvest found. A block whose harvests found no written page in
++ * LD_WW_STATIC_FRAMES frames running (a track's textures and vertex arrays) is asked about once a frame from then
++ * on: every page of it counts as looked at for the rest of the frame in which a harvest found it clean. A write of
++ * this side into it (rsx_ww_note_write) and any write the next harvest finds end that at once. What it gives up: a
++ * first write into such a block in the middle of a frame is seen by the next frame, not by a later pass of the
++ * same one. Every-frame writers never qualify - the first harvest of a frame finds the frame before's writes. */
++#define LD_WW_STATIC_FRAMES 120u
++static u32 g_ww_block_clean_frame[8192];     /* frame (+1) whose harvest found the block clean; 0 = written, or not known */
++static u32 g_ww_block_seen_frame[8192];      /* frame (+1) of its last harvest (a frame counts once) */
++static u8  g_ww_block_clean_run[8192];       /* frames in a row like that, up to 255 */
++static u8  g_ww_block_dirty_now[8192];
++static unsigned long long g_ww_static_skips;
+ /* LD_WW_BLOCK_SCHED=<s>:<pages>[,<s>:<pages>...] [GT6 0036]: from <s> seconds after the process started the block is
+  * <pages> pages (times ascending) - one run then measures several sizes over the same drive ([ww] line). */
+ static u32 ld_ww_block_pages(void)
+@@ -3185,6 +3214,10 @@ void rsx_ww_note_write(u32 ea, u32 bytes)
+     if (!g_ww_page_epoch || !bytes) return;
+     const u32 p0 = ea >> 12, p1 = (u32)(((u64)ea + bytes - 1u) >> 12);
+     for (u32 pg = p0; pg <= p1 && pg < LD_WW_PAGES; pg++) g_ww_page_epoch[pg] = 0;
++    if (g_ww_block_epoch_pages)                               /* [GT6 0051] not a clean block any more */
++        for (u32 b = p0 / g_ww_block_epoch_pages; b <= p1 / g_ww_block_epoch_pages && b < 8192u; b++) {
++            g_ww_block_clean_frame[b] = 0; g_ww_block_clean_run[b] = 0;
++        }
+ }
+ static u32 ld_ww_harvest_locked(const u8* p, u32 n)
+ {
+@@ -3211,8 +3244,22 @@ static u32 ld_ww_harvest_locked(const u8* p, u32 n)
+             for (u32 b = b0; b <= b1 && widened; b++) if (g_ww_block_bad[b]) widened = 0;
+             if (g_ww_block_epoch_pages != bp) {
+                 memset(g_ww_block_epoch, 0, sizeof g_ww_block_epoch);
++                memset(g_ww_block_clean_frame, 0, sizeof g_ww_block_clean_frame);
++                memset(g_ww_block_clean_run, 0, sizeof g_ww_block_clean_run);
+                 g_ww_block_epoch_pages = bp;
+             }
++            if (g_ld_wws_ab && b1 < 8192u) {                 /* [GT6 0051] a block that has long been clean: once a frame */
++                const u32 fr = g_ld_frames + 1u;
++                int skip = 1;
++                for (u32 b = b0; b <= b1 && skip; b++)
++                    skip = g_ww_block_clean_frame[b] == fr && g_ww_block_clean_run[b] >= LD_WW_STATIC_FRAMES;
++                for (u32 q = pg0; q < pg1 && skip; q++) skip = g_ww_page_epoch[q] != 0u;      /* 0: this side wrote there */
++                if (skip) {
++                    for (u32 q = pg0; q < pg1; q++) g_ww_page_epoch[q] = ep;
++                    g_ww_static_skips++;
++                    return g_ww_gen;
++                }
++            }
+             static int repeat_blocks = -1;
+             if (repeat_blocks < 0) {
+                 const char* e = getenv("LD_WW_REHARVEST_BLOCKS");
+@@ -3228,6 +3275,8 @@ static u32 ld_ww_harvest_locked(const u8* p, u32 n)
+     }
+     int found = 0;
+     LARGE_INTEGER q0; QueryPerformanceCounter(&q0);
++    if (widened)
++        for (u32 b = hp0 / bp; b <= (hp1 - 1u) / bp; b++) g_ww_block_dirty_now[b] = 0;
+ again:
+     a = (uintptr_t)vm_base + ((uintptr_t)hp0 << 12);
+     { const uintptr_t hend = (uintptr_t)vm_base + ((uintptr_t)hp1 << 12);
+@@ -3250,13 +3299,26 @@ again:
+         g_ww_pages_asked += (unsigned long long)(len >> 12);
+         g_ww_pages_written += (unsigned long long)count;
+         if (count && !found) { g_ww_gen++; found = 1; }
+-        for (ULONG_PTR i = 0; i < count; i++)
+-            g_ww_page_gen[((uintptr_t)addrs[i] - (uintptr_t)vm_base) >> 12] = g_ww_gen;
++        for (ULONG_PTR i = 0; i < count; i++) {
++            const u32 wpg = (u32)(((uintptr_t)addrs[i] - (uintptr_t)vm_base) >> 12);
++            g_ww_page_gen[wpg] = g_ww_gen;
++            if (widened) g_ww_block_dirty_now[wpg / bp] = 1;
++        }
+         a += len;
+       } }
+     { LARGE_INTEGER q1; QueryPerformanceCounter(&q1); g_ww_ticks += (unsigned long long)(q1.QuadPart - q0.QuadPart); }
+-    if (widened)
+-        for (u32 b = hp0 / bp; b <= (hp1 - 1u) / bp; b++) g_ww_block_epoch[b] = ep;
++    if (widened) {
++        const u32 fr = g_ld_frames + 1u;
++        for (u32 b = hp0 / bp; b <= (hp1 - 1u) / bp; b++) {
++            g_ww_block_epoch[b] = ep;
++            if (g_ww_block_dirty_now[b]) { g_ww_block_clean_frame[b] = 0; g_ww_block_clean_run[b] = 0; }   /* [GT6 0051] */
++            else {
++                if (g_ww_block_seen_frame[b] != fr && g_ww_block_clean_run[b] < 255u) g_ww_block_clean_run[b]++;
++                g_ww_block_clean_frame[b] = fr;
++            }
++            g_ww_block_seen_frame[b] = fr;
++        }
++    }
+     if (batch)
+         for (u32 pg = hp0; pg < hp1; pg++) g_ww_page_epoch[pg] = ep;
+     return g_ww_gen;
+@@ -3535,9 +3597,11 @@ static void ld_ww_stats(void)
+     t0 = now.QuadPart;
+     static u32 last_epoch;
+     const u32 epoch_now = (u32)g_gcm_ww_epoch;
+-    fprintf(stderr, "[ww] last 5 s: texture checks=%llu skipped-hash=%llu misses=%llu fails=%llu  harvests=%llu syscalls=%llu epochs=%u in-GetWriteWatch=%.0fms  pages asked=%llu written=%llu narrow-reharvest=%llu\n",
++    fprintf(stderr, "[ww] last 5 s: texture checks=%llu skipped-hash=%llu misses=%llu fails=%llu  harvests=%llu syscalls=%llu epochs=%u in-GetWriteWatch=%.0fms  pages asked=%llu written=%llu narrow-reharvest=%llu static-skips=%llu (wws %d)\n",
+             g_ww_checks, g_ww_skips, g_ww_misses, g_ww_fails, g_ww_calls, g_ww_sys, epoch_now - last_epoch,
+-            (double)g_ww_ticks * 1000.0 / (double)f, g_ww_pages_asked, g_ww_pages_written, g_ww_narrow_reharvests);
++            (double)g_ww_ticks * 1000.0 / (double)f, g_ww_pages_asked, g_ww_pages_written, g_ww_narrow_reharvests,
++            g_ww_static_skips, g_ld_wws_ab);
++    g_ww_static_skips = 0;
+     /* "written" is also how many write-watch faults the title's threads took in the watched pages that were asked
+      * about: a page is reported once for each time it is first written after a harvest. */
+     g_ww_pages_asked = g_ww_pages_written = 0;
+@@ -11128,6 +11192,10 @@ static int ld_vs_alloc(u32 size, u32 stride, u32* chunk, u32* offset)
+ 
+ /* The block leaves the hash now; its place is free once the GPU has run what was recorded so far (the open
+  * command list included: g.fence_value + 1 is what ld_flush signals it with). */
++/* (Tried and taken out again, [GT6 0051]: a memo in front of ld_vs_find's chain walk. A signature's blocks all hang
++ * in one chain and the walk is 0.2-0.4 ms of a frame, but more than half of the look-ups are for groups that have
++ * no block - those walk the whole chain whatever a memo holds - and the function's time did not move, b12_ab2.
++ * What would help is a hash by signature AND position.) */
+ static void ld_vs_retire(ld_vs_slab* s)
+ {
+     ld_vs_slab** pp = &g_vs_bucket[(u32)(s->sig ^ (s->sig >> 32)) & (LD_VS_BUCKETS - 1u)];
+@@ -11409,15 +11477,11 @@ static int ld_vs_validate(ld_vs_slab* s, const rsx_vertex_fetch_plan* pl, const
+  * the named elements was 0.4 ms of a heavy frame (run252). It is a choice between two ways that both draw the
+  * group right, so an answer that has gone stale (indices rewritten in place with the same lowest and span) can
+  * cost time and nothing else. */
+-static int ld_vs_direct_ok(u32 total, u32 rmin, u32 span, u64 where)
++static struct { int on; u32 total, rmin, span; } g_vs_uncounted;      /* [GT6 0051]: the answer 2 given without the count */
++/* The count itself (g_vs_raw still holds the group's indices): 1 when nearly every element of the span is named. */
++static int ld_vs_direct_count(u32 total, u32 rmin, u32 span)
+ {
+     static u64 bits[LD_VS_MAX_BLOCK / 64u];
+-    static u64 memo[LD_VS_MEMO];
+-    if (span > LD_VS_MAX_BLOCK || span > total + total / 4u + 16u) return 0;
+-    if (g_ld_vdir_ab) return 2;                     /* GT6_AB "vdir": the span against the index list alone */
+-    const u64 key = ld_vr_mix(where, ((u64)total << 40) ^ ((u64)rmin << 20) ^ span) | 1ull;
+-    u64* const m = &memo[(u32)(key >> 24) & (LD_VS_MEMO - 1u)];
+-    if (((*m ^ key) & ~2ull) == 0ull) { g_vss.memo_hit++; return (int)(*m & 2ull); }
+     g_vss.counted++;
+     const u32 words = (span + 63u) >> 6;
+     memset(bits, 0, (size_t)words * sizeof(u64));
+@@ -11428,7 +11492,26 @@ static int ld_vs_direct_ok(u32 total, u32 rmin, u32 span, u64 where)
+     }
+     u32 named = 0;
+     for (u32 w = 0; w < words; w++) named += (u32)__builtin_popcountll(bits[w]);
+-    const int yes = span <= named + named / 4u + 16u;
++    return span <= named + named / 4u + 16u;
++}
++static int ld_vs_direct_ok(u32 total, u32 rmin, u32 span, u64 where)
++{
++    static u64 memo[LD_VS_MEMO];
++    g_vs_uncounted.on = 0;
++    if (span > LD_VS_MAX_BLOCK || span > total + total / 4u + 16u) return 0;
++    if (g_ld_vdir_ab) return 2;                     /* GT6_AB "vdir": the span against the index list alone */
++    /* [GT6 0051] Where such a group is pulled on the GPU its span costs a copy of raw bytes whichever answer comes
++     * out (the sparse pull takes the "no" as well), so the count - 290 times a frame in the pack, its memo misses
++     * because the lists lie somewhere else every frame - only chose between two names for the same path. The
++     * answer is given at once and marked; a draw whose pull is refused counts then (the draw function). */
++    if (g_ld_fast_ab && ld_vertex_pull_on()) {
++        g_vs_uncounted.on = 1; g_vs_uncounted.total = total; g_vs_uncounted.rmin = rmin; g_vs_uncounted.span = span;
++        return 2;
++    }
++    const u64 key = ld_vr_mix(where, ((u64)total << 40) ^ ((u64)rmin << 20) ^ span) | 1ull;
++    u64* const m = &memo[(u32)(key >> 24) & (LD_VS_MEMO - 1u)];
++    if (((*m ^ key) & ~2ull) == 0ull) { g_vss.memo_hit++; return (int)(*m & 2ull); }
++    const int yes = ld_vs_direct_count(total, rmin, span);
+     *m = (key & ~2ull) | (yes ? 2ull : 0ull);
+     return yes ? 2 : 0;
+ }
+@@ -11466,6 +11549,7 @@ static int ld_vs_prepare_inner(const rsx_vertex_layout_plan* layout, u32 prim, l
+      * a twelve-car race of Gran Turismo 6 these were 430 of 1,600 groups a frame and 79,000 vertices fetched and
+      * converted on the drawing thread every frame, because only indexed groups were asked here [GT6 0047]. */
+     const int arrays_only = !dc.n_idx && dc.n_arr && !g.video_active && ld_vs_arrays_on();   /* a movie's quads: as before */
++    g_vs_uncounted.on = 0;
+     g_vs_why = !dc.n_idx ? 1u : dc.n_arr ? 2u : 8u;
+     if ((!dc.n_idx && !arrays_only) || (dc.n_idx && dc.n_arr) || !layout->stride || !layout->count) return 0;
+     g_vs_why = 3u;
+@@ -11535,8 +11619,48 @@ static int ld_vs_prepare_inner(const rsx_vertex_layout_plan* layout, u32 prim, l
+         if (start + bytes > 0x100000000ull) { g_vss.f_shape++; return 0; }
+         const u8* src = guest_ptr(ia.location, (u32)start, (u32)bytes);
+         if (!src) { g_vss.f_shape++; return 0; }
++        /* [GT6 0051] eight (four) at a time: the scalar loops below were 0.48 ms of a frame in the pack - every
++         * indexed group's list is read here, 460,000 indices a frame. The same values, lowest, highest and cut. */
++        u32 i = 0;
++#if defined(__SSE4_1__)
++        if (g_ld_fast_ab && ia.is_u32 && count >= 8u) {
++            const __m128i swap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
++            const __m128i rv = _mm_set1_epi32((int)restart_value);
++            __m128i lo = _mm_set1_epi32(-1), hi = _mm_setzero_si128(), eq = _mm_setzero_si128();
++            for (; i + 4u <= count; i += 4u) {
++                const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(src + (size_t)i * 4u)), swap);
++                lo = _mm_min_epu32(lo, v); hi = _mm_max_epu32(hi, v);
++                eq = _mm_or_si128(eq, _mm_cmpeq_epi32(v, rv));
++                _mm_storeu_si128((__m128i*)(raw + w + i), v);
++            }
++            u32 t[4];
++            _mm_storeu_si128((__m128i*)t, lo);
++            for (u32 k = 0; k < 4u; k++) rmin = t[k] < rmin ? t[k] : rmin;
++            _mm_storeu_si128((__m128i*)t, hi);
++            for (u32 k = 0; k < 4u; k++) rmax = t[k] > rmax ? t[k] : rmax;
++            cut |= (u32)(_mm_movemask_epi8(eq) != 0);
++        } else if (g_ld_fast_ab && !ia.is_u32 && count >= 16u) {
++            const __m128i swap = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
++            const __m128i rv = _mm_set1_epi16((short)restart_value);
++            __m128i lo = _mm_set1_epi16(-1), hi = _mm_setzero_si128(), eq = _mm_setzero_si128();
++            for (; i + 8u <= count; i += 8u) {
++                const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(src + (size_t)i * 2u)), swap);
++                lo = _mm_min_epu16(lo, v); hi = _mm_max_epu16(hi, v);
++                eq = _mm_or_si128(eq, _mm_cmpeq_epi16(v, rv));
++                _mm_storeu_si128((__m128i*)(raw + w + i), _mm_cvtepu16_epi32(v));
++                _mm_storeu_si128((__m128i*)(raw + w + i + 4u), _mm_cvtepu16_epi32(_mm_srli_si128(v, 8)));
++            }
++            u16 t[8];
++            _mm_storeu_si128((__m128i*)t, lo);
++            for (u32 k = 0; k < 8u; k++) rmin = t[k] < rmin ? t[k] : rmin;
++            _mm_storeu_si128((__m128i*)t, hi);
++            for (u32 k = 0; k < 8u; k++) rmax = t[k] > rmax ? t[k] : rmax;
++            /* a 16-bit index can only be the restart value when that value fits in 16 bits */
++            cut |= (u32)(restart_value <= 0xFFFFu && _mm_movemask_epi8(eq) != 0);
++        }
++#endif
+         if (ia.is_u32) {
+-            for (u32 i = 0; i < count; i++) {
++            for (; i < count; i++) {
+                 u32 v; memcpy(&v, src + (size_t)i * 4u, 4);
+                 v = __builtin_bswap32(v);
+                 raw[w + i] = v;
+@@ -11544,7 +11668,7 @@ static int ld_vs_prepare_inner(const rsx_vertex_layout_plan* layout, u32 prim, l
+                 cut |= (u32)(v == restart_value);
+             }
+         } else {
+-            for (u32 i = 0; i < count; i++) {
++            for (; i < count; i++) {
+                 u16 v16; memcpy(&v16, src + (size_t)i * 2u, 2);
+                 const u32 v = __builtin_bswap16(v16);
+                 raw[w + i] = v;
+@@ -13677,7 +13801,13 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 if (vertex_pull) { g_vsp.draws++; g_vsp.bytes += pull_plan.bytes; g_vsp.span += vs.span; g_vsp.total += vs.total; }
+                 else { vs_on = 0; g_vsp.back++; }             /* the old way, which compacts */
+             } else
+-            if (!vertex_pull && !ld_vs_direct_fetch(&used_layout, &vs)) vs_on = 0;
++            if (!vertex_pull) {
++                /* [GT6 0051] an answer given without counting, for the pull - and the pull has said no: the count
++                 * now decides between converting the span as a run and the old way, as it always did */
++                if (g_vs_uncounted.on &&
++                    !ld_vs_direct_count(g_vs_uncounted.total, g_vs_uncounted.rmin, g_vs_uncounted.span)) vs_on = 0;
++                else if (!ld_vs_direct_fetch(&used_layout, &vs)) vs_on = 0;
++            }
+         }
+     }
+     if (!vs_on && ld_vertex_compact_payload() && !dc.inl && ld_vc_on() &&
+@@ -14639,13 +14769,32 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     D3D12_GPU_DESCRIPTOR_HANDLE vtex_table = {0};
+     if (have_vertex_table)
+         vtex_table = srv_table(vtex_slots);
+-    u64 descriptor_signature =
+-        fnv1a(slots, sizeof(slots), 1469598103934665603ull);
+-    descriptor_signature =
+-        fnv1a(smp_slots, sizeof(smp_slots), descriptor_signature);
+-    if (have_vertex_table)
++    u64 descriptor_signature;
++    if (g_ld_fast_ab) {
++        /* [GT6 0051] by words: the signature only says whether two draws of this run bind the same tables, and
++         * the three arrays (about 150 bytes) were hashed a byte at a time for every draw */
++        descriptor_signature = 0x9E3779B97F4A7C15ull;
++        for (u32 k = 0; k + 1u < SRV_TABLE_SIZE; k += 2u)
++            descriptor_signature = ld_vr_mix(descriptor_signature, ((u64)slots[k] << 32) | slots[k + 1u]);
++        if (SRV_TABLE_SIZE & 1u) descriptor_signature = ld_vr_mix(descriptor_signature, slots[SRV_TABLE_SIZE - 1u]);
++        for (u32 k = 0; k + 1u < SMP_TABLE_SIZE; k += 2u)
++            descriptor_signature = ld_vr_mix(descriptor_signature, ((u64)smp_slots[k] << 32) | smp_slots[k + 1u]);
++        if (SMP_TABLE_SIZE & 1u) descriptor_signature = ld_vr_mix(descriptor_signature, smp_slots[SMP_TABLE_SIZE - 1u]);
++        if (have_vertex_table) {
++            descriptor_signature = ld_vr_mix(descriptor_signature, 0x7E87AB1E00000000ull);
++            for (u32 k = 0; k + 1u < SRV_TABLE_SIZE; k += 2u)
++                descriptor_signature = ld_vr_mix(descriptor_signature, ((u64)vtex_slots[k] << 32) | vtex_slots[k + 1u]);
++            if (SRV_TABLE_SIZE & 1u) descriptor_signature = ld_vr_mix(descriptor_signature, vtex_slots[SRV_TABLE_SIZE - 1u]);
++        }
++    } else {
+         descriptor_signature =
+-            fnv1a(vtex_slots, sizeof(vtex_slots), descriptor_signature);
++            fnv1a(slots, sizeof(slots), 1469598103934665603ull);
++        descriptor_signature =
++            fnv1a(smp_slots, sizeof(smp_slots), descriptor_signature);
++        if (have_vertex_table)
++            descriptor_signature =
++                fnv1a(vtex_slots, sizeof(vtex_slots), descriptor_signature);
++    }
+ 
+     const float W = sf.clip_w ? (float)sf.clip_w : (float)g.width;
+     const float H = sf.clip_h ? (float)sf.clip_h : (float)g.height;

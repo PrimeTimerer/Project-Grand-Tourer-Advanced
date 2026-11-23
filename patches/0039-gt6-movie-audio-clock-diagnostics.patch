@@ -1,0 +1,82 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 397b9c9..f6bf7fe 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -687,6 +687,36 @@ static void audio_backend_wait(void)
+ 
+ #endif /* AUDIO_BACKEND_WASAPI */
+ 
++/* Initial movie clock evidence: at most eight records per port, under the
++ * audio mutex. This does not alter tags, timestamps or playback behavior. */
++static void audio_clock_diag_locked(const char* event, u32 port_num, u64 tag, u64 returned_us, u64 block_no)
++{
++    static int enabled = -1;
++    static u32 count[CELL_AUDIO_PORT_MAX];
++    if (enabled < 0) {
++        const char* mode = getenv("GT6_AUDIO_CLOCK_DIAG");
++        enabled = mode && !strcmp(mode, "1");
++    }
++    if (!enabled || port_num >= CELL_AUDIO_PORT_MAX || count[port_num] >= 8) return;
++    ++count[port_num];
++    double qpc_s = 0;
++    u32 padding = UINT32_MAX;
++#ifdef _WIN32
++    LARGE_INTEGER now, frequency;
++    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);
++    qpc_s = (double)now.QuadPart / (double)frequency.QuadPart;
++#endif
++#if AUDIO_BACKEND_WASAPI
++    if (s_wasapi_client) padding = s_wasapi_padding;
++#endif
++    const AudioPortSlot* port = &s_ports[port_num];
++    fprintf(stderr, "[audio-clock] event=%s port=%u tag=%llu read_index=%llu port_timestamp_us=%llu returned_us=%llu guest_now_us=%llu mix_present_us=%llu padding_frames=%u nblock=%llu block_no=%llu qpc_s=%.9f\n",
++            event, port_num, (unsigned long long)tag, (unsigned long long)port->read_index,
++            (unsigned long long)port->timestamp_us, (unsigned long long)returned_us,
++            (unsigned long long)ppu_system_time_us(), (unsigned long long)s_mix_present_us,
++            padding, (unsigned long long)port->param.nBlock, (unsigned long long)block_no, qpc_s);
++}
++
+ /* AUDIO_FLOW_TRACE=<new file>: bounded producer/consumer evidence, not an A/V
+  * synchronization measurement. _AFTER_MS is relative to cellAudioInit and
+  * _DURATION_MS defaults to 10000 (maximum 30000); _PORT defaults to 0.
+@@ -1099,6 +1129,8 @@ static void audio_mix_one_block(void)
+         port->read_index++;
+         port->timestamp_us = s_mix_present_us +
+             (u64)CELL_AUDIO_BLOCK_SAMPLES * 1000000ULL / CELL_AUDIO_SAMPLE_RATE;
++        if (port->read_index == 1)
++            audio_clock_diag_locked("first_consume", p, 0, s_mix_present_us, 0);
+         if (port->read_idx_addr)
+             vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
+     }
+@@ -1660,6 +1692,7 @@ s32 cellAudioPortStart(u32 portNum)
+     mutex_lock(&s_audio_mutex);
+     s_ports[portNum].timestamp_us = ppu_system_time_us();
+     s_ports[portNum].running = 1;
++    audio_clock_diag_locked("start", portNum, s_ports[portNum].read_index, s_ports[portNum].timestamp_us, UINT64_MAX);
+     audio_sgx_port_changed(portNum, 0);
+     mutex_unlock(&s_audio_mutex);
+ 
+@@ -1707,6 +1740,7 @@ s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
+         return CELL_AUDIO_ERROR_PARAM;
+     }
+     u64 t = port->read_index + blockNo - (port->read_index % nblk);
++    audio_clock_diag_locked("block_tag", portNum, t, 0, blockNo);
+     /* Tags name a slot in the current ring epoch, including slots already
+      * consumed. Rounding a past slot up to the next lap delays completion by
+      * a whole buffer (85 ms for GT6) and stalls SGX's completed-buffer queue. */
+@@ -1734,6 +1768,7 @@ s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
+     s_audio_stamp_calls++;
+     if (tag > global_counter) {
+         s_audio_stamp_waits++;
++        audio_clock_diag_locked("tag_not_found", portNum, tag, 0, UINT64_MAX);
+         mutex_unlock(&s_audio_mutex);
+         return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
+     }
+@@ -1741,6 +1776,7 @@ s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
+     const u64 elapsed_us = (global_counter - tag) *
+         (u64)CELL_AUDIO_BLOCK_SAMPLES * 1000000ULL / CELL_AUDIO_SAMPLE_RATE;
+     const u64 t = port->timestamp_us > elapsed_us ? port->timestamp_us - elapsed_us : 0;
++    audio_clock_diag_locked("timestamp", portNum, tag, t, UINT64_MAX);
+     mutex_unlock(&s_audio_mutex);
+     vm_write64(stamp_ea, t);
+     return CELL_OK;
