@@ -263,6 +263,8 @@ namespace GT6Launcher
             { "AutoUpdate", "1" },      // ...downloads it without asking and applies it at the next start
             { "Language", "" },         // "" = by Windows' display language, "ko", "en" (Lang.cs)
             { "UseGhCli", "0" },        // a private repository: the GitHub CLI's login of this PC when no token was pasted
+            { "AA", "" },               // anti-aliasing of a run: "" = the game's own default (GPU filter), "off", "spu" (GT6_AA)
+            { "Fullscreen", "0" },      // start in borderless full screen (GT6_FULLSCREEN=1)
         };
 
         public static string Default(string key)
@@ -280,6 +282,11 @@ namespace GT6Launcher
                 env["PS3_MUTE"] = "1";
             if (!launcher.On("Keyboard"))
                 env["PAD_NO_KEYBOARD"] = "1";                        // any value turns it off, so it is set only then
+            string aa = launcher.Setting("AA");
+            if (aa == "off" || aa == "spu")
+                env["GT6_AA"] = aa;                                  // "" = the game's own default, the GPU filter
+            if (launcher.On("Fullscreen"))
+                env["GT6_FULLSCREEN"] = "1";                         // an exe that does not know it ignores it
             return env;
         }
     }
@@ -292,7 +299,7 @@ namespace GT6Launcher
         public readonly Dictionary<string, string> Env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         public readonly List<string> Unset = new List<string>();
         public readonly List<KeyValuePair<string, string>> Copies = new List<KeyValuePair<string, string>>();   // the bat's log rotation
-        public bool FullHd, Overlay;   // what this exe knows (looked for in the exe itself)
+        public bool FullHd, Overlay, Aa, FullScreen;   // what this exe knows (looked for in the exe itself)
 
         public bool Available { get { return Problem == null && Exe != null && File.Exists(Exe); } }
         public string ExeName { get { return Exe == null ? "" : Path.GetFileName(Exe); } }
@@ -373,16 +380,18 @@ namespace GT6Launcher
             try
             {
                 var file = new FileInfo(b.Exe);
-                string stamp = file.Length + ":" + file.LastWriteTimeUtc.Ticks;
+                string stamp = "2:" + file.Length + ":" + file.LastWriteTimeUtc.Ticks;   // (2: the list of names grew; an older record is looked up again)
                 string[] known = launcher.Value("Exe", b.ExeName, "").Split('|');
                 if (known.Length != 2 || known[0] != stamp)
                 {
-                    bool[] found = Scan(b.Exe, "MenuFullHd", "PS3_USRDIR_OVERLAY");
-                    known = new[] { stamp, (found[0] ? "F" : "") + (found[1] ? "O" : "") };
+                    bool[] found = Scan(b.Exe, "MenuFullHd", "PS3_USRDIR_OVERLAY", "GT6_AA", "GT6_FULLSCREEN");
+                    known = new[] { stamp, (found[0] ? "F" : "") + (found[1] ? "O" : "") + (found[2] ? "A" : "") + (found[3] ? "S" : "") };
                     launcher.Set("Exe", b.ExeName, known[0] + "|" + known[1]);
                 }
                 b.FullHd = known[1].Contains("F");
                 b.Overlay = known[1].Contains("O");
+                b.Aa = known[1].Contains("A");
+                b.FullScreen = known[1].Contains("S");
             }
             catch (Exception)
             {

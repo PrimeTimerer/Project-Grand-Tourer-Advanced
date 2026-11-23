@@ -324,6 +324,46 @@ namespace GT6Launcher
             else
                 screen.Children.Add(Ui.Text(build.Available ? build.ExeName + L.T("는 Full HD 스위치가 생기기 전의 빌드입니다 (720p). 시험판에서 쓸 수 있습니다.") : L.T("빌드를 찾지 못했습니다."), "Caption"));
 
+            // Anti-aliasing and full screen are the launcher's own switches for a run (Settings.Overrides: GT6_AA, GT6_FULLSCREEN).
+            if (build.Aa)
+            {
+                FrameworkElement aa = Ui.Setting(L.T("안티에일리어싱"),
+                    L.T("계단 현상을 부드럽게 하는 방식입니다. GPU 필터(기본)는 완성된 화면을 GPU에서 처리하고, 끄면 가장 가볍고, 원본 SPU MLAA는 콘솔의 방식입니다 (CPU 부담이 큽니다). 게임을 시작할 때 정해집니다."),
+                    Ui.Choices(Launcher.Setting("AA"), delegate(string v) { Launcher.SetSetting("AA", v); },
+                        "", L.T("GPU 필터 (기본)"), "off", L.T("끄기 (가장 가벼움)"), "spu", L.T("원본 SPU MLAA (무거움)")));
+                aa.Margin = new Thickness(0, 14, 0, 14);
+                screen.Children.Add(aa);
+            }
+            if (build.FullScreen)
+                screen.Children.Add(Toggle("Fullscreen", L.T("전체 화면으로 시작"),
+                    L.T("게임 창을 테두리 없는 전체 화면으로 엽니다. 게임 중에는 Alt+Enter로 바꿉니다. 화면이 16:9가 아니면 비율을 지키고 남는 곳은 검게 둡니다.")));
+            else if (build.Available)
+                screen.Children.Add(Ui.Text(L.T("이 빌드에는 전체 화면 스위치가 없습니다. Alt+Enter와 함께 다음 빌드부터 들어갑니다."), "Caption"));
+            if (build.Aa || build.FullScreen)
+            {
+                var preset = Ui.Button(L.T("휴대용(UMPC) 권장 설정 적용"), delegate
+                {
+                    try
+                    {
+                        if (build.FullHd)
+                            MenuSettings.SetFullHd(build.SettingsFile, false);
+                    }
+                    catch (Exception error)
+                    {
+                        Window.Error(L.T("설정 파일을 쓰지 못했습니다"), error);
+                        return;
+                    }
+                    Launcher.SetSetting("AA", "off");
+                    Launcher.SetSetting("Fullscreen", "1");
+                    Window.Refresh();
+                    Window.Toast(L.T("휴대용 권장 설정을 적용했습니다: 720p · 안티에일리어싱 끄기 · 전체 화면으로 시작"));
+                });
+                preset.HorizontalAlignment = HorizontalAlignment.Left;
+                preset.IsEnabled = !running;
+                screen.Children.Add(Ui.Text(running ? L.T("게임이 꺼진 뒤에 눌러 주세요.") : L.T("720p, 안티에일리어싱 끄기, 전체 화면으로 시작을 한 번에 켭니다. 게임을 시작할 때 적용됩니다."), "Caption"));
+                screen.Children.Add(preset);
+            }
+
             var env = new TextBox
             {
                 Text = build.Problem ?? string.Join("\r\n", build.Env.OrderBy(p => p.Key, StringComparer.Ordinal).Select(p => p.Key + "=" + p.Value)),
@@ -367,7 +407,7 @@ namespace GT6Launcher
                                Ui.Choices(Launcher.Setting("BackupsToKeep"), delegate(string v) { Launcher.SetSetting("BackupsToKeep", v); }, "5", L.T("5개"), "10", L.T("10개"), "20", L.T("20개"), "50", L.T("50개")))),
                 Ui.Card(L.T("실행 환경"),
                     Ui.Text(L.T("런처는 ") + build.BatName + L.T("을 읽어 그 파일과 똑같은 환경으로 ") + build.ExeName + L.T("를 시작하고, 로그도 같은 파일에 남깁니다. 아래는 지금 읽은 값입니다 (")
-                            + build.Env.Count + L.T("개 설정, ") + build.Unset.Count + L.T("개 제거). 런처가 더하는 것은 모드 폴더, 소리 끄기, 키보드 끄기뿐입니다."), "Caption"),
+                            + build.Env.Count + L.T("개 설정, ") + build.Unset.Count + L.T("개 제거). 런처가 더하는 것은 모드 폴더, 소리 끄기, 키보드 끄기, 안티에일리어싱, 전체 화면 시작뿐입니다."), "Caption"),
                     env, openBat));
         }
     }

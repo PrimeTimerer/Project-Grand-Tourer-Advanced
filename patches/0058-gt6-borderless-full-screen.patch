@@ -1,0 +1,247 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 24e18d9..8adf6c7 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -16295,6 +16295,10 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     }
+     sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g.swap);
+     sc1->lpVtbl->Release(sc1);
++    /* [public issues 2 and 3] DXGI's own Alt+Enter would put this flip-model swap chain into exclusive full screen, which nothing
++     * here handles (no ResizeBuffers): every Present then failed with DXGI_ERROR_INVALID_CALL and the picture froze
++     * while the game went on. The window turns borderless full screen itself instead (rsx_null_backend.c). */
++    factory->lpVtbl->MakeWindowAssociation(factory, (HWND)hwnd, DXGI_MWA_NO_ALT_ENTER);
+     factory->lpVtbl->Release(factory);
+ 
+     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index 0fb84c4..c87f71c 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -58,17 +58,207 @@ static int s_present_suppressed = 0;
+  * menu instead of the game). */
+ int (*rsx_window_message_hook)(void* hwnd, unsigned msg, uintptr_t wp, intptr_t lp) = NULL;
+ 
++/* ---------------------------------------------------------------------------
++ * Full screen [public issues 2 and 3]
++ *
++ * Alt+Enter, the maximize button and a double click on the caption turn the window borderless full screen and back. The
++ * swap chain keeps the picture's size and the desktop compositor scales it to the window, so the window keeps the
++ * picture's shape: dragged by its frame it stays that shape (WM_SIZING); full screen on a monitor of another shape (21:9,
++ * 16:10, 4:3) it is the biggest rectangle of the picture's shape, centred over a black window that fills the monitor,
++ * instead of a stretched picture. The caption and the frame are not part of the picture: the client area is.
++ * DXGI's own Alt+Enter would put the flip-model swap chain into exclusive full screen, which nothing here handles (no
++ * ResizeBuffers): every Present then failed with DXGI_ERROR_INVALID_CALL and the picture froze while the game went on;
++ * rsx_live_draw.c switches that off (DXGI_MWA_NO_ALT_ENTER) and the toggle here is the only one.
++ * -----------------------------------------------------------------------*/
++
++static int              s_full;          /* 1 = borderless full screen */
++static HWND             s_back;          /* the black window behind a picture that does not fill the monitor */
++static LONG             s_saved_style;
++static WINDOWPLACEMENT  s_saved_place;
++static RECT             s_full_mon, s_full_pic;   /* the monitor, and the picture's rectangle in it, while full */
++
++static LRESULT CALLBACK back_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
++{
++    if (m == WM_MOUSEACTIVATE)
++        return MA_NOACTIVATE;       /* a click on the black bars must not take the keyboard from the game */
++    return DefWindowProcA(h, m, w, l);
++}
++
++/* The biggest rectangle of the picture's shape inside mon, centred; mon itself when it has that shape within 1 %. */
++static RECT picture_rect(RECT mon)
++{
++    const long long mw = mon.right - mon.left, mh = mon.bottom - mon.top;
++    const long long pw = (long long)s_state.width, ph = (long long)s_state.height;
++    RECT r = mon;
++    if (mw <= 0 || mh <= 0 || pw <= 0 || ph <= 0)
++        return r;
++    if (mw * ph * 100 > mh * pw * 101) {            /* the monitor is wider: bars left and right */
++        const LONG w = (LONG)(mh * pw / ph);
++        r.left = mon.left + (LONG)((mw - w) / 2);
++        r.right = r.left + w;
++    } else if (mw * ph * 101 < mh * pw * 100) {     /* taller: bars above and below */
++        const LONG h = (LONG)(mw * ph / pw);
++        r.top = mon.top + (LONG)((mh - h) / 2);
++        r.bottom = r.top + h;
++    }
++    return r;
++}
++
++/* On top, and the black window right behind it where the picture does not fill the monitor. */
++static void full_top(HWND hwnd)
++{
++    const int bars = s_full_pic.left != s_full_mon.left || s_full_pic.top != s_full_mon.top ||
++                     s_full_pic.right != s_full_mon.right || s_full_pic.bottom != s_full_mon.bottom;
++    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
++    if (!bars) {
++        if (s_back) { DestroyWindow(s_back); s_back = NULL; }
++        return;
++    }
++    if (!s_back) {
++        static int registered = 0;
++        if (!registered) {
++            WNDCLASSEXA bc = {0};
++            bc.cbSize = sizeof(bc);
++            bc.lpfnWndProc = back_wndproc;
++            bc.hInstance = GetModuleHandle(NULL);
++            bc.hCursor = LoadCursor(NULL, IDC_ARROW);
++            bc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
++            bc.lpszClassName = "ps3recomp_back";
++            RegisterClassExA(&bc);
++            registered = 1;
++        }
++        s_back = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, "ps3recomp_back", "", WS_POPUP,
++                                 s_full_mon.left, s_full_mon.top, s_full_mon.right - s_full_mon.left,
++                                 s_full_mon.bottom - s_full_mon.top, NULL, NULL, GetModuleHandle(NULL), NULL);
++    }
++    if (s_back)     /* inserted after the picture's window in the z order: right behind it */
++        SetWindowPos(s_back, hwnd, s_full_mon.left, s_full_mon.top, s_full_mon.right - s_full_mon.left,
++                     s_full_mon.bottom - s_full_mon.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
++}
++
++static void full_place(HWND hwnd)
++{
++    SetWindowPos(hwnd, HWND_TOPMOST, s_full_pic.left, s_full_pic.top, s_full_pic.right - s_full_pic.left,
++                 s_full_pic.bottom - s_full_pic.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
++    full_top(hwnd);
++}
++
++static void full_enter(HWND hwnd)
++{
++    MONITORINFO mi;
++    memset(&mi, 0, sizeof mi);
++    mi.cbSize = sizeof mi;
++    if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
++        return;
++    s_saved_place.length = sizeof s_saved_place;
++    if (!GetWindowPlacement(hwnd, &s_saved_place))
++        return;
++    s_saved_style = GetWindowLongA(hwnd, GWL_STYLE);
++    s_full_mon = mi.rcMonitor;
++    s_full_pic = picture_rect(s_full_mon);
++    s_full = 1;
++    SetWindowLongA(hwnd, GWL_STYLE, (s_saved_style & ~(LONG)WS_OVERLAPPEDWINDOW) | (LONG)WS_POPUP);
++    full_place(hwnd);
++}
++
++static void full_leave(HWND hwnd)
++{
++    s_full = 0;
++    if (s_back) { DestroyWindow(s_back); s_back = NULL; }
++    SetWindowLongA(hwnd, GWL_STYLE, s_saved_style);
++    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOACTIVATE);
++    SetWindowPlacement(hwnd, &s_saved_place);
++}
++
++static void full_toggle(HWND hwnd)
++{
++    if (s_full) full_leave(hwnd); else full_enter(hwnd);
++}
++
++/* While the window is dragged by its frame: the client area keeps the picture's shape. */
++static void keep_shape(HWND hwnd, UINT edge, RECT* r)
++{
++    const long long pw = (long long)s_state.width, ph = (long long)s_state.height;
++    if (pw <= 0 || ph <= 0)
++        return;
++    RECT nc = {0, 0, 0, 0};
++    AdjustWindowRectEx(&nc, (DWORD)GetWindowLongA(hwnd, GWL_STYLE), FALSE, (DWORD)GetWindowLongA(hwnd, GWL_EXSTYLE));
++    const LONG fw = nc.right - nc.left, fh = nc.bottom - nc.top;      /* the frame and the caption */
++    const long long cw = (r->right - r->left) - fw, ch = (r->bottom - r->top) - fh;
++    switch (edge) {
++    case WMSZ_LEFT: case WMSZ_RIGHT:
++        r->bottom = r->top + (LONG)(cw * ph / pw) + fh;
++        break;
++    case WMSZ_TOP: case WMSZ_BOTTOM:
++        r->right = r->left + (LONG)(ch * pw / ph) + fw;
++        break;
++    case WMSZ_TOPLEFT: case WMSZ_TOPRIGHT:
++        r->top = r->bottom - ((LONG)(cw * ph / pw) + fh);
++        break;
++    default:   /* the bottom corners */
++        r->bottom = r->top + (LONG)(cw * ph / pw) + fh;
++        break;
++    }
++}
++
+ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
++    /* Alt+Enter is the window's own, before the in-game menu: it works with the menu open too. [public issues 2 and 3] */
++    if (msg == WM_SYSKEYDOWN && wp == VK_RETURN) {
++        if (!(lp & (1 << 30)))      /* once, not for the key's repeats */
++            full_toggle(hwnd);
++        return 0;
++    }
++    if (msg == WM_SYSCHAR && wp == '\r')
++        return 0;                   /* no beep for the Alt+Enter just handled */
+     if (rsx_window_message_hook && rsx_window_message_hook(hwnd, msg, (uintptr_t)wp, (intptr_t)lp))
+         return 0;
+     switch (msg) {
++    case WM_SYSCOMMAND:
++        if ((wp & 0xFFF0) == SC_MAXIMIZE) {     /* the maximize button, a double click on the caption, Win+Up */
++            full_toggle(hwnd);
++            return 0;
++        }
++        break;
++
++    case WM_SIZING:
++        if (!s_full) {
++            keep_shape(hwnd, (UINT)wp, (RECT*)lp);
++            return TRUE;
++        }
++        break;
++
++    case WM_ACTIVATE:           /* on top while the game has the keyboard, not over the program one switches to */
++        if (s_full) {
++            if (LOWORD(wp) == WA_INACTIVE) {
++                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
++                if (s_back) ShowWindow(s_back, SW_HIDE);
++            } else {
++                full_top(hwnd);
++            }
++        }
++        break;
++
++    case WM_DISPLAYCHANGE:      /* another resolution or monitor while full screen: fit again */
++        if (s_full) {
++            MONITORINFO mi;
++            memset(&mi, 0, sizeof mi);
++            mi.cbSize = sizeof mi;
++            if (GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
++                s_full_mon = mi.rcMonitor;
++                s_full_pic = picture_rect(s_full_mon);
++                full_place(hwnd);
++            }
++        }
++        break;
++
+     case WM_CLOSE:
+         s_state.window_closed = 1;
+         DestroyWindow(hwnd);
+         return 0;
+ 
+     case WM_DESTROY:
++        if (s_back) { DestroyWindow(s_back); s_back = NULL; }
+         PostQuitMessage(0);
+         return 0;
+ 
+@@ -251,7 +441,7 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+     wc.lpfnWndProc = null_wndproc;
+     wc.hInstance = GetModuleHandle(NULL);
+     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
++    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);   /* [public issues 2 and 3] black where no picture is (was the window colour) */
+     wc.lpszClassName = "ps3recomp_null";
+     RegisterClassExA(&wc);
+ 
+@@ -283,6 +473,10 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+      * in the intro movie while an attended one did not. */
+     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+ 
++    /* GT6_FULLSCREEN=1 (the launcher's "start in full screen"): borderless full screen from the first frame.
++     * [public issues 2 and 3] */
++    { const char* fs = getenv("GT6_FULLSCREEN"); if (fs && *fs == '1') full_enter(s_state.hwnd); }
++
+     /* Register as the active RSX backend */
+     rsx_set_backend(&s_null_backend);
+ 
