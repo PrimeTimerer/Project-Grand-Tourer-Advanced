@@ -1,0 +1,27 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 4143dd6..c0b74a4 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1102,9 +1102,20 @@ skip_inject: ;
+             { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x08, CELL_PAD_BTN_OFFSET_PRESS_R1 },
+             { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x01, CELL_PAD_BTN_OFFSET_PRESS_L2 },
+             { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x02, CELL_PAD_BTN_OFFSET_PRESS_R2 } };
+-        for (unsigned k = 0; k < sizeof pm / sizeof pm[0]; k++)
+-            if ((data->button[pm[k].word] & pm[k].bit) && data->button[pm[k].off] < 255)
++        /* L2/R2 are analog triggers on the host pads (SDL, XInput): their value IS the
++         * pressure, as a DS3's L2/R2 pressure is, and their digital bit comes on at
++         * ~9 % of the pull. Raised to 255 with that bit, the triggers worked like
++         * on/off buttons - throttle and brake bound to them jumped to full (a
++         * player's report on the GT6 port; GT6 turns press mode on and copies all
++         * 64 words, see func_00AFA7C4 / 00AF9BD0). A trigger press that carries no
++         * pressure at all (injected input, keyboard) still reads full. */
++        for (unsigned k = 0; k < sizeof pm / sizeof pm[0]; k++) {
++            const int trig = pm[k].off == CELL_PAD_BTN_OFFSET_PRESS_L2 ||
++                             pm[k].off == CELL_PAD_BTN_OFFSET_PRESS_R2;
++            if ((data->button[pm[k].word] & pm[k].bit) && data->button[pm[k].off] < 255 &&
++                !(trig && data->button[pm[k].off] > 0))
+                 data->button[pm[k].off] = 255;
++        }
+     }
+ 
+     /* Sensor data (only meaningful if SENSOR_ON) */
