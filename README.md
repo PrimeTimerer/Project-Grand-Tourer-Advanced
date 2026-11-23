@@ -61,7 +61,7 @@ The launcher checks this repository's releases once a day. A newer release is do
 
 ## Build
 
-[BUILD.md](BUILD.md) has the steps. In short: apply `patches/*.patch` to the `ps3recomp` submodule in number order, prepare `game\` from your own disc with the launcher's setup, lift `game\EMAIN.ELF` with ps3recomp's PPU lifter, then run `build_release.bat`, `build_launcher.bat` and `trainer\BUILD_TRAINER.cmd`.
+[BUILD.md](BUILD.md) has the steps. In short: apply `patches/*.patch` to the `ps3recomp` submodule in number order, prepare `game\` from your own disc with the launcher's setup, lift `game\EMAIN.ELF` with ps3recomp's PPU lifter, then run `build_release.bat` and `build_launcher.bat`.
 
 ## License
 

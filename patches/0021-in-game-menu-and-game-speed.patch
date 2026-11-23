@@ -17,8 +17,8 @@
      return SUCCEEDED(hr) ? 0 : -1;
  }
  
-+/* The present's sync interval (owner, 2026-11-08: "경기 화면에서 버벅거리고"). Default 1, as before.
-+ * LD_SYNC_INTERVAL=auto (the launcher's "고주사율 모니터 프레임 간격 맞춤"): at 120/180/240 Hz a frame presented with
++/* The present's sync interval (2026-11-08: the race screen stuttered). Default 1, as before.
++ * LD_SYNC_INTERVAL=auto (the launcher's frame pacing for high refresh rate monitors): at 120/180/240 Hz a frame presented with
 + * interval 1 shows at the next refresh after it is ready, so frames stay up 11, 17 or 22 ms by turns at 180 Hz;
 + * refresh / 60 keeps each up 16.7 ms when frames are on time, but a late frame then stays up 33 ms instead of 22
 + * (sy2 vs fm2, a match: seconds under 58 fps 27 vs 13). Other rates keep 1. LD_SYNC_INTERVAL=<1-4> forces a value.

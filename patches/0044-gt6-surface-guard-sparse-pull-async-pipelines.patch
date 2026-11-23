@@ -234,7 +234,7 @@ index d81dd7a..136c932 100644
 + * surfaces were still taken as what is at those addresses: a texture that starts where one started was bound to
 + * the old label picture, and the lazy mirror copied label pixels that guest memory "did not have yet" over the
 + * icon bytes the title had just written (the quick menu after a race showed a driver's name and noise where its
-+ * icons are; the owner saw the track tiles turn white).
++ * icons are; the track tiles turned white).
 + *
 + * RPCS3 has the same question and answers it by remembering a few words of the memory under each render target
 + * (render_target_descriptor::sync_tag) and dropping the target as a texture source when they have changed

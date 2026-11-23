@@ -304,7 +304,7 @@ namespace GT6Launcher
 
         public static GameBuild Read(Launcher launcher, string key)
         {
-            var b = new GameBuild { Key = key, Label = LabelOf(key), BatName = key == "test" ? "PLAY_GT6_CHEAT_TEST.bat" : "PLAY_GT6.bat" };
+            var b = new GameBuild { Key = key, Label = LabelOf(key), BatName = key == "test" ? "PLAY_GT6_TEST.bat" : "PLAY_GT6.bat" };
             b.Bat = Path.Combine(launcher.Dir, b.BatName);
             b.SettingsFile = Path.Combine(launcher.Dir, "GT6Menu.settings.json");   // the menu's default: beside the exe
             if (!File.Exists(b.Bat))

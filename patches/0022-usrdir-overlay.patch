@@ -8,7 +8,7 @@
 + * is a regular file there, on any device (/dev_bdvd/PS3_GAME/USRDIR/..., /dev_hdd0/game/<ID>/USRDIR/...). A
 + * translation or mod then lives in its own folder and the original files stay as they are; without the
 + * variable nothing changes. Directories are never redirected, so listings still show the original tree.
-+ * All three path translators call this first. Sakatsuku: the Korean patch's data files (launcher "한글패치"). */
++ * All three path translators call this first. Sakatsuku: the Korean patch's data files (the launcher's Korean patch). */
 +int ps3_vfs_usrdir_overlay(const char* guest, char* out, size_t cap)
 +{
 +    static const char* root = NULL; static int init = 0, log = 0;

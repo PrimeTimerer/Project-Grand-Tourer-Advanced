@@ -13,8 +13,8 @@ index c65ab09..e86c92e 100644
 +     * Gran Turismo 6 draws with the origin at the BOTTOM, and its glass - the covers of the headlights, the windows,
 +     * panes beside the track - reads the picture behind it out of the colour target it is drawing into, at
 +     * WPOS x (1/W, -1/H) with the texture set to repeat in t: with the real WPOS that is the pixel's own row, with
-+     * the host's y it is the row mirrored about the middle of the screen. So a headlight showed the sky (owner,
-+     * 2026-11-20: "헤드라이트가 제대로 보이지 않고 마냥 거울처럼 반사만"), and panes high on the screen showed pieces
++     * the host's y it is the row mirrored about the middle of the screen. So a headlight showed the sky (2026-11-20:
++     * headlights did not show, only mirror-like reflections), and panes high on the screen showed pieces
 +     * of the road. LD_WPOS_WINDOW=0 = as before. */
 +    { static int on = -1;
 +      if (on < 0) { const char* e = getenv("LD_WPOS_WINDOW"); on = (e && *e == '0') ? 0 : 1; }

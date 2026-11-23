@@ -23,14 +23,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $Pkg 'GT6 Launcher.exe'))) { throw "
 # The app files: by name at the top of the package, and the trainer folder without the user's own files. The car list
 # and the parts list (cars.json, parts_index.txt) are not app files: they come out of the game's own database, and the
 # game makes them on each PC by itself ([GT6 0089] gt6_menu_engine.cpp, AutoImports).
-$top = @('GT6 Launcher.exe', 'GT6Recomp.exe', 'GT6Recomp_CheatTest.exe', 'PLAY_*.bat', '*.dll', 'SDL2-LICENSE.txt', 'README.txt', 'CHANGES_*.txt')
+$top = @('GT6 Launcher.exe', 'GT6Recomp.exe', 'PLAY_*.bat', '*.dll', 'SDL2-LICENSE.txt', 'README.txt', 'CHANGES_*.txt')
 $files = @()
 foreach ($pattern in $top) { $files += Get-ChildItem -LiteralPath $Pkg -File -Filter $pattern }
-$trainer = Join-Path $Pkg 'trainer'
-if (Test-Path -LiteralPath $trainer) {
-    $files += Get-ChildItem -LiteralPath $trainer -File -Recurse |
-        Where-Object { $_.Name -notlike '*.profiles.json*' -and $_.Name -ne 'bspec_log.txt' -and $_.Extension -ne '.pdb' -and $_.Name -ne 'cars.json' }
-}
 $files = $files | Sort-Object FullName -Unique
 
 $stamped = $files | Where-Object { $_.Name -like 'GT6Recomp*.exe' -or $_.Name -eq 'GT6 Launcher.exe' }

@@ -145,7 +145,7 @@ index 54ff926..c65ab09 100644
 + * GET_REPORT (0x1800, type 1). A title asks the RSX how many pixels of what it drew passed the depth test - Gran
 + * Turismo 6 does it for the lights it draws a glow for, and shows the glow by the answer. Until now the walker
 + * answered 0xFFFF ("visible") without measuring, so at night the glows of lights behind walls and hills stood in
-+ * the picture (owner, 2026-11-19: "야간 주행을 하면 벽을 뚫고 저 멀리의 빛이 보이거나").
++ * the picture (2026-11-19: at night, lights far away showed through walls).
 + * Measured with D3D12 occlusion queries: while the enable register is set, the draws of sink_end_impl run inside a
 + * query (one heap slot from the first such draw to the next GET_REPORT, CLEAR, uncounted draw or submit). The
 + * count is known only when the GPU has run that command list, so GET_REPORT hands the report over
@@ -436,8 +436,8 @@ index 54ff926..c65ab09 100644
 + * Gran Turismo 6 draws the glow of each street lamp at night with the depth test OFF (one group of 325 quads at the
 + * end of the scene) and lets the fragment program decide, from the scene's depth read as a 1280x720 texture, whether
 + * the lamp is covered. The zeta is the one its reflection faces, mirror and 2D layer use as well, so the snapshot
-+ * stood at 2048x3174: the glows of lamps behind walls and under the road were in the picture (owner, 2026-11-19:
-+ * "야간 주행을 하면 벽을 뚫고 저 멀리의 빛이 보이거나").
++ * stood at 2048x3174: the glows of lamps behind walls and under the road were in the picture (2026-11-19:
++ * at night, lights far away showed through walls).
 + * The window is a copy of that top-left part, as large as the texture, made anew when the snapshot has changed; two
 + * sizes a zeta are kept. Texel-addressed reads need none - their coordinates are divided by the snapshot's size
 + * (unnorm_dim). LD_ZDEPTH_WINDOW=0: off, the snapshot as before.

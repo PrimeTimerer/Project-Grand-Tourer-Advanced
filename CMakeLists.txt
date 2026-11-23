@@ -36,6 +36,7 @@ if(NOT DEFINED PS3RECOMP_DIR)
 endif()
 get_filename_component(PS3RECOMP_DIR "${PS3RECOMP_DIR}" ABSOLUTE)
 
+
 set(RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/recompiled" CACHE PATH
     "Directory holding the lifter's output: ppu_recomp.h and the lifted sources")
 get_filename_component(RECOMP_DIR "${RECOMP_DIR}" ABSOLUTE)

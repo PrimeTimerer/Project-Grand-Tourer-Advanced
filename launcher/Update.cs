@@ -655,7 +655,7 @@ namespace GT6Launcher
                 return true;
             if (r.StartsWith("gt6menu.") && r.Contains(".settings.json"))
                 return true;
-            return r.StartsWith("trainer\\gt6trainernative.profiles.json") || r == "trainer\\bspec_log.txt";
+            return false;
         }
 
         static List<string> Relative(string root)

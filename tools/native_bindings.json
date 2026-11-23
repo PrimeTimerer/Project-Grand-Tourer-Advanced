@@ -1,0 +1,130 @@
+[
+ {
+  "site": "003D31D4",
+  "word": "C02B1D1C",
+  "anchor": "{ uint32_t tmp = vm_read32(ctx->gpr[11] + 0x1D1C); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[1] = ftmp; }",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "003D3144",
+    "file": "ppu_recomp_011.cpp"
+   },
+   {
+    "entry": "003D3194",
+    "file": "ppu_recomp_052.cpp"
+   },
+   {
+    "entry": "003D31B8",
+    "file": "ppu_recomp_052.cpp"
+   },
+   {
+    "entry": "003D31CC",
+    "file": "ppu_recomp_052.cpp"
+   }
+  ]
+ },
+ {
+  "site": "003D3224",
+  "word": "C02B1D20",
+  "anchor": "{ uint32_t tmp = vm_read32(ctx->gpr[11] + 0x1D20); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[1] = ftmp; }",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "003D31DC",
+    "file": "ppu_recomp_011.cpp"
+   },
+   {
+    "entry": "003D321C",
+    "file": "ppu_recomp_052.cpp"
+   }
+  ]
+ },
+ {
+  "site": "00C063D4",
+  "word": "7CC83378",
+  "anchor": "ctx->gpr[8] = ctx->gpr[6] | ctx->gpr[6];",
+  "before": "",
+  "after": "\n        ctx->gpr[9] = ctx->gpr[7] | ctx->gpr[7];\n        ctx->gpr[6] = (int64_t)(int32_t)(0);",
+  "copies": [
+   {
+    "entry": "00C06264",
+    "file": "ppu_recomp_036.cpp"
+   },
+   {
+    "entry": "00C063C0",
+    "file": "ppu_recomp_057.cpp"
+   },
+   {
+    "entry": "00C063D4",
+    "file": "ppu_recomp_057.cpp"
+   }
+  ]
+ },
+ {
+  "site": "000EDDF0",
+  "word": "38A00100",
+  "anchor": "ctx->gpr[5] = (int64_t)(int32_t)(0x100);",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "000EDD7C",
+    "file": "ppu_recomp_002.cpp"
+   }
+  ]
+ },
+ {
+  "site": "000EDDFC",
+  "word": "7FA4EB78",
+  "anchor": "ctx->gpr[4] = ctx->gpr[29] | ctx->gpr[29];",
+  "before": "ctx->lr = 0x000EDDFC; func_0058DE70(ctx); DRAIN_TRAMPOLINE(ctx);\n        ",
+  "after": "",
+  "copies": [
+   {
+    "entry": "000EDD7C",
+    "file": "ppu_recomp_002.cpp"
+   }
+  ]
+ },
+ {
+  "site": "003A3D58",
+  "word": "7D800026",
+  "anchor": "ctx->gpr[12] = ctx->cr;",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "003A3D58",
+    "file": "ppu_recomp_010.cpp"
+   }
+  ]
+ },
+ {
+  "site": "003A3E0C",
+  "word": "E80100B0",
+  "anchor": "ctx->gpr[0] = vm_read64(ctx->gpr[1] + 0xB0);",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "003A3D58",
+    "file": "ppu_recomp_010.cpp"
+   }
+  ]
+ },
+ {
+  "site": "003A3F20",
+  "word": "F821FF01",
+  "anchor": "vm_write64(ctx->gpr[1] + -0x100, ctx->gpr[1]); ctx->gpr[1] += -0x100;",
+  "before": "",
+  "after": "",
+  "copies": [
+   {
+    "entry": "003A3F20",
+    "file": "ppu_recomp_010.cpp"
+   }
+  ]
+ }
+]
