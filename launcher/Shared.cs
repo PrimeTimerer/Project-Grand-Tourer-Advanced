@@ -196,6 +196,12 @@ namespace GT6Launcher
         [DllImport("user32.dll")]
         static extern int GetSystemMetrics(int index);
 
+        // The main monitor's height in pixels (the launcher's resolution choice marks the one that fits it).
+        public static int MonitorHeight()
+        {
+            return GetSystemMetrics(1);
+        }
+
         public static PcInfo Read()
         {
             var pc = new PcInfo();

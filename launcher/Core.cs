@@ -299,7 +299,7 @@ namespace GT6Launcher
         public readonly Dictionary<string, string> Env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         public readonly List<string> Unset = new List<string>();
         public readonly List<KeyValuePair<string, string>> Copies = new List<KeyValuePair<string, string>>();   // the bat's log rotation
-        public bool FullHd, Overlay, Aa, FullScreen;   // what this exe knows (looked for in the exe itself)
+        public bool FullHd, Overlay, Aa, FullScreen, RealRes;   // what this exe knows (looked for in the exe itself)
 
         public bool Available { get { return Problem == null && Exe != null && File.Exists(Exe); } }
         public string ExeName { get { return Exe == null ? "" : Path.GetFileName(Exe); } }
@@ -380,18 +380,19 @@ namespace GT6Launcher
             try
             {
                 var file = new FileInfo(b.Exe);
-                string stamp = "2:" + file.Length + ":" + file.LastWriteTimeUtc.Ticks;   // (2: the list of names grew; an older record is looked up again)
+                string stamp = "3:" + file.Length + ":" + file.LastWriteTimeUtc.Ticks;   // (3: the list of names grew; an older record is looked up again)
                 string[] known = launcher.Value("Exe", b.ExeName, "").Split('|');
                 if (known.Length != 2 || known[0] != stamp)
                 {
-                    bool[] found = Scan(b.Exe, "MenuFullHd", "PS3_USRDIR_OVERLAY", "GT6_AA", "GT6_FULLSCREEN");
-                    known = new[] { stamp, (found[0] ? "F" : "") + (found[1] ? "O" : "") + (found[2] ? "A" : "") + (found[3] ? "S" : "") };
+                    bool[] found = Scan(b.Exe, "MenuFullHd", "PS3_USRDIR_OVERLAY", "GT6_AA", "GT6_FULLSCREEN", "ScreenRealRes");
+                    known = new[] { stamp, (found[0] ? "F" : "") + (found[1] ? "O" : "") + (found[2] ? "A" : "") + (found[3] ? "S" : "") + (found[4] ? "R" : "") };
                     launcher.Set("Exe", b.ExeName, known[0] + "|" + known[1]);
                 }
                 b.FullHd = known[1].Contains("F");
                 b.Overlay = known[1].Contains("O");
                 b.Aa = known[1].Contains("A");
                 b.FullScreen = known[1].Contains("S");
+                b.RealRes = known[1].Contains("R");   // [GT6 0102] the F2 menu's real resolution ("ScreenRealRes")
             }
             catch (Exception)
             {
@@ -449,12 +450,14 @@ namespace GT6Launcher
         }
     }
 
-    // The F2 menu's settings file (JSON written by the game). The launcher changes one key only, Resolution Full HD
-    // ("MenuFullHd", read by the game when it starts), by editing that value in place: every other key stays as the
-    // menu wrote it. Never while the game runs (the menu writes the file itself).
+    // The F2 menu's settings file (JSON written by the game). The launcher changes the resolution keys only - Full HD
+    // ("MenuFullHd") and the real resolution ("ScreenRealRes": 0 = off, 1 = 1920x1080, 2 = 2560x1440, 3 = 3840x2160),
+    // both read by the game when it starts - by editing those values in place: every other key stays as the menu wrote
+    // it. Never while the game runs (the menu writes the file itself).
     public static class MenuSettings
     {
         static readonly Regex Key = new Regex("\"MenuFullHd\"\\s*:\\s*(true|false)");
+        static readonly Regex RealKey = new Regex("\"ScreenRealRes\"\\s*:\\s*(-?\\d+)");
 
         public static bool FullHd(string path)
         {
@@ -469,21 +472,33 @@ namespace GT6Launcher
             }
         }
 
+        // 0 = off (the game's own Full HD picture), 1..3 = drawn for real at 1920x1080, 2560x1440, 3840x2160.
+        public static int RealRes(string path)
+        {
+            try
+            {
+                Match m = RealKey.Match(File.ReadAllText(path));
+                int value;
+                return m.Success && int.TryParse(m.Groups[1].Value, out value) ? Math.Max(0, Math.Min(3, value)) : 0;
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
         public static void SetFullHd(string path, bool on)
         {
+            SetResolution(path, on, -1);
+        }
+
+        // Both resolution keys in one write; realRes < 0 leaves "ScreenRealRes" as it is (an exe that does not know it).
+        public static void SetResolution(string path, bool fullHd, int realRes)
+        {
             string text = File.Exists(path) ? File.ReadAllText(path) : "";
-            string value = on ? "true" : "false", next;
-            Match m = Key.Match(text);
-            int brace = text.IndexOf('{');
-            if (m.Success)
-                next = text.Substring(0, m.Groups[1].Index) + value + text.Substring(m.Groups[1].Index + m.Groups[1].Length);
-            else if (brace < 0)
-                next = "{\n  \"MenuFullHd\": " + value + "\n}\n";   // no file yet: the menu adds the rest with its defaults
-            else
-            {
-                bool empty = text.Substring(brace + 1).TrimStart().StartsWith("}");
-                next = text.Substring(0, brace + 1) + "\n  \"MenuFullHd\": " + value + (empty ? "\n" : ",") + text.Substring(brace + 1);
-            }
+            string next = Put(text, Key, "MenuFullHd", fullHd ? "true" : "false");
+            if (realRes >= 0)
+                next = Put(next, RealKey, "ScreenRealRes", Math.Min(3, realRes).ToString());
             if (next == text)
                 return;
             if (File.Exists(path))
@@ -493,6 +508,20 @@ namespace GT6Launcher
             if (File.Exists(path))
                 File.Delete(path);
             File.Move(temp, path);
+        }
+
+        // One key's value replaced in place, or the key added first in the object (no file yet: the menu adds the rest
+        // with its defaults).
+        static string Put(string text, Regex key, string name, string value)
+        {
+            Match m = key.Match(text);
+            if (m.Success)
+                return text.Substring(0, m.Groups[1].Index) + value + text.Substring(m.Groups[1].Index + m.Groups[1].Length);
+            int brace = text.IndexOf('{');
+            if (brace < 0)
+                return "{\n  \"" + name + "\": " + value + "\n}\n";
+            bool empty = text.Substring(brace + 1).TrimStart().StartsWith("}");
+            return text.Substring(0, brace + 1) + "\n  \"" + name + "\": " + value + (empty ? "\n" : ",") + text.Substring(brace + 1);
         }
     }
 

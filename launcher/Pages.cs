@@ -146,6 +146,7 @@ namespace GT6Launcher
                 Effect = new DropShadowEffect { Color = Color.FromRgb(0xFF, 0x5A, 0x3D), BlurRadius = 26, ShadowDepth = 0, Opacity = 0.55 },
             });
             bool fullHd = build.FullHd && MenuSettings.FullHd(build.SettingsFile);
+            int realRes = fullHd && build.RealRes && Launcher.Setting("AA") != "spu" ? MenuSettings.RealRes(build.SettingsFile) : 0;
             var subtitle = Ui.Text(build.Describe(), "Caption");
             subtitle.FontSize = 14;
             subtitle.Margin = new Thickness(0, 8, 0, 16);
@@ -153,7 +154,7 @@ namespace GT6Launcher
 
             var chips = new WrapPanel { MaxWidth = 600, Margin = new Thickness(0, 0, 0, 18) };
             chips.Children.Add(files.Ready ? Ui.Chip("", L.T("게임 파일 확인됨"), Ui.Brush("Good")) : Ui.Chip("", L.T("게임 파일 부족"), Ui.Brush("Warn")));
-            chips.Children.Add(Ui.Chip("", fullHd ? "Full HD 1080p" : "720p", fullHd ? Ui.Brush("Accent") : Ui.Brush("SubText")));
+            chips.Children.Add(Ui.Chip("", SettingsPage.ResolutionName(fullHd, realRes), fullHd ? Ui.Brush("Accent") : Ui.Brush("SubText")));
             List<ModInfo> mods = ModStore.List(Launcher);
             int on = mods.Count(m => m.Enabled && m.Root != null);
             int inGame = GameMods.List(Launcher, false).Count;   // mods inside the game data itself: always applied
@@ -294,6 +295,118 @@ namespace GT6Launcher
             return Ui.ToggleRow(label, hint, Launcher.On(key), delegate(bool on) { Launcher.SetSetting(key, on ? "1" : "0"); });
         }
 
+        // How the home page's chip names the resolution (realRes as in MenuSettings.RealRes).
+        public static string ResolutionName(bool fullHd, int realRes)
+        {
+            if (!fullHd)
+                return "720p";
+            switch (realRes)
+            {
+                case 1: return L.T("1080p 선명");
+                case 2: return "1440p";
+                case 3: return "4K";
+                default: return "Full HD 1080p";
+            }
+        }
+
+        // The resolution as ONE choice of tiles (2026-11-24, to make it easy): 720p, the game's own Full HD and - an exe that
+        // knows "ScreenRealRes" - the picture drawn for real at 1920x1080, 2560x1440 or 3840x2160. The tile that fits the
+        // main monitor is marked; a line under the tiles says what the chosen one does. It writes the two keys of the F2
+        // menu's settings file (MenuSettings.SetResolution); tile values: 0 = 720p, 1 = Full HD, 2..4 = real 1..3.
+        FrameworkElement ResolutionPicker(GameBuild build, bool running)
+        {
+            bool fullHd = MenuSettings.FullHd(build.SettingsFile);
+            int real = build.RealRes && fullHd ? MenuSettings.RealRes(build.SettingsFile) : 0;
+            string selected = !fullHd ? "0" : (real == 0 ? 1 : real + 1).ToString();
+            var items = new List<string[]>   // value, name, size
+            {
+                new[] { "0", "720p", "1280×720 · " + L.T("가장 가벼움") },
+                new[] { "1", "1080p", L.T("게임 기본") + " · 1440×1080" },
+            };
+            if (build.RealRes)
+            {
+                items.Add(new[] { "2", L.T("1080p 선명"), "1920×1080" });
+                items.Add(new[] { "3", "1440p", "2560×1440" });
+                items.Add(new[] { "4", "4K", "3840×2160" });
+            }
+            int height = PcInfo.MonitorHeight();
+            string fits = !build.RealRes ? (height >= 1080 ? "1" : "0") : height >= 2160 ? "4" : height >= 1440 ? "3" : height >= 1080 ? "2" : "0";
+
+            var panel = new StackPanel { Margin = new Thickness(0, 0, 0, 8), IsEnabled = !running, Opacity = running ? 0.5 : 1 };
+            var head = Ui.Text(L.T("해상도"), "Body");
+            head.FontWeight = FontWeights.SemiBold;
+            panel.Children.Add(head);
+            var hint = Ui.Text(L.T("높을수록 선명하고 그래픽카드 부담이 큽니다. 게임을 시작할 때 정해지고, 게임 안 F2 → 설정 → 화면과 같은 값입니다."), "Caption");
+            hint.Margin = new Thickness(0, 2, 0, 10);
+            panel.Children.Add(hint);
+            var tiles = new System.Windows.Controls.Primitives.UniformGrid { Rows = 1, Columns = items.Count, MaxWidth = 220 * items.Count, HorizontalAlignment = HorizontalAlignment.Left };   // one row, equal tiles
+            panel.Children.Add(tiles);
+            var note = Ui.Text("", "Caption");
+            note.Margin = new Thickness(0, 8, 0, 0);
+            panel.Children.Add(note);
+
+            var paints = new List<Action>();
+            Action describe = delegate
+            {
+                string text = selected == "0" ? L.T("PS3와 같은 1280×720입니다. 가장 가볍고, 휴대용 PC나 약한 그래픽카드에 맞습니다.")
+                    : selected == "1" ? L.T("게임 자체의 Full HD 모드입니다. 게임이 1440×1080으로 그린 그림을 1920×1080 창에 넓혀 보여 줍니다.")
+                    : L.T("게임 그림을 PC에서 이 해상도로 실제로 그립니다 (늘이기가 아님). 창보다 크면 줄여서 보여 주니, 창을 최대화하거나 Alt+Enter 전체 화면에서 가장 선명합니다.");
+                if (selected != "0" && selected != "1" && Launcher.Setting("AA") == "spu")
+                    text += " " + L.T("안티에일리어싱이 원본 SPU MLAA인 동안에는 게임 기본 1080p로 그립니다.");
+                note.Text = text;
+            };
+            foreach (string[] item in items)
+            {
+                string value = item[0];
+                var tile = new Border { CornerRadius = new CornerRadius(10), BorderThickness = new Thickness(1), Padding = new Thickness(12, 10, 12, 10), Margin = new Thickness(0, 0, item == items[items.Count - 1] ? 0 : 8, 0), Cursor = System.Windows.Input.Cursors.Hand };
+                var stack = new StackPanel();
+                var name = new TextBlock { Text = item[1], FontSize = 20, FontWeight = FontWeights.Bold };
+                stack.Children.Add(name);
+                stack.Children.Add(Ui.Text(item[2], "Caption"));
+                if (value == fits)
+                {
+                    var badge = Ui.Text(L.T("이 모니터에 맞음"), "Caption");
+                    badge.Foreground = Ui.Brush("Accent2");
+                    badge.FontWeight = FontWeights.SemiBold;
+                    badge.Margin = new Thickness(0, 4, 0, 0);
+                    stack.Children.Add(badge);
+                }
+                tile.Child = stack;
+                paints.Add(delegate
+                {
+                    bool now = selected == value;
+                    tile.Background = now ? Ui.Brush("AccentSoft") : Brushes.Transparent;
+                    tile.BorderBrush = now ? Ui.Brush("Accent") : Ui.Brush("Line");
+                    name.Foreground = now ? Ui.Brush("Accent") : Ui.Brush("Text");
+                });
+                tile.MouseLeftButtonUp += delegate
+                {
+                    if (running || selected == value)
+                        return;
+                    int pick = int.Parse(value);
+                    try
+                    {
+                        MenuSettings.SetResolution(build.SettingsFile, pick > 0, build.RealRes ? Math.Max(0, pick - 1) : -1);
+                    }
+                    catch (Exception error)
+                    {
+                        Window.Error(L.T("설정 파일을 쓰지 못했습니다"), error);
+                        Window.Refresh();
+                        return;
+                    }
+                    selected = value;
+                    foreach (Action paint in paints)
+                        paint();
+                    describe();
+                };
+                tiles.Children.Add(tile);
+            }
+            foreach (Action paint in paints)
+                paint();
+            describe();
+            return panel;
+        }
+
         protected override FrameworkElement Build()
         {
             GameBuild build = Launcher.Build;
@@ -302,23 +415,9 @@ namespace GT6Launcher
             var screen = new StackPanel();
             if (build.FullHd)
             {
-                FrameworkElement row = Ui.ToggleRow(L.T("해상도 Full HD (1080p)"),
-                    L.T("게임 자체의 1080p 모드로 그립니다 (내부 1440x1080, 창 1920x1080). 끄면 720p. 게임 안 F2 → 설정 → 화면의 스위치와 같은 값이고, 게임을 시작할 때 정해집니다."),
-                    MenuSettings.FullHd(build.SettingsFile), delegate(bool on)
-                    {
-                        try
-                        {
-                            MenuSettings.SetFullHd(build.SettingsFile, on);
-                        }
-                        catch (Exception error)
-                        {
-                            Window.Error(L.T("설정 파일을 쓰지 못했습니다"), error);
-                            Window.Refresh();
-                        }
-                    });
-                row.IsEnabled = !running;
-                row.Opacity = running ? 0.5 : 1;
-                screen.Children.Add(row);
+                screen.Children.Add(ResolutionPicker(build, running));
+                if (!build.RealRes && build.Available)
+                    screen.Children.Add(Ui.Text(build.ExeName + L.T("는 1080p 선명 · 1440p · 4K가 생기기 전의 빌드입니다."), "Caption"));
                 screen.Children.Add(Ui.Text(running ? L.T("게임이 켜져 있는 동안에는 게임 안 메뉴에서 바꿔 주세요.") : L.T("설정 파일: ") + System.IO.Path.GetFileName(build.SettingsFile) + L.T(" (이 빌드의 F2 메뉴가 쓰는 파일)"), "Caption"));
             }
             else
@@ -346,7 +445,7 @@ namespace GT6Launcher
                     try
                     {
                         if (build.FullHd)
-                            MenuSettings.SetFullHd(build.SettingsFile, false);
+                            MenuSettings.SetResolution(build.SettingsFile, false, build.RealRes ? 0 : -1);
                     }
                     catch (Exception error)
                     {
