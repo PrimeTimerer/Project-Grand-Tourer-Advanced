@@ -244,6 +244,45 @@ void wpf32(uint32_t a, float f)
 }
 bool bridgeReady() { return vm_base && __atomic_load_n(&gt6_trainer_bridge.ready, __ATOMIC_ACQUIRE) != 0; }
 
+// [GT6 0113] Looser Chase Camera (Settings -> Display; public issue #7): the switch and its two values for the bridge
+// (gt6_trainer.cpp chase_cam, P + 0x300 / + 0x304 / + 0x308), and the camera table itself (0x016DDFF0) at once when they
+// change - with it on the game's own stores are answered by the bridge; off, the game's numbers go back: the init's source
+// (0x01130160, 32 bytes) and the camera parameters' + 0x54 / + 0x58 / + 0x60 (0x016E632C) as func_002F6B30 writes them.
+void cameraTick(const Settings& s)
+{
+    if (!bridgeReady())
+        return;
+    const float spring = (float)std::clamp(std::isfinite(s.camSpring) ? s.camSpring : 90.0, 0.0, 300.0);
+    const float angle = (float)std::clamp(std::isfinite(s.camAngle) ? s.camAngle : 35.0, 0.0, 100.0);
+    wpf32(P + 0x304, spring);
+    wpf32(P + 0x308, angle);
+    wp32(P + 0x300, s.camLoose ? 1u : 0u);
+    static int last = -1;
+    static float lastSpring = -1.0f, lastAngle = -1.0f;
+    const int on = s.camLoose ? 1 : 0;
+    if (on == last && spring == lastSpring && angle == lastAngle)
+        return;
+    constexpr uint32_t T = 0x016DDFF0u, Init = 0x01130160u, Prm = 0x016E632Cu;
+    if (on) {
+        wpf32(T + 4, spring);
+        wpf32(T + 8, 200.0f);
+        wp32(T + 12, 0);
+        wpf32(T + 20, angle);
+        wpf32(T + 24, 20.0f);
+        wp32(T + 28, 0);
+    } else if (last == 1) {
+        for (uint32_t i = 0; i < 32; i += 4)
+            wp32(T + i, p32(Init + i));
+        wp32(T, p32(Prm + 0x54));
+        wp32(T + 4, p32(Prm + 0x58));
+        wp32(T + 16, p32(Prm + 0x60));
+        wp32(T + 20, p32(Prm + 0x60));
+    }
+    last = on;
+    lastSpring = spring;
+    lastAngle = angle;
+}
+
 // Committed, readable guest memory (Rpcs3Memory.Regions): the RSX range 0xC0000000..0xD0000000 is left out.
 struct Region {
     uint64_t lo, hi;
@@ -760,6 +799,10 @@ std::string settingsToJson(const Settings& s)
     w.kv("MenuFullHd", s.fullHd);
     w.kv("ScreenRealRes", s.realRes);
     w.kv("ScreenBright", s.screenBright);
+    w.kv("CameraLooseChase", s.camLoose);
+    w.kv("CameraChaseSpring", s.camSpring);
+    w.kv("CameraChaseAngle", s.camAngle);
+    w.kv("NetLanMode", s.lanMode);
     w.kv("MenuLang", s.menuLang);
     w.kv("MenuLastPage", s.lastPage);
     w.close('}');
@@ -823,6 +866,12 @@ void settingsFromJson(const J& j, Settings& s, bool menuKeys)
         I("ScreenRealRes", s.realRes);
         s.realRes = std::clamp(s.realRes, 0, 3);
         D("ScreenBright", s.screenBright);
+        B("CameraLooseChase", s.camLoose);
+        D("CameraChaseSpring", s.camSpring);
+        s.camSpring = std::clamp(std::isfinite(s.camSpring) ? s.camSpring : 90.0, 0.0, 300.0);
+        D("CameraChaseAngle", s.camAngle);
+        s.camAngle = std::clamp(std::isfinite(s.camAngle) ? s.camAngle : 35.0, 0.0, 100.0);
+        B("NetLanMode", s.lanMode);
         I("MenuLang", s.menuLang);
         s.menuLang = std::clamp(s.menuLang, 0, 2);
         I("MenuLastPage", s.lastPage);
@@ -867,6 +916,22 @@ extern "C" int gt6_menu_setting_real_res(void)
         if (!x || x->t != J::Num) return 0;
         const int v = (int)x->n;
         return v >= 0 && v <= 3 ? v : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// [GT6 0114] LAN mode (Settings -> Network; Mabec's GT6 PC build brought it to RPCS3): read by main.cpp at its start like
+// the two above - the game takes its hidden "lanmode" boot argument then. No file, a broken file or no such key = off.
+extern "C" int gt6_menu_setting_lan_mode(void)
+{
+    try {
+        std::string text;
+        J j;
+        if (!readFile(settingsPath(), text) || !jsonParse(text, j) || j.t != J::Obj)
+            return 0;
+        const J* x = j.get("NetLanMode");
+        return x && x->t == J::Bool && x->b ? 1 : 0;
     } catch (...) {
         return 0;
     }
@@ -975,11 +1040,54 @@ std::optional<long long> read(uint32_t obj)
     return v >= 0 && v <= Max ? std::optional<long long>(v) : std::nullopt;
 }
 
+// [GT6 0115] (public issue #8: credits set in the menu showed in the game, the parts shop said "Insufficient credits", the
+// lock did not help.) Test dl1 (GT6_CASH_LOG): after the value at obj + 0x28 was set, the game took its next charge from
+// the new value - but a copy in the game's own heap (0x40000000.., a 64-bit word between two heap pointers: 0x40654068
+// in that run) kept the old one, and that is what the shop's script reads. So the copy is found by the value the object
+// held before the write - an 8-aligned 64-bit word in 0x40000000 .. 0x50000000 between two words that point into that
+// heap - and set as well; its place is kept and checked again (it must still hold what the object held) before each
+// later write.
+static uint32_t g_cashCopy = 0;
+static void writeCopy(long long before, long long v)
+{
+    auto ptr = [](uint32_t w) { return w >= 0x40000000u && w < 0x50000000u; };
+    auto holds = [&](uint32_t a) {
+        uint8_t b[16];
+        if (!rd(a - 4, b, 16))
+            return false;
+        const long long x = (long long)((uint64_t)rbe32(b + 4) << 32 | rbe32(b + 8));
+        return x == before && ptr(rbe32(b)) && ptr(rbe32(b + 12));
+    };
+    if (g_cashCopy && !holds(g_cashCopy))
+        g_cashCopy = 0;
+    if (!g_cashCopy) {
+        const uint32_t lo = (uint32_t)before;
+        int found = 0;
+        uint32_t at = 0;
+        scanWords(&lo, 1, 0x40000000u, [&](int, uint32_t a, const uint8_t*, size_t) {
+            if (a < 0x40000004u || a >= 0x50000000u || ((a - 4) & 7))
+                return;
+            if (holds(a - 4)) { at = a - 4; ++found; }
+        });
+        if (found == 1)
+            g_cashCopy = at;
+        static int said;
+        if (said < 6) { ++said; fprintf(stderr, "[cash] the game's own copy of %lld: %d candidate(s)%s\n", before, found, found == 1 ? "" : " - left alone"); }
+    }
+    if (g_cashCopy)
+        w64(g_cashCopy, (uint64_t)v);
+}
+
 bool write(uint32_t obj, long long v)
 {
-    if (v < 0 || v > Max || !read(obj))
+    const auto before = read(obj);
+    if (v < 0 || v > Max || !before)
         return false;
-    return w64(obj + Off, (uint64_t)v);
+    if (!w64(obj + Off, (uint64_t)v))
+        return false;
+    if (*before != v)
+        writeCopy(*before, v);
+    return true;
 }
 
 // [GT6 0108] (tests, GT6_CASH_LOG=1) A player: credits set in the menu showed in the game, but the parts shop said
@@ -1466,6 +1574,7 @@ struct Engine {
             }
             // [GT6 0101] Brightness (Settings -> Display), live: the presenter draws the picture as out = in^(1 / b)
             rsx_live_draw_present_gamma = (float)(1.0 / std::clamp(std::isfinite(s.screenBright) ? s.screenBright : 1.0, 0.5, 2.0));
+            cameraTick(s);
             control(now, s);
             std::vector<Command> cmds;
             {

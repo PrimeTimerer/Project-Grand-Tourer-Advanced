@@ -169,7 +169,10 @@ extern "C" void rsx_live_draw_upscale_size(unsigned w, unsigned h);
 extern "C" int gt6_res_1080(void) { return g_gt6_res_1080; }   /* (the menu shows which mode this run is in) */
 static int g_gt6_real_res = 0;                      /* [GT6 0102] 0 = off, 1 = 1920x1080, 2 = 2560x1440, 3 = 3840x2160 */
 extern "C" int gt6_real_res(void) { return g_gt6_real_res; }
+static int g_gt6_lan = 0;                             /* [GT6 0114] this run boots with "lanmode" */
+extern "C" int gt6_lan_mode(void) { return g_gt6_lan; }
 extern "C" int gt6_menu_setting_real_res(void);     /* gt6_menu_engine.cpp */
+extern "C" int gt6_menu_setting_lan_mode(void);     /* gt6_menu_engine.cpp [GT6 0114] */
 extern "C" void rsx_live_draw_reports_tick(void);   /* rsx_live_draw.c: ZPASS counts the title may be waiting for [0056] */
 extern "C" int g_spu_force_ch_block;        /* runtime/spu/spu_channels.c: an empty SPU channel read sleeps */
 static long long s_last_pending_present = 0;
@@ -920,6 +923,27 @@ int main(int argc, char** argv)
     /* Defaults a plain start needs (the environment still overrides each):
      * argv[0] as the loader EBOOT hands it to EMAIN, and the live renderer. */
     if (!getenv("PS3_BOOT_PATH")) _putenv_s("PS3_BOOT_PATH", "/dev_hdd0/game/BCES01893/USRDIR/EMAIN.SELF");
+    /* [GT6 0114] LAN MODE (Settings -> Network; public issue #6, and Mabec's GT6 PC build for RPCS3 brought GT6's own LAN
+     * play back: the game's hidden boot argument "lanmode" - RPCS3's "Process ARGV" - with the network up and no PSN).
+     * Each PC also needs a name of its own: the game tells the consoles apart by their Open PSID, which the runtime
+     * derives from the player's name (lv2_register.c open_psid) - here the computer's name unless PS3_NP_ONLINE_ID says
+     * otherwise. The room's own fixes are the bridge's (gt6_trainer.cpp lan_*). GT6_LAN=0/1 overrides the switch. */
+    { const char* e = getenv("GT6_LAN");
+      const int lan = e && *e ? atoi(e) != 0 : gt6_menu_setting_lan_mode() != 0;
+      if (lan) {
+          g_gt6_lan = 1;
+          if (!getenv("PS3_ARGV")) _putenv_s("PS3_ARGV", "lanmode");
+          if (!getenv("PS3_NET_ONLINE")) _putenv_s("PS3_NET_ONLINE", "1");
+          if (!getenv("PS3_NP_ONLINE_ID")) {
+              char name[17] = {0}; int n = 0;
+              const char* pc = getenv("COMPUTERNAME");
+              for (; pc && *pc && n < 16; pc++)
+                  if (isalnum((unsigned char)*pc) || *pc == '-' || *pc == '_') name[n++] = *pc;
+              if (n < 3 || !isalpha((unsigned char)name[0])) { memmove(name + 3, name, 13); memcpy(name, "GT6", 3); name[16] = 0; }
+              _putenv_s("PS3_NP_ONLINE_ID", name);
+          }
+          fprintf(stderr, "[gt6] LAN mode: boot argument \"%s\", network on, player \"%s\"\n", getenv("PS3_ARGV"), getenv("PS3_NP_ONLINE_ID"));
+      } }
     if (!getenv("RSX_LIVE_DRAW")) _putenv_s("RSX_LIVE_DRAW", "1");
     /* Retain unchanged vertex arrays on the GPU. LD_VTX_SLAB=0 keeps the
      * ordinary upload path available for diagnosis and comparison. */

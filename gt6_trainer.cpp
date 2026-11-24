@@ -170,6 +170,8 @@ extern "C" int gt6_trainer_init(void) {
         {0x003D31D4u,0xC02B1D1Cu},{0x003D3224u,0xC02B1D20u},
         {0x00C063D4u,0x7CC83378u},{0x000EDDF0u,0x38A00100u},
         {0x000EDDFCu,0x7FA4EB78u},
+        {0x002F6B84u,0xD1890004u},{0x002F71BCu,0xD00B0020u},
+        {0x00A0BDACu,0x7C63F038u},{0x00A0BF50u,0x7C63F038u},{0x0081715Cu,0x4807972Du},
     };
     for (const auto& s : signatures) if (!range(s[0], 4) || r32(s[0]) != s[1]) {
         fprintf(stderr, "[trainer] disabled: unsupported EMAIN instruction at %08X\n", s[0]); return 0;
@@ -289,10 +291,52 @@ extern "C" int gt6_trainer_bypass(ppu_context* c, uint32_t site) {
     if (c && site == 0x003A3F20) return graph_walk_enter(c);
     return 0;
 }
+/* ---- Looser Chase Camera [GT6 0113, 2026-11-24] (public issue #7: the RPCS3 GT6 PC build has a looser chase camera) --------
+ * The RPCS3 patch "Looser Chase Camera" for 1.22 (author Edo, in RPCS3's patch.yml; facts used, no code copied): the chase
+ * camera's spring damper and its largest angle are two floats of the table at 0x016DDFF0 (+ 4 and + 0x14; the game's 300 and
+ * 30). func_002F7170 (also inside func_002F6DBC) fills the table's 32 bytes from 0x01130160 / 0x01130170, and
+ * func_002F6B30 writes + 4 and + 0x14 again from the camera parameters at 0x016E632C + 0x58 / + 0x60 each time; the patch
+ * takes those stores out (nop at 0x2F71B0 / 0x2F71B8 and 0x2F6B80 / 0x2F6B84) and puts its own numbers into the table.
+ * Here, with P + 0x300 bit 0 (the menu's switch, P + 0x304 / + 0x308 the two values), the table is given the patch's
+ * numbers right after the game's own stores (sites 0x002F71BC, the init's last store, and 0x002F6B84). */
+static void chase_cam(uint32_t site) {
+    if (!(r32(P + 0x300) & 1u)) return;
+    constexpr uint32_t T = 0x016DDFF0u;
+    if (!range(T, 0x20)) return;
+    const float spring = rf32(P + 0x304), angle = rf32(P + 0x308);
+    if (!(spring >= 0.0f && spring <= 300.0f) || !(angle >= 0.0f && angle <= 100.0f)) return;
+    static int said;
+    if (said < 4) { ++said; fprintf(stderr, "[camera] looser chase camera: the game wrote the table (site %08X: spring %.0f, angle %.0f) - now %.0f / %.0f\n",
+                                    site, rf32(T + 4), rf32(T + 20), spring, angle); }
+    if (site == 0x002F71BCu) { wf32(T, 30.0f); wf32(T + 8, 200.0f); w32(T + 12, 0); wf32(T + 16, 10.0f); wf32(T + 24, 20.0f); w32(T + 28, 0); }
+    wf32(T + 4, spring); wf32(T + 20, angle);
+}
+
+/* ---- LAN mode [GT6 0114, 2026-11-24] (Mabec's GT6 PC build for RPCS3 - credits in the README - and the patches it uses,
+ * "LAN Room Sync Without PSN" and RPCS3's "Develop Settings"; facts used, no code copied) -------------------------------------
+ * With the hidden boot argument "lanmode" (main.cpp, the menu's LAN switch) GT6 plays over the home network - but it keeps its
+ * "online" flag (r31 + 0x684F) at "network up AND signed in to PSN", so a host never shares its room and the others wait at
+ * "Creating room... Please wait": at 0x00A0BDAC and 0x00A0BF50 the flag is made "network up" alone (and r3,r3,r30 ->
+ * mr r3,r30). The game's developer settings (R1 + SELECT at My Home) are opened too - completing the tutorials there is
+ * what unlocks Open Lobby: the answer of func_00890888 at 0x0081715C is 1 (the patch's li r3,1). Only in LAN mode. */
+static bool lan_on() {
+    static const int on = [] { const char* a = getenv("PS3_ARGV"); return a && strstr(a, "lanmode") ? 1 : 0; }();
+    return on != 0;
+}
+static void lan_site(ppu_context* c, uint32_t site) {
+    if (!lan_on()) return;
+    static int said;
+    if (said < 3) { ++said; fprintf(stderr, "[lan] site %08X: %s\n", site, site == 0x0081715Cu ? "developer settings on" : "the room follows 'network up'"); }
+    if (site == 0x0081715Cu) { c->gpr[3] = 1; return; }
+    c->gpr[3] = c->gpr[30];
+}
+
 extern "C" void gt6_trainer_after(ppu_context* c, uint32_t site) {
     if (site == 0x003A3E0C) { graph_search_leave(); return; }
     if (c) graph_search_selftest(c);
     if (!c || !ready()) return;
+    if (site == 0x002F6B84 || site == 0x002F71BC) { chase_cam(site); return; }   /* [GT6 0113] */
+    if (site == 0x00A0BDAC || site == 0x00A0BF50 || site == 0x0081715C) { lan_site(c, site); return; }   /* [GT6 0114] */
     if (site == 0x000EDDF0) { name_code = (uint32_t)c->gpr[3]; w32(P + 0x40, name_code); return; }
     if (site == 0x000EDDFC) {
         std::string name;
