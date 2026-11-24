@@ -1,0 +1,41 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 8adf6c7..28d701e 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -7833,6 +7833,28 @@ static void shader_disk_cache_progress(u64 value)
+             (unsigned long long)g_ld_shader_disk_rejects);
+ }
+ 
++/* Every folder on the way to the cache folder is made first. A release has no scratch\ beside the exe while its
++ * PLAY_GT6.bat names scratch\rsx_shader_cache_v2 there: one CreateDirectoryA gave ERROR_PATH_NOT_FOUND (3), and the
++ * shader cache and the PSO library were off on every new installation (GT6 public issue #4). A folder that is there
++ * already or cannot be made is left to the last CreateDirectoryA to report. */
++static void shader_disk_cache_make_parents(const char* dir)
++{
++    char part[MAX_PATH];
++    const size_t n = strlen(dir);
++    if (n == 0u || n >= sizeof(part))
++        return;
++    memcpy(part, dir, n + 1u);
++    for (size_t i = 1u; i < n; ++i) {
++        if (part[i] != '\\' && part[i] != '/')
++            continue;
++        if (part[i - 1u] == '\\' || part[i - 1u] == '/' || part[i - 1u] == ':')
++            continue;                       /* (a root, a drive, a doubled separator) */
++        part[i] = '\0';
++        CreateDirectoryA(part, NULL);
++        part[i] = dir[i];
++    }
++}
++
+ static int shader_disk_cache_prepare(void)
+ {
+     if (g_ld_shader_disk_ready >= 0)
+@@ -7856,6 +7878,7 @@ static int shader_disk_cache_prepare(void)
+                  SHADER_DISK_CACHE_VERSION);
+     }
+ 
++    shader_disk_cache_make_parents(g_ld_shader_disk_dir);
+     if (!CreateDirectoryA(g_ld_shader_disk_dir, NULL) &&
+         GetLastError() != ERROR_ALREADY_EXISTS) {
+         fprintf(stderr,
