@@ -1,0 +1,369 @@
+diff --git a/libs/misc/cellOskDialog.c b/libs/misc/cellOskDialog.c
+index 14034ce..e2cfeef 100644
+--- a/libs/misc/cellOskDialog.c
++++ b/libs/misc/cellOskDialog.c
+@@ -110,6 +110,12 @@ static LRESULT CALLBACK osk_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+ static DWORD WINAPI osk_thread(LPVOID unused)
+ {
+     (void)unused;
++    /* [GT6 0104] The box is laid out in fixed pixels: made unaware of the display's scale on this thread, so Windows
++     * scales it as before, now that the game window is per-monitor DPI aware (rsx_null_backend.c). */
++    { typedef HANDLE (WINAPI* set_thread_ctx_fn)(HANDLE);
++      HMODULE u = GetModuleHandleW(L"user32.dll");
++      set_thread_ctx_fn st = u ? (set_thread_ctx_fn)GetProcAddress(u, "SetThreadDpiAwarenessContext") : NULL;
++      if (st) st((HANDLE)(LONG_PTR)-1); }     /* DPI_AWARENESS_CONTEXT_UNAWARE */
+     HINSTANCE hi = GetModuleHandleW(NULL);
+     static int registered = 0;
+     if (!registered) {
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 5285820..4f30ac0 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1420,6 +1420,7 @@ typedef enum {
+     LD_FLUSH_PIXEL_CONSTANT_RING,
+     LD_FLUSH_DESCRIPTOR_RING,
+     LD_FLUSH_SHUTDOWN,
++    LD_FLUSH_RESIZE,            /* [GT6 0104] the swap chain follows the window's size */
+     LD_FLUSH_REASON_COUNT
+ } ld_flush_reason;
+ 
+@@ -2506,7 +2507,7 @@ static void ld_flush(ld_flush_reason reason)
+       if ((unsigned)reason < LD_FLUSH_REASON_COUNT) cnt[reason]++;
+       if (now.QuadPart - t0 >= 5 * f) {
+           static const char* nm[LD_FLUSH_REASON_COUNT] = { "present", "guest_ref", "vertex_ring", "vconst_ring",
+-              "retire", "movie", "movie_present", "readback", "pconst_ring", "descriptor_ring", "shutdown" };
++              "retire", "movie", "movie_present", "readback", "pconst_ring", "descriptor_ring", "shutdown", "resize" };
+           char line[400]; int n = 0;
+           for (int i = 0; i < LD_FLUSH_REASON_COUNT; i++)
+               if (cnt[i]) n += snprintf(line + n, sizeof line - n, " %s=%u", nm[i], cnt[i]);
+@@ -16367,6 +16368,63 @@ static UINT ld_sync_interval(void)
+     return cached;
+ }
+ 
++/* ---- The back buffer follows the window [GT6 0104] ---------------------------------------------------------------
++ * The swap chain was made at the picture's size (g.width x g.height) and the compositor stretched it over whatever the
++ * window's client area was - a second, blurring resample in a maximized window or in full screen, and a third on a
++ * high-DPI monitor while the game window was not DPI aware (a 1920x1080 window was 2880x1620 physical pixels at 150 %).
++ * Now the window is per-monitor DPI aware (rsx_null_backend.c) and the back buffer is the client area's size: when that
++ * changes, the GPU is waited for and ResizeBuffers makes the two back buffers again. The present draws the picture once,
++ * into the biggest rectangle of the picture's shape (black around it): 1:1 when the window and the scanout have the
++ * same size (a 1920x1080 window in 1080p mode, full screen at a real resolution that matches the monitor).
++ * g.width x g.height stay the picture's size - the guest canvas uses them. LD_BACKBUFFER_FOLLOW=0 = the fixed size,
++ * as before. LD_PRESENT_FIT_TEST=<w>x<h> takes that as the client area (a hidden test window has the picture's). */
++static u32 g_bb_w, g_bb_h;          /* the back buffers' size */
++static int ld_bb_follow_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("LD_BACKBUFFER_FOLLOW"); on = !(e && *e == '0'); }
++    return on;
++}
++static int ld_client_size(LONG* cw, LONG* ch)
++{
++    static int test_w = -1, test_h = 0;
++    if (test_w < 0) { const char* e = getenv("LD_PRESENT_FIT_TEST"); test_w = 0;
++                      if (e && sscanf(e, "%dx%d", &test_w, &test_h) != 2) test_w = test_h = 0; }
++    if (test_w > 0 && test_h > 0) { *cw = test_w; *ch = test_h; return 1; }
++    RECT cr;
++    if (!s_ld_hwnd || !GetClientRect(s_ld_hwnd, &cr)) return 0;
++    *cw = cr.right - cr.left; *ch = cr.bottom - cr.top;
++    return 1;
++}
++static void ld_backbuffer_follow(void)
++{
++    LONG cw = 0, ch = 0;
++    if (!ld_bb_follow_on() || !g.swap || !ld_client_size(&cw, &ch)) return;
++    if (cw < 64 || ch < 64 || cw > 16384 || ch > 16384) return;     /* minimized, or no size yet */
++    if ((u32)cw == g_bb_w && (u32)ch == g_bb_h) return;
++    static LONG fail_w, fail_h;         /* a size ResizeBuffers refused is not tried again every frame */
++    if (cw == fail_w && ch == fail_h) return;
++    ld_flush(LD_FLUSH_RESIZE);          /* everything recorded so far, and every frame before, done on the GPU */
++    if (!g.ready) return;
++    for (u32 i = 0; i < LD_SWAP_BUFFERS; i++)
++        if (g.backbuf[i]) { g.backbuf[i]->lpVtbl->Release(g.backbuf[i]); g.backbuf[i] = NULL; }
++    const HRESULT hr = g.swap->lpVtbl->ResizeBuffers(g.swap, LD_SWAP_BUFFERS, (UINT)cw, (UINT)ch, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
++    for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {
++        g.swap->lpVtbl->GetBuffer(g.swap, i, &IID_ID3D12Resource, (void**)&g.backbuf[i]);
++        if (g.backbuf[i]) g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.backbuf[i], NULL, rtv_handle(i));
++    }
++    if (FAILED(hr)) {
++        fprintf(stderr, "[backbuffer] ResizeBuffers %ldx%ld failed hr=0x%08lX: stays %ux%u\n", (long)cw, (long)ch,
++                (unsigned long)hr, g_bb_w, g_bb_h);
++        fail_w = cw; fail_h = ch;
++        return;
++    }
++    fprintf(stderr, "[backbuffer] %ux%u -> %ldx%ld: the window's client area, frame %u\n", g_bb_w, g_bb_h, (long)cw, (long)ch,
++            g_ld_frames);
++    g_bb_w = (u32)cw; g_bb_h = (u32)ch;
++    ld_ls_invalidate();
++}
++
+ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+                        rsx_live_guest_ptr_fn guest_fn, void* guest_user)
+ {
+@@ -16562,6 +16620,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+         g.swap->lpVtbl->GetBuffer(g.swap, i, &IID_ID3D12Resource, (void**)&g.backbuf[i]);
+         g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.backbuf[i], NULL, rtv_handle(i));
+     }
++    g_bb_w = width; g_bb_h = height;    /* [GT6 0104] (ld_backbuffer_follow) */
+ 
+     /* upload arena */
+     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+@@ -17783,6 +17842,8 @@ void rsx_live_draw_present(u32 buffer_id)
+           last_present_target = target;
+       } }
+     ID3D12Resource* srcimg = presented_surface->tex;
++    ld_backbuffer_follow();             /* [GT6 0104] the back buffer = the window's client area */
++    const u32 bb_w = g_bb_w, bb_h = g_bb_h;
+     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+     ID3D12Resource* bb = g.backbuf[bbi];
+     const display_buffer_t* scanout = buffer_id < 8 && g.display_buffers[buffer_id].valid
+@@ -17791,34 +17852,32 @@ void rsx_live_draw_present(u32 buffer_id)
+     const u32 scan_w = scanout ? ld_hx(presented_surface, scanout->width) : 0u;
+     const u32 scan_h = scanout ? ld_hy(presented_surface, scanout->height) : 0u;
+     const rsx_present_copy_plan scanout_copy = rsx_present_plan_copy(
+-        presented_surface->w, presented_surface->h, g.width, g.height, scan_w, scan_h);
++        presented_surface->w, presented_surface->h, bb_w, bb_h, scan_w, scan_h);
+     if (!scanout_copy.whole_resource) {
+         static unsigned region_logs;
+         if (PS3_LOG_FIRST(region_logs, 4u))
+             fprintf(stderr, "[scanout-copy] source=%ux%u display=%ux%u destination=%ux%u region=%ux%u clear=%d\n",
+-                presented_surface->w, presented_surface->h, scan_w, scan_h, g.width, g.height,
++                presented_surface->w, presented_surface->h, scan_w, scan_h, bb_w, bb_h,
+                 scanout_copy.width, scanout_copy.height, scanout_copy.clear_destination);
+     }
+-    /* [GT6 0103] A client area of another shape than the back buffer - a maximized window, full screen on a 16:10,
+-     * 21:9 or 4:3 monitor: the compositor stretches the back buffer over the whole client area, so the picture is drawn
+-     * into the part of the back buffer that comes out there in the picture's shape (the back buffer's), centred, black
+-     * around it. LD_PRESENT_FIT_TEST=<w>x<h> takes that as the client area (a hidden test window has the picture's). */
++    /* [GT6 0103] A client area of another shape than the picture (g.width x g.height) - a maximized window, full screen
++     * on a 16:10, 21:9 or 4:3 monitor: the picture goes into the biggest rectangle of its shape there, centred, black
++     * around it. That rectangle in back-buffer pixels: the same when the back buffer follows the window [GT6 0104];
++     * with a fixed back buffer the compositor stretches it over the client area, so the rectangle is the part that
++     * comes out in the picture's shape there. */
+     int fitted = 0;
+     float fit_x = 0.0f, fit_y = 0.0f, fit_w = 0.0f, fit_h = 0.0f;
+     const u32 fit_src_w = scanout && scan_w ? scan_w : scanout_copy.width;
+     const u32 fit_src_h = scanout && scan_h ? scan_h : scanout_copy.height;
+-    { static int test_w = -1, test_h = 0;
+-      if (test_w < 0) { const char* e = getenv("LD_PRESENT_FIT_TEST"); test_w = 0;
+-                        if (e && sscanf(e, "%dx%d", &test_w, &test_h) != 2) test_w = test_h = 0; }
+-      RECT cr = {0, 0, test_w, test_h};
+-      if ((test_w > 0 || (s_ld_hwnd && GetClientRect(s_ld_hwnd, &cr))) && fit_src_w && fit_src_h && g.width && g.height) {
+-          const double cw = (double)(cr.right - cr.left), chh = (double)(cr.bottom - cr.top);
+-          const double ca = cw / (chh > 0.0 ? chh : 1.0), ba = (double)g.width / (double)g.height;
+-          if (cw >= 16.0 && chh >= 16.0 && fabs(ca / ba - 1.0) > 0.005) {
++    { LONG lcw = 0, lch = 0;
++      if (ld_client_size(&lcw, &lch) && fit_src_w && fit_src_h && g.width && g.height && bb_w && bb_h) {
++          const double cw = (double)lcw, chh = (double)lch;
++          const double ca = cw / (chh > 0.0 ? chh : 1.0), pa = (double)g.width / (double)g.height;
++          if (cw >= 16.0 && chh >= 16.0 && fabs(ca / pa - 1.0) > 0.005) {
+               double pw = cw, ph = chh;                       /* the picture in the client area */
+-              if (ca > ba) pw = chh * ba; else ph = cw / ba;
+-              fit_x = (float)((cw - pw) * 0.5 * g.width / cw);  fit_w = (float)(pw * g.width / cw);
+-              fit_y = (float)((chh - ph) * 0.5 * g.height / chh); fit_h = (float)(ph * g.height / chh);
++              if (ca > pa) pw = chh * pa; else ph = cw / pa;
++              fit_x = (float)((cw - pw) * 0.5 * bb_w / cw);  fit_w = (float)(pw * bb_w / cw);
++              fit_y = (float)((chh - ph) * 0.5 * bb_h / chh); fit_h = (float)(ph * bb_h / chh);
+               fitted = 1;
+           }
+           static int last_fit = -1; static LONG last_cw, last_ch;
+@@ -17826,7 +17885,7 @@ void rsx_live_draw_present(u32 buffer_id)
+               last_fit = fitted; last_cw = (LONG)cw; last_ch = (LONG)chh;
+               if (fitted)
+                   fprintf(stderr, "[present-fit] client area %.0fx%.0f: the picture into back buffer %.1f,%.1f %.1fx%.1f of %ux%u, "
+-                                  "black around it, frame %u\n", cw, chh, fit_x, fit_y, fit_w, fit_h, g.width, g.height, g_ld_frames);
++                                  "black around it, frame %u\n", cw, chh, fit_x, fit_y, fit_w, fit_h, bb_w, bb_h, g_ld_frames);
+               else
+                   fprintf(stderr, "[present-fit] client area %.0fx%.0f has the picture's shape again, frame %u\n", cw, chh,
+                           g_ld_frames);
+@@ -17847,9 +17906,10 @@ void rsx_live_draw_present(u32 buffer_id)
+     int stretched = 0;
+     { static int env = -2;
+       if (env == -2) { const char* e = getenv("LD_PRESENT_STRETCH"); env = e ? (*e != '0') : -1; }
+-      const int want = env >= 0 ? env : rsx_live_draw_present_stretch;
++      /* [GT6 0104] a back buffer that follows the window always gets the whole picture, whatever the mode's own choice */
++      const int want = env >= 0 ? env : (rsx_live_draw_present_stretch || ld_bb_follow_on());
+       stretched = want && scanout && scan_w && scan_h &&
+-          (scan_w != g.width || scan_h != g.height) &&
++          (scan_w != bb_w || scan_h != bb_h) &&
+           scan_w <= presented_surface->w && scan_h <= presented_surface->h;
+       if ((stretched || toned || fitted) &&
+           (stretch_pso = ld_scaled_blit_pso_mode(DXGI_FORMAT_R8G8B8A8_UNORM, toned ? 2 : 0)) != NULL) {
+@@ -17863,7 +17923,7 @@ void rsx_live_draw_present(u32 buffer_id)
+         static unsigned told, told_tone;
+         if (stretched && PS3_LOG_FIRST(told, 2u))
+             fprintf(stderr, "[scanout-stretch] %ux%u of surface %ux%u over the %ux%u window\n", scan_w, scan_h,
+-                    presented_surface->w, presented_surface->h, g.width, g.height);
++                    presented_surface->w, presented_surface->h, bb_w, bb_h);
+         if (toned && PS3_LOG_FIRST(told_tone, 2u))
+             fprintf(stderr, "[present-tone] out = in^%.3f (the host's %.3f x the video out's %.3f)%s\n", tone,
+                     rsx_live_draw_present_gamma, cellAvconfExt_display_gamma(), stretched ? ", stretched" : "");
+@@ -17888,7 +17948,7 @@ void rsx_live_draw_present(u32 buffer_id)
+         g.list->lpVtbl->SetGraphicsRootSignature(g.list, g_sblit_rs);
+         /* stretched: the scanout over the whole window; else ([GT6 0101] toned only) the copy's region 1:1, the rest
+          * of the window cleared as the copy path clears it */
+-        const u32 cw = stretched ? g.width : scanout_copy.width, ch = stretched ? g.height : scanout_copy.height;
++        const u32 cw = stretched ? bb_w : scanout_copy.width, ch = stretched ? bb_h : scanout_copy.height;
+         if (fitted || (!stretched && scanout_copy.clear_destination)) {
+             const float black[4] = {0, 0, 0, 1};
+             g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, black, 0, NULL);
+@@ -17916,14 +17976,14 @@ void rsx_live_draw_present(u32 buffer_id)
+         g.list->lpVtbl->ResourceBarrier(g.list, 1, &sb[0]);
+         /* (the back buffer is a render target now: the overlay draws into it as it is) */
+         if (rsx_live_draw_overlay_on && rsx_live_draw_overlay_draw && rsx_live_draw_overlay_on())
+-            rsx_live_draw_overlay_draw(g.dev, g.queue, g.list, bb, (size_t)rtv_handle(bbi).ptr, g.width, g.height);
++            rsx_live_draw_overlay_draw(g.dev, g.queue, g.list, bb, (size_t)rtv_handle(bbi).ptr, bb_w, bb_h);
+         /* [GT6 0101] LD_PRESENT_DUMP=<dir>: the window's picture as it goes out (brightness, stretch, overlay) at the
+          * frames LD_FRAME_DUMP dumps - this drawn present only; the plain copy is the display buffer itself */
+         { static const char* pd = (const char*)-1;
+           if (pd == (const char*)-1) pd = getenv("LD_PRESENT_DUMP");
+           if (pd && pd[0] && dump_now) {
+               surface_t bbs; memset(&bbs, 0, sizeof bbs);
+-              bbs.tex = bb; bbs.w = g.width; bbs.h = g.height; bbs.fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
++              bbs.tex = bb; bbs.w = bb_w; bbs.h = bb_h; bbs.fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+               char path[MAX_PATH * 2];
+               snprintf(path, sizeof path, "%s\\present_%06u.ppm", pd, dump_n - 1u);
+               ld_dump_surface_ppm(path, &bbs);
+@@ -17974,7 +18034,7 @@ void rsx_live_draw_present(u32 buffer_id)
+     bar[1].Transition.StateAfter = overlay ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_PRESENT;
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+     if (overlay) {
+-        rsx_live_draw_overlay_draw(g.dev, g.queue, g.list, bb, (size_t)rtv_handle(bbi).ptr, g.width, g.height);
++        rsx_live_draw_overlay_draw(g.dev, g.queue, g.list, bb, (size_t)rtv_handle(bbi).ptr, bb_w, bb_h);
+         bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+         bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+         g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar[1]);
+@@ -18006,7 +18066,7 @@ void rsx_live_draw_present(u32 buffer_id)
+                     "target=%u size=%ux%u window=%ux%u\n",
+                     (unsigned long)present_hr, g_ld_frames,
+                     target, g.surfaces[target].w, g.surfaces[target].h,
+-                    g.width, g.height);
++                    bb_w, bb_h);
+             ld_dump_dred("Present", present_hr);
+             g.ready = 0;
+         }
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index a499689..8980931 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -159,15 +159,63 @@ static void full_toggle(HWND hwnd)
+     if (s_full) full_leave(hwnd); else full_enter(hwnd);
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * DPI [GT6 0104]
++ *
++ * The process is per-monitor DPI aware (V2), set before the window is made: Windows no longer stretches the window's
++ * picture by the display's scale - at 150 % a 1920x1080 window was 2880x1620 pixels, bigger than a 2560x1600 screen,
++ * and blurred - and every coordinate here is a real pixel. The back buffer follows the client area
++ * (rsx_live_draw.c, ld_backbuffer_follow). GT6_DPI_AWARE=0 = as before.
++ * -----------------------------------------------------------------------*/
++static UINT s_dpi = 96;     /* the system's, when the window was made */
++static void dpi_aware(void)
++{
++    const char* e = getenv("GT6_DPI_AWARE");
++    HMODULE u = GetModuleHandleA("user32.dll");
++    typedef BOOL (WINAPI* set_ctx_fn)(HANDLE);
++    typedef UINT (WINAPI* sys_dpi_fn)(void);
++    if (e && *e == '0') {
++        fprintf(stderr, "[window] per-monitor DPI aware: off (GT6_DPI_AWARE=0)\n");
++        return;
++    }
++    set_ctx_fn set = u ? (set_ctx_fn)GetProcAddress(u, "SetProcessDpiAwarenessContext") : NULL;
++    const BOOL ok = set ? set((HANDLE)(LONG_PTR)-4) : FALSE;      /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
++    const DWORD err = ok ? 0 : GetLastError();
++    sys_dpi_fn sys = u ? (sys_dpi_fn)GetProcAddress(u, "GetDpiForSystem") : NULL;
++    if (ok && sys) s_dpi = sys();
++    fprintf(stderr, "[window] per-monitor DPI aware: %s (system DPI %u = %u %%)\n",
++            ok ? "yes" : set ? "refused" : "not offered by this Windows", s_dpi, s_dpi * 100u / 96u);
++    if (!ok && set) fprintf(stderr, "[window] SetProcessDpiAwarenessContext error %lu\n", (unsigned long)err);
++}
++
++/* The frame and the caption around a client area at a DPI (0 = the window's own, or the system's). */
++static void frame_extra(HWND hwnd, DWORD style, DWORD exstyle, LONG* fw, LONG* fh)
++{
++    typedef BOOL (WINAPI* adj_fn)(LPRECT, DWORD, BOOL, DWORD, UINT);
++    typedef UINT (WINAPI* win_dpi_fn)(HWND);
++    static adj_fn adj = (adj_fn)-1;
++    static win_dpi_fn wdpi = (win_dpi_fn)-1;
++    if (adj == (adj_fn)-1) {
++        HMODULE u = GetModuleHandleA("user32.dll");
++        adj = u ? (adj_fn)GetProcAddress(u, "AdjustWindowRectExForDpi") : NULL;
++        wdpi = u ? (win_dpi_fn)GetProcAddress(u, "GetDpiForWindow") : NULL;
++    }
++    RECT nc = {0, 0, 0, 0};
++    const UINT dpi = hwnd && wdpi ? wdpi(hwnd) : s_dpi;
++    if (adj && dpi) adj(&nc, style, FALSE, exstyle, dpi);
++    else AdjustWindowRectEx(&nc, style, FALSE, exstyle);
++    *fw = nc.right - nc.left;
++    *fh = nc.bottom - nc.top;
++}
++
+ /* While the window is dragged by its frame: the client area keeps the picture's shape. */
+ static void keep_shape(HWND hwnd, UINT edge, RECT* r)
+ {
+     const long long pw = (long long)s_state.width, ph = (long long)s_state.height;
+     if (pw <= 0 || ph <= 0)
+         return;
+-    RECT nc = {0, 0, 0, 0};
+-    AdjustWindowRectEx(&nc, (DWORD)GetWindowLongA(hwnd, GWL_STYLE), FALSE, (DWORD)GetWindowLongA(hwnd, GWL_EXSTYLE));
+-    const LONG fw = nc.right - nc.left, fh = nc.bottom - nc.top;      /* the frame and the caption */
++    LONG fw, fh;                                                       /* the frame and the caption */
++    frame_extra(hwnd, (DWORD)GetWindowLongA(hwnd, GWL_STYLE), (DWORD)GetWindowLongA(hwnd, GWL_EXSTYLE), &fw, &fh);
+     const long long cw = (r->right - r->left) - fw, ch = (r->bottom - r->top) - fh;
+     switch (edge) {
+     case WMSZ_LEFT: case WMSZ_RIGHT:
+@@ -411,6 +459,7 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+     s_state.width = width;
+     s_state.height = height;
+     s_state.clear_color = RGB(0, 0, 64); /* dark blue default */
++    dpi_aware();                         /* [GT6 0104] before the window is made */
+ 
+     /* Register window class */
+     WNDCLASSEXA wc = {0};
+@@ -423,22 +472,40 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+     wc.lpszClassName = "ps3recomp_null";
+     RegisterClassExA(&wc);
+ 
+-    /* Compute window size from client area */
+-    RECT wr = {0, 0, (LONG)width, (LONG)height};
+-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
++    /* Compute window size from client area. [GT6 0104] In real pixels, 1:1 with the picture; when that window would not
++     * fit the primary monitor's work area, the biggest client area of the picture's shape that does, centred there. */
++    LONG fw = 0, fh = 0;
++    frame_extra(NULL, WS_OVERLAPPEDWINDOW, 0, &fw, &fh);
++    LONG cw = (LONG)width, ch = (LONG)height;
++    int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT;
++    { RECT work;
++      if (width && height && SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
++          const LONG aw = (work.right - work.left) - fw, ah = (work.bottom - work.top) - fh;
++          if (aw > 64 && ah > 64 && (cw > aw || ch > ah)) {
++              if ((long long)aw * height <= (long long)ah * width) { cw = aw; ch = (LONG)((long long)aw * height / width); }
++              else { ch = ah; cw = (LONG)((long long)ah * width / height); }
++              wx = work.left + ((work.right - work.left) - (cw + fw)) / 2;
++              wy = work.top + ((work.bottom - work.top) - (ch + fh)) / 2;
++              fprintf(stderr, "[window] %ux%u does not fit the work area %ldx%ld: client area %ldx%ld\n", width, height,
++                      (long)(work.right - work.left), (long)(work.bottom - work.top), (long)cw, (long)ch);
++          }
++      } }
+ 
+     s_state.hwnd = CreateWindowExA(
+         0, "ps3recomp_null",
+         title ? title : "ps3recomp",
+         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+-        CW_USEDEFAULT, CW_USEDEFAULT,
+-        wr.right - wr.left, wr.bottom - wr.top,
++        wx, wy,
++        cw + fw, ch + fh,
+         NULL, NULL, GetModuleHandle(NULL), NULL);
+ 
+     if (!s_state.hwnd) {
+         printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());
+         return -1;
+     }
++    { RECT cr; if (GetClientRect(s_state.hwnd, &cr))       /* [GT6 0104] */
++          fprintf(stderr, "[window] client area %ldx%ld (asked %ux%u), frame %ldx%ld\n", (long)(cr.right - cr.left),
++                  (long)(cr.bottom - cr.top), width, height, (long)fw, (long)fh); }
+ 
+     s_state.hdc = GetDC(s_state.hwnd);
+     s_state.last_fps_time = GetTickCount64();
