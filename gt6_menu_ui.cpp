@@ -43,6 +43,7 @@ extern void (*rsx_live_draw_overlay_draw)(void* dev, void* queue, void* list, vo
                                           unsigned height);
 extern int (*cellPad_overlay_hook)(unsigned port, unsigned buttons);
 int gt6_res_1080(void);     /* main.cpp: 1 = this run is in the game's 1080p mode */
+int gt6_real_res(void);     /* main.cpp [GT6 0102]: this run's real resolution (Settings::realRes, 0 = off) */
 }
 
 using namespace gt6menu;
@@ -803,10 +804,34 @@ void pageSettings(Settings& s)
                                                  "게임이 켜질 때 정해지므로 다음 실행부터 적용됩니다."),
                       &s.fullHd))
             U.dirty = true;
+        // [GT6 0102] Real resolution: the game's 1440x1080 buffers drawn that large on the host (from the next start)
+        if (s.fullHd) {
+            rowLabel(T_("실제 해상도"), T_("게임의 1440x1080 화면을 PC에서 이 크기로 실제로 그립니다 (늘이기가 아님). 창보다 크면 창에 "
+                                         "맞게 줄여 보여 줘서 더 매끄럽습니다. 높을수록 GPU 부담이 큽니다. 다음 실행부터 적용됩니다."));
+            const float w = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 3) / 4.0f;
+            const char* names[] = {T_("끄기 (1440x1080)"), "1920x1080", "2560x1440", "3840x2160"};
+            for (int i = 0; i < 4; i++) {
+                if (i)
+                    ImGui::SameLine();
+                ImGui::PushID(950 + i);
+                if (button(names[i], s.realRes == i ? 1 : 2, std::floor(w))) {
+                    s.realRes = i;
+                    U.dirty = true;
+                }
+                ImGui::PopID();
+            }
+        }
+        // [GT6 0101] Brightness (2026-11-24, a player's report: "image is very dim"): applied at the present, live
+        if (rowSlider(T_("밝기"), T_("화면이 어둡거나 밝게 보일 때 조절합니다. 1.00이 게임이 그린 그대로이고, 올리면 중간 밝기가 "
+                                   "밝아집니다(검정과 흰색은 그대로). 바로 적용됩니다."),
+                      nullptr, &s.screenBright, 0.6, 1.6, 0.5, 2.0, "%.2f", true))
+            U.dirty = true;
         endRows();
     }
     if (s.fullHd != (gt6_res_1080() != 0))
         note(s.fullHd ? T_("게임을 다시 실행하면 1080p로 켜집니다.") : T_("게임을 다시 실행하면 720p로 켜집니다."), kFaint);
+    else if (s.fullHd && s.realRes != gt6_real_res())
+        note(T_("게임을 다시 실행하면 새 실제 해상도로 그립니다."), kFaint);
     endCard();
 
 

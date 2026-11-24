@@ -1,0 +1,151 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 75fa029..70617e5 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -63,6 +63,7 @@ u32  rsx_live_draw_get_last_draws(void) { return 0; }
+ unsigned long long rsx_live_draw_fence_wait_us(unsigned* w) { if (w) *w = 0; return 0; }
+ void rsx_live_draw_set_present_nowait(int on) { (void)on; }
+ int rsx_live_draw_present_stretch = 0;
++float rsx_live_draw_present_gamma = 1.0f;
+ double rsx_live_draw_get_present_fps(void) { return 0.0; }
+ void rsx_live_draw_dump_present_samples(void) {}
+ void rsx_live_draw_a010_probe_begin(void) {}
+@@ -852,6 +853,10 @@ void rsx_live_draw_set_present_nowait(int on) { g_ld_present_nowait = on ? 1 : 0
+ /* The host's choice [GT6 0058]: a scanout of another size than the window is stretched over the whole window at the
+  * present, as the console's video output does (rsx_live_draw_present). 0 = copied as it is, as before. */
+ int rsx_live_draw_present_stretch = 0;
++/* The host's brightness [GT6 0101]: the picture goes to the window as out = in^g (on top of the title's own video-out
++ * gamma, cellAvconfExt_display_gamma: PS3_DISPLAY_GAMMA or cellVideoOutSetGamma). 1 = the bytes as the title drew them,
++ * copied as before; under 1 brightens the middle tones, black and white stay where they are. */
++float rsx_live_draw_present_gamma = 1.0f;
+ static unsigned long long g_ld_fence_wait_us = 0;  /* GPU fence waits in flushes */
+ static unsigned g_ld_fence_waits = 0;
+ static double g_ld_setup_ms[4];
+@@ -6574,11 +6579,13 @@ static int ld_downsample(u32 si, u32 sx, u32 sy, u32 k,
+  * One root signature, one PSO per destination format (cached). */
+ static ID3D12RootSignature* g_sblit_rs;
+ typedef struct { DXGI_FORMAT fmt; ID3D12PipelineState* pso; } ld_blit_pipeline;
+-static ld_blit_pipeline g_sblit_pso[4], g_aa_blit_pso[4];
++static ld_blit_pipeline g_sblit_pso[4], g_aa_blit_pso[4], g_tone_blit_pso[4];
+ 
++/* aa: 0 the plain scaled blit, 1 the GPU AA filter, 2 the plain blit with the present's brightness [GT6 0101]
++ * (out = in^t.x - root constants 4 .. 7; the root signature carries eight, the others read the first four) */
+ static ID3D12PipelineState* ld_scaled_blit_pso_mode(DXGI_FORMAT fmt, int aa)
+ {
+-    ld_blit_pipeline* cache = aa ? g_aa_blit_pso : g_sblit_pso;
++    ld_blit_pipeline* cache = aa == 2 ? g_tone_blit_pso : aa ? g_aa_blit_pso : g_sblit_pso;
+     for (int i = 0; i < 4; i++)
+         if (cache[i].pso && cache[i].fmt == fmt) return cache[i].pso;
+     static const char plain_src[] =
+@@ -6591,14 +6598,25 @@ static ID3D12PipelineState* ld_scaled_blit_pso_mode(DXGI_FORMAT fmt, int aa)
+         "    o.p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+         "    o.uv = r.xy + (r.zw - r.xy) * q; return o; }\n"
+         "float4 ps(V i) : SV_Target { return t0.SampleLevel(s0, i.uv, 0); }\n";
+-    const char* src = aa ? rsx_gpu_aa_hlsl : plain_src;
++    static const char tone_src[] =
++        "cbuffer C : register(b0) { float4 r; float4 t; };\n"
++        "Texture2D t0 : register(t0);\n"
++        "SamplerState s0 : register(s0);\n"
++        "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
++        "V vs(uint id : SV_VertexID) {\n"
++        "    V o; float2 q = float2((id << 1) & 2, id & 2);\n"
++        "    o.p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1);\n"
++        "    o.uv = r.xy + (r.zw - r.xy) * q; return o; }\n"
++        "float4 ps(V i) : SV_Target { float4 c = t0.SampleLevel(s0, i.uv, 0);\n"
++        "    c.rgb = pow(saturate(c.rgb), t.x); return c; }\n";
++    const char* src = aa == 2 ? tone_src : aa ? rsx_gpu_aa_hlsl : plain_src;
+     if (!g_sblit_rs) {
+         D3D12_DESCRIPTOR_RANGE range = {0};
+         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+         range.NumDescriptors = 1;
+         D3D12_ROOT_PARAMETER p[2] = {0};
+         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+-        p[0].Constants.Num32BitValues = 4;
++        p[0].Constants.Num32BitValues = 8;   /* (the rect; [GT6 0101] the tone blit's exponent after it) */
+         p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+         p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+         p[1].DescriptorTable.NumDescriptorRanges = 1;
+@@ -17577,13 +17595,20 @@ void rsx_live_draw_present(u32 buffer_id)
+      * quarters of a 1920x1080 window. One triangle with the scaled-blit pipeline, linear filter. */
+     ID3D12PipelineState* stretch_pso = NULL;
+     D3D12_GPU_DESCRIPTOR_HANDLE stretch_table = {0};
++    /* [GT6 0101] With a brightness other than 1 the picture is drawn through the tone blit (out = in^tone) instead of
++     * copied - stretched or not, the same region the copy would fill. */
++    extern float cellAvconfExt_display_gamma(void);
++    const float tone = cellAvconfExt_display_gamma() * rsx_live_draw_present_gamma;
++    const int toned = tone > 0.05f && tone < 20.0f && fabsf(tone - 1.0f) > 0.002f && scanout_copy.width && scanout_copy.height;
++    int stretched = 0;
+     { static int env = -2;
+       if (env == -2) { const char* e = getenv("LD_PRESENT_STRETCH"); env = e ? (*e != '0') : -1; }
+       const int want = env >= 0 ? env : rsx_live_draw_present_stretch;
+-      if (want && scanout && scanout->width && scanout->height &&
++      stretched = want && scanout && scanout->width && scanout->height &&
+           (scanout->width != g.width || scanout->height != g.height) &&
+-          scanout->width <= presented_surface->w && scanout->height <= presented_surface->h &&
+-          (stretch_pso = ld_scaled_blit_pso(DXGI_FORMAT_R8G8B8A8_UNORM)) != NULL) {
++          scanout->width <= presented_surface->w && scanout->height <= presented_surface->h;
++      if ((stretched || toned) &&
++          (stretch_pso = ld_scaled_blit_pso_mode(DXGI_FORMAT_R8G8B8A8_UNORM, toned ? 2 : 0)) != NULL) {
+           u32 slots[SRV_TABLE_SIZE];
+           for (u32 i = 0; i < SRV_TABLE_SIZE; i++) slots[i] = SRV_WHITE;
+           slots[0] = SRV_SURFACE_BASE + target;
+@@ -17591,10 +17616,13 @@ void rsx_live_draw_present(u32 buffer_id)
+           if (!stretch_table.ptr) stretch_pso = NULL;
+       } }
+     if (stretch_pso) {
+-        static unsigned told;
+-        if (PS3_LOG_FIRST(told, 2u))
++        static unsigned told, told_tone;
++        if (stretched && PS3_LOG_FIRST(told, 2u))
+             fprintf(stderr, "[scanout-stretch] %ux%u of surface %ux%u over the %ux%u window\n", scanout->width, scanout->height,
+                     presented_surface->w, presented_surface->h, g.width, g.height);
++        if (toned && PS3_LOG_FIRST(told_tone, 2u))
++            fprintf(stderr, "[present-tone] out = in^%.3f (the host's %.3f x the video out's %.3f)%s\n", tone,
++                    rsx_live_draw_present_gamma, cellAvconfExt_display_gamma(), stretched ? ", stretched" : "");
+         ld_ls_invalidate();   /* sets list state the draw path caches */
+         D3D12_RESOURCE_BARRIER sb[2] = {0};
+         sb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -17614,12 +17642,21 @@ void rsx_live_draw_present(u32 buffer_id)
+         g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+         g.list->lpVtbl->SetPipelineState(g.list, stretch_pso);
+         g.list->lpVtbl->SetGraphicsRootSignature(g.list, g_sblit_rs);
+-        const float r[4] = {0.0f, 0.0f, (float)scanout->width / (float)presented_surface->w,
+-                            (float)scanout->height / (float)presented_surface->h};
++        /* stretched: the scanout over the whole window; else ([GT6 0101] toned only) the copy's region 1:1, the rest
++         * of the window cleared as the copy path clears it */
++        const u32 cw = stretched ? g.width : scanout_copy.width, ch = stretched ? g.height : scanout_copy.height;
++        if (!stretched && scanout_copy.clear_destination) {
++            const float black[4] = {0, 0, 0, 1};
++            g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, black, 0, NULL);
++        }
++        const float r[4] = {0.0f, 0.0f,
++                            (float)(stretched ? scanout->width : cw) / (float)presented_surface->w,
++                            (float)(stretched ? scanout->height : ch) / (float)presented_surface->h};
+         g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, r, 0);
++        if (toned) { const float t[4] = {tone, 0.0f, 0.0f, 0.0f}; g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, t, 4); }
+         g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, stretch_table);
+-        D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)g.width, (float)g.height, 0.0f, 1.0f};
+-        D3D12_RECT sc = {0, 0, (LONG)g.width, (LONG)g.height};
++        D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)cw, (float)ch, 0.0f, 1.0f};
++        D3D12_RECT sc = {0, 0, (LONG)cw, (LONG)ch};
+         g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
+         g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+         g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+@@ -17630,6 +17667,17 @@ void rsx_live_draw_present(u32 buffer_id)
+         /* (the back buffer is a render target now: the overlay draws into it as it is) */
+         if (rsx_live_draw_overlay_on && rsx_live_draw_overlay_draw && rsx_live_draw_overlay_on())
+             rsx_live_draw_overlay_draw(g.dev, g.queue, g.list, bb, (size_t)rtv_handle(bbi).ptr, g.width, g.height);
++        /* [GT6 0101] LD_PRESENT_DUMP=<dir>: the window's picture as it goes out (brightness, stretch, overlay) at the
++         * frames LD_FRAME_DUMP dumps - this drawn present only; the plain copy is the display buffer itself */
++        { static const char* pd = (const char*)-1;
++          if (pd == (const char*)-1) pd = getenv("LD_PRESENT_DUMP");
++          if (pd && pd[0] && dump_now) {
++              surface_t bbs; memset(&bbs, 0, sizeof bbs);
++              bbs.tex = bb; bbs.w = g.width; bbs.h = g.height; bbs.fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
++              char path[MAX_PATH * 2];
++              snprintf(path, sizeof path, "%s\\present_%06u.ppm", pd, dump_n - 1u);
++              ld_dump_surface_ppm(path, &bbs);
++          } }
+         sb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+         sb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+         g.list->lpVtbl->ResourceBarrier(g.list, 1, &sb[1]);

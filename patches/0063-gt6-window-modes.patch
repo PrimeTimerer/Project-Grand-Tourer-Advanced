@@ -1,0 +1,166 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index afd5fa9..52e29ee 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -17799,6 +17799,39 @@ void rsx_live_draw_present(u32 buffer_id)
+                 presented_surface->w, presented_surface->h, scan_w, scan_h, g.width, g.height,
+                 scanout_copy.width, scanout_copy.height, scanout_copy.clear_destination);
+     }
++    /* [GT6 0103] A client area of another shape than the back buffer - a maximized window, full screen on a 16:10,
++     * 21:9 or 4:3 monitor: the compositor stretches the back buffer over the whole client area, so the picture is drawn
++     * into the part of the back buffer that comes out there in the picture's shape (the back buffer's), centred, black
++     * around it. LD_PRESENT_FIT_TEST=<w>x<h> takes that as the client area (a hidden test window has the picture's). */
++    int fitted = 0;
++    float fit_x = 0.0f, fit_y = 0.0f, fit_w = 0.0f, fit_h = 0.0f;
++    const u32 fit_src_w = scanout && scan_w ? scan_w : scanout_copy.width;
++    const u32 fit_src_h = scanout && scan_h ? scan_h : scanout_copy.height;
++    { static int test_w = -1, test_h = 0;
++      if (test_w < 0) { const char* e = getenv("LD_PRESENT_FIT_TEST"); test_w = 0;
++                        if (e && sscanf(e, "%dx%d", &test_w, &test_h) != 2) test_w = test_h = 0; }
++      RECT cr = {0, 0, test_w, test_h};
++      if ((test_w > 0 || (s_ld_hwnd && GetClientRect(s_ld_hwnd, &cr))) && fit_src_w && fit_src_h && g.width && g.height) {
++          const double cw = (double)(cr.right - cr.left), chh = (double)(cr.bottom - cr.top);
++          const double ca = cw / (chh > 0.0 ? chh : 1.0), ba = (double)g.width / (double)g.height;
++          if (cw >= 16.0 && chh >= 16.0 && fabs(ca / ba - 1.0) > 0.005) {
++              double pw = cw, ph = chh;                       /* the picture in the client area */
++              if (ca > ba) pw = chh * ba; else ph = cw / ba;
++              fit_x = (float)((cw - pw) * 0.5 * g.width / cw);  fit_w = (float)(pw * g.width / cw);
++              fit_y = (float)((chh - ph) * 0.5 * g.height / chh); fit_h = (float)(ph * g.height / chh);
++              fitted = 1;
++          }
++          static int last_fit = -1; static LONG last_cw, last_ch;
++          if (fitted != last_fit || (fitted && (last_cw != (LONG)cw || last_ch != (LONG)chh))) {
++              last_fit = fitted; last_cw = (LONG)cw; last_ch = (LONG)chh;
++              if (fitted)
++                  fprintf(stderr, "[present-fit] client area %.0fx%.0f: the picture into back buffer %.1f,%.1f %.1fx%.1f of %ux%u, "
++                                  "black around it, frame %u\n", cw, chh, fit_x, fit_y, fit_w, fit_h, g.width, g.height, g_ld_frames);
++              else
++                  fprintf(stderr, "[present-fit] client area %.0fx%.0f has the picture's shape again, frame %u\n", cw, chh,
++                          g_ld_frames);
++          }
++      } }
+ 
+     /* A scanout of another size than the window, stretched over it [GT6 0058] (rsx_live_draw_present_stretch, the
+      * host's choice). The console's video output scales such a buffer to the screen: Gran Turismo 6's 1080p mode
+@@ -17818,7 +17851,7 @@ void rsx_live_draw_present(u32 buffer_id)
+       stretched = want && scanout && scan_w && scan_h &&
+           (scan_w != g.width || scan_h != g.height) &&
+           scan_w <= presented_surface->w && scan_h <= presented_surface->h;
+-      if ((stretched || toned) &&
++      if ((stretched || toned || fitted) &&
+           (stretch_pso = ld_scaled_blit_pso_mode(DXGI_FORMAT_R8G8B8A8_UNORM, toned ? 2 : 0)) != NULL) {
+           u32 slots[SRV_TABLE_SIZE];
+           for (u32 i = 0; i < SRV_TABLE_SIZE; i++) slots[i] = SRV_WHITE;
+@@ -17856,18 +17889,24 @@ void rsx_live_draw_present(u32 buffer_id)
+         /* stretched: the scanout over the whole window; else ([GT6 0101] toned only) the copy's region 1:1, the rest
+          * of the window cleared as the copy path clears it */
+         const u32 cw = stretched ? g.width : scanout_copy.width, ch = stretched ? g.height : scanout_copy.height;
+-        if (!stretched && scanout_copy.clear_destination) {
++        if (fitted || (!stretched && scanout_copy.clear_destination)) {
+             const float black[4] = {0, 0, 0, 1};
+             g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, black, 0, NULL);
+         }
++        /* [GT6 0103] fitted: the whole picture (the scanout, or the copy's region) into the fitted rectangle */
+         const float r[4] = {0.0f, 0.0f,
+-                            (float)(stretched ? scan_w : cw) / (float)presented_surface->w,
+-                            (float)(stretched ? scan_h : ch) / (float)presented_surface->h};
++                            (float)(fitted ? fit_src_w : stretched ? scan_w : cw) / (float)presented_surface->w,
++                            (float)(fitted ? fit_src_h : stretched ? scan_h : ch) / (float)presented_surface->h};
+         g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, r, 0);
+         if (toned) { const float t[4] = {tone, 0.0f, 0.0f, 0.0f}; g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, t, 4); }
+         g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, stretch_table);
+         D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)cw, (float)ch, 0.0f, 1.0f};
+         D3D12_RECT sc = {0, 0, (LONG)cw, (LONG)ch};
++        if (fitted) {
++            vp.TopLeftX = fit_x; vp.TopLeftY = fit_y; vp.Width = fit_w; vp.Height = fit_h;
++            sc.left = (LONG)floorf(fit_x); sc.top = (LONG)floorf(fit_y);
++            sc.right = (LONG)ceilf(fit_x + fit_w); sc.bottom = (LONG)ceilf(fit_y + fit_h);
++        }
+         g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
+         g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+         g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index c87f71c..a499689 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -61,11 +61,15 @@ int (*rsx_window_message_hook)(void* hwnd, unsigned msg, uintptr_t wp, intptr_t
+ /* ---------------------------------------------------------------------------
+  * Full screen [public issues 2 and 3]
+  *
+- * Alt+Enter, the maximize button and a double click on the caption turn the window borderless full screen and back. The
+- * swap chain keeps the picture's size and the desktop compositor scales it to the window, so the window keeps the
+- * picture's shape: dragged by its frame it stays that shape (WM_SIZING); full screen on a monitor of another shape (21:9,
+- * 16:10, 4:3) it is the biggest rectangle of the picture's shape, centred over a black window that fills the monitor,
+- * instead of a stretched picture. The caption and the frame are not part of the picture: the client area is.
++ * Alt+Enter turns the window borderless full screen and back. The maximize button, a double click on the caption and
++ * Win+Up maximize the window as any window does [GT6 0103] - a player who works in other programs beside the game wants
++ * a maximized window; before, those also went full screen. The swap chain keeps the picture's
++ * size and the desktop compositor scales it to the client area; dragged by its frame the window keeps the picture's
++ * shape (WM_SIZING). A client area of another shape - maximized, or full screen on a 16:10, 21:9 or 4:3 monitor - gets
++ * the picture in that shape with black around it from the present (rsx_live_draw.c, [GT6 0103]). Full screen is ONE
++ * window over the whole monitor: with the picture's window smaller than the monitor and a black window behind it, the
++ * shell did not take the game for a full-screen program, and the taskbar's bottom edge stayed visible as a grey line
++ * under the picture (seen on a 16:10 monitor at 150 % scaling). The caption and the frame are not part of the picture.
+  * DXGI's own Alt+Enter would put the flip-model swap chain into exclusive full screen, which nothing here handles (no
+  * ResizeBuffers): every Present then failed with DXGI_ERROR_INVALID_CALL and the picture froze while the game went on;
+  * rsx_live_draw.c switches that off (DXGI_MWA_NO_ALT_ENTER) and the toggle here is the only one.
+@@ -84,26 +88,6 @@ static LRESULT CALLBACK back_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+     return DefWindowProcA(h, m, w, l);
+ }
+ 
+-/* The biggest rectangle of the picture's shape inside mon, centred; mon itself when it has that shape within 1 %. */
+-static RECT picture_rect(RECT mon)
+-{
+-    const long long mw = mon.right - mon.left, mh = mon.bottom - mon.top;
+-    const long long pw = (long long)s_state.width, ph = (long long)s_state.height;
+-    RECT r = mon;
+-    if (mw <= 0 || mh <= 0 || pw <= 0 || ph <= 0)
+-        return r;
+-    if (mw * ph * 100 > mh * pw * 101) {            /* the monitor is wider: bars left and right */
+-        const LONG w = (LONG)(mh * pw / ph);
+-        r.left = mon.left + (LONG)((mw - w) / 2);
+-        r.right = r.left + w;
+-    } else if (mw * ph * 101 < mh * pw * 100) {     /* taller: bars above and below */
+-        const LONG h = (LONG)(mw * ph / pw);
+-        r.top = mon.top + (LONG)((mh - h) / 2);
+-        r.bottom = r.top + h;
+-    }
+-    return r;
+-}
+-
+ /* On top, and the black window right behind it where the picture does not fill the monitor. */
+ static void full_top(HWND hwnd)
+ {
+@@ -155,7 +139,7 @@ static void full_enter(HWND hwnd)
+         return;
+     s_saved_style = GetWindowLongA(hwnd, GWL_STYLE);
+     s_full_mon = mi.rcMonitor;
+-    s_full_pic = picture_rect(s_full_mon);
++    s_full_pic = s_full_mon;            /* [GT6 0103] the whole monitor; the present keeps the picture's shape */
+     s_full = 1;
+     SetWindowLongA(hwnd, GWL_STYLE, (s_saved_style & ~(LONG)WS_OVERLAPPEDWINDOW) | (LONG)WS_POPUP);
+     full_place(hwnd);
+@@ -214,13 +198,7 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     if (rsx_window_message_hook && rsx_window_message_hook(hwnd, msg, (uintptr_t)wp, (intptr_t)lp))
+         return 0;
+     switch (msg) {
+-    case WM_SYSCOMMAND:
+-        if ((wp & 0xFFF0) == SC_MAXIMIZE) {     /* the maximize button, a double click on the caption, Win+Up */
+-            full_toggle(hwnd);
+-            return 0;
+-        }
+-        break;
+-
++    /* (the maximize button, a double click on the caption and Win+Up maximize the window: Windows' own [GT6 0103]) */
+     case WM_SIZING:
+         if (!s_full) {
+             keep_shape(hwnd, (UINT)wp, (RECT*)lp);
+@@ -246,7 +224,7 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+             mi.cbSize = sizeof mi;
+             if (GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+                 s_full_mon = mi.rcMonitor;
+-                s_full_pic = picture_rect(s_full_mon);
++                s_full_pic = s_full_mon;    /* [GT6 0103] */
+                 full_place(hwnd);
+             }
+         }

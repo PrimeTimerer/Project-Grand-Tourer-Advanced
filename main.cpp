@@ -164,7 +164,12 @@ extern "C" void cellVideoOut_set_resolution(unsigned char resolutionId);        
 static int g_gt6_res_1080 = 0;
 extern "C" int gt6_menu_setting_full_hd(void);      /* gt6_menu_engine.cpp */
 extern "C" int rsx_live_draw_present_stretch;       /* rsx_live_draw.c: the scanout is stretched over the window */
+extern "C" void rsx_live_draw_upscale(float ux, float uy);       /* rsx_live_draw.c [GT6 0102] */
+extern "C" void rsx_live_draw_upscale_size(unsigned w, unsigned h);
 extern "C" int gt6_res_1080(void) { return g_gt6_res_1080; }   /* (the menu shows which mode this run is in) */
+static int g_gt6_real_res = 0;                      /* [GT6 0102] 0 = off, 1 = 1920x1080, 2 = 2560x1440, 3 = 3840x2160 */
+extern "C" int gt6_real_res(void) { return g_gt6_real_res; }
+extern "C" int gt6_menu_setting_real_res(void);     /* gt6_menu_engine.cpp */
 extern "C" void rsx_live_draw_reports_tick(void);   /* rsx_live_draw.c: ZPASS counts the title may be waiting for [0056] */
 extern "C" int g_spu_force_ch_block;        /* runtime/spu/spu_channels.c: an empty SPU channel read sleeps */
 static long long s_last_pending_present = 0;
@@ -1037,6 +1042,34 @@ int main(int argc, char** argv)
           rsx_live_draw_present_stretch = 1;  /* its 1080p buffer is 1440x1080 for a 16:9 picture */
           cellVideoOut_set_resolution(1);     /* CELL_VIDEO_OUT_RESOLUTION_1080 */
           fprintf(stderr, "[gt6] video output reported as 1080p (%s)\n", by_env ? "GT6_RES=1080" : "the F2 menu's switch");
+          /* [GT6 0102] GT6_UPSCALE=1 (= 1920x1080) or <W>x<H>: a real resolution, not a stretch - the game's
+           * 1440x1080 scene and display buffers are made W x H on the host and drawn at that size (rsx_live_draw.c,
+           * rsx_live_draw_upscale). Everything else (shadow maps, reflection faces, the brightness samples) keeps its
+           * size. Not with GT6_AA=spu: the SPU anti-aliasing reads the guest-size picture from guest memory.
+           * Without GT6_UPSCALE the F2 menu's switch decides (Settings -> Screen -> Real resolution). A picture larger
+           * than the 1920x1080 window is drawn down into it (the present's stretch, linear). */
+          { const char* up = getenv("GT6_UPSCALE");
+            unsigned uw = 0, uh = 0;
+            if (up && *up) {
+                if (*up != '0' && sscanf(up, "%ux%u", &uw, &uh) != 2) { uw = 1920; uh = 1080; }
+            } else {
+                static const unsigned sizes[4][2] = { {0, 0}, {1920, 1080}, {2560, 1440}, {3840, 2160} };
+                const int r = gt6_menu_setting_real_res();
+                if (r > 0 && r < 4) { uw = sizes[r][0]; uh = sizes[r][1]; }
+            }
+            const char* nm = getenv("GT6_NO_MLAA");
+            if (uw && nm && *nm == '0') {
+                fprintf(stderr, "[gt6] GT6_UPSCALE left off: GT6_AA=spu reads the guest-size picture\n");
+                uw = uh = 0;
+            }
+            if (uw >= 1440 && uh >= 1080 && uw <= 7680 && uh <= 4320) {
+                rsx_live_draw_upscale_size(1440, 1080);
+                rsx_live_draw_upscale_size(1536, 1408);
+                rsx_live_draw_upscale((float)uw / 1440.0f, (float)uh / 1080.0f);
+                g_gt6_real_res = uw >= 3840 ? 3 : uw >= 2560 ? 2 : 1;
+                fprintf(stderr, "[gt6] real resolution %ux%u (%s): the game's 1440x1080 buffers are that large on the host\n", uw, uh,
+                        up && *up ? "GT6_UPSCALE" : "the F2 menu's switch");
+            } }
       } }
 
     printf("=== GT6 native port (ps3recomp) ===\n");

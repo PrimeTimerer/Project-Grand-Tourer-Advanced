@@ -46,6 +46,10 @@ struct Settings {
     bool padBlock = true;          // while the menu is open the game gets a neutral pad
     float uiScale = 1.0f;
     bool fullHd = false;           // the game's own 1080p mode from the next start on (main.cpp reads the file before the game boots)
+    int realRes = 0;               // [GT6 0102] with fullHd: the game's 1440x1080 buffers drawn on the host at 0 = 1440x1080 (stretched,
+                                   // as before), 1 = 1920x1080, 2 = 2560x1440, 3 = 3840x2160 - a real resolution (from the next start)
+    double screenBright = 1.0;     // Brightness (2026-11-24, a player's report: "image is very dim"): the picture goes to the window as
+                                   // out = in^(1 / this) - 1 = as the game draws it, live [GT6 0101]
     int menuLang = 0;              // [GT6 0087] 0 = by Windows' display language, 1 = Korean, 2 = English (from the next start)
     int lastPage = 0;
 };

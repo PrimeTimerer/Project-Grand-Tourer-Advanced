@@ -32,6 +32,7 @@
 
 extern "C" {
 extern uint8_t* vm_base;
+extern float rsx_live_draw_present_gamma;   /* rsx_live_draw.c [GT6 0101]: the present's exponent, out = in^g */
 }
 
 // ---- [GT6 0087] the menu's language (see gt6_menu.h) ----------------------------------------------------------
@@ -757,6 +758,8 @@ std::string settingsToJson(const Settings& s)
     w.kv("MenuPadBlock", s.padBlock);
     w.kv("MenuUiScale", (double)s.uiScale);
     w.kv("MenuFullHd", s.fullHd);
+    w.kv("ScreenRealRes", s.realRes);
+    w.kv("ScreenBright", s.screenBright);
     w.kv("MenuLang", s.menuLang);
     w.kv("MenuLastPage", s.lastPage);
     w.close('}');
@@ -817,6 +820,9 @@ void settingsFromJson(const J& j, Settings& s, bool menuKeys)
         D("MenuUiScale", sc);
         s.uiScale = (float)std::clamp(sc, 0.6, 2.0);
         B("MenuFullHd", s.fullHd);
+        I("ScreenRealRes", s.realRes);
+        s.realRes = std::clamp(s.realRes, 0, 3);
+        D("ScreenBright", s.screenBright);
         I("MenuLang", s.menuLang);
         s.menuLang = std::clamp(s.menuLang, 0, 2);
         I("MenuLastPage", s.lastPage);
@@ -843,6 +849,24 @@ extern "C" int gt6_menu_setting_full_hd(void)
             return 0;
         const J* x = j.get("MenuFullHd");
         return x && x->t == J::Bool && x->b ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// [GT6 0102] Real resolution (the switch under Full HD): 0 = 1440x1080 stretched, 1 = 1920x1080, 2 = 2560x1440,
+// 3 = 3840x2160. Read by main.cpp at its start like the one above; no file, a broken file or no such key = 0.
+extern "C" int gt6_menu_setting_real_res(void)
+{
+    try {
+        std::string text;
+        J j;
+        if (!readFile(settingsPath(), text) || !jsonParse(text, j) || j.t != J::Obj)
+            return 0;
+        const J* x = j.get("ScreenRealRes");
+        if (!x || x->t != J::Num) return 0;
+        const int v = (int)x->n;
+        return v >= 0 && v <= 3 ? v : 0;
     } catch (...) {
         return 0;
     }
@@ -1367,6 +1391,8 @@ struct Engine {
                 std::lock_guard<std::mutex> lk(g_mx);
                 s = g_set;
             }
+            // [GT6 0101] Brightness (Settings -> Display), live: the presenter draws the picture as out = in^(1 / b)
+            rsx_live_draw_present_gamma = (float)(1.0 / std::clamp(std::isfinite(s.screenBright) ? s.screenBright : 1.0, 0.5, 2.0));
             control(now, s);
             std::vector<Command> cmds;
             {
