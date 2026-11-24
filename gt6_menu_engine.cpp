@@ -981,6 +981,78 @@ bool write(uint32_t obj, long long v)
         return false;
     return w64(obj + Off, (uint64_t)v);
 }
+
+// [GT6 0108] (tests, GT6_CASH_LOG=1) A player: credits set in the menu showed in the game, but the parts shop said
+// "Insufficient credits", the lock did not help either. Every object with the tag (find() takes the first), and every
+// place the value is held as a 64- or 32-bit word, with the words around it. GT6_CASH_TEST=<n>: the value is set once,
+// and three seconds later both the old and the new value are looked for again - a copy that kept the old value is what
+// the shop may read.
+void scanValue(long long v, const char* label)
+{
+    const uint32_t lo = (uint32_t)v, hi = (uint32_t)((uint64_t)v >> 32);
+    int m = 0;
+    scanWords(&lo, 1, 0x10000u, [&](int, uint32_t a, const uint8_t*, size_t) {
+        uint8_t w[16];
+        if (a < 0x10008u || !rd(a - 8, w, 16) || m++ >= 60)
+            return;
+        fprintf(stderr, "[cash] %s %lld at %08X as a %s word: %08X %08X [%08X] %08X\n", label, v, a,
+                rbe32(w + 4) == hi ? "64-bit" : "32-bit", rbe32(w), rbe32(w + 4), rbe32(w + 8), rbe32(w + 12));
+    });
+    fprintf(stderr, "[cash] %s %lld: %d place(s)\n", label, v, m);
+}
+
+void diag(uint32_t obj)
+{
+    uint8_t tag[8];
+    const auto v = read(obj);
+    if (!v || !rd(TagStatic, tag, 8))
+        return;
+    const uint32_t hi = rbe32(tag), lo = rbe32(tag + 4), word = hi ? hi : lo, shift = hi ? 0 : 4;
+    int n = 0;
+    scanWords(&word, 1, 0x10000u, [&](int, uint32_t a, const uint8_t*, size_t) {
+        uint8_t o[0x30];
+        if (a < shift)
+            return;
+        const uint32_t g = a - shift;
+        if ((g & 7) || g == TagStatic || !rd(g, o, 0x30) || std::memcmp(o, tag, 8) || n++ >= 40)
+            return;
+        fprintf(stderr, "[cash] object with the tag at %08X: %lld%s\n", g,
+                (long long)((uint64_t)rbe32(o + Off) << 32 | rbe32(o + Off + 4)), g == obj ? " (the menu's)" : "");
+    });
+    scanValue(*v, "value");
+}
+
+void testStep(uint32_t obj)
+{
+    static const bool on = getenv("GT6_CASH_LOG") != nullptr;
+    static long long before = -1, after = -1;
+    static uint64_t again = 0, foundAt = 0;
+    if (!on || !obj)
+        return;
+    // GT6_CASH_TEST_AFTER=<s>: the first look and the write that long after the object was found (not while a save loads)
+    if (!foundAt)
+        foundAt = GetTickCount64();
+    if (const char* wait = getenv("GT6_CASH_TEST_AFTER"); wait && GetTickCount64() < foundAt + 1000ull * (uint64_t)std::atoi(wait))
+        return;
+    if (before < 0) {
+        diag(obj);
+        const auto v = read(obj);
+        before = v ? *v : 0;
+        const char* t = getenv("GT6_CASH_TEST");
+        if (t && *t && v) {
+            after = std::clamp(std::atoll(t), 0LL, 2147483647LL);
+            fprintf(stderr, "[cash] test: %lld -> %lld: %s\n", before, after, write(obj, after) ? "written" : "NOT written");
+            again = GetTickCount64() + 3000;
+        }
+        return;
+    }
+    if (again && GetTickCount64() >= again) {
+        again = 0;
+        scanValue(before, "old value");
+        scanValue(after, "new value");
+        diag(obj);
+    }
+}
 }  // namespace cash
 
 
@@ -1310,6 +1382,7 @@ struct Engine {
             cashObj = cash::find();
             nextCashSearch = GetTickCount64() + 5000;
         }
+        cash::testStep(cashObj);   // [GT6 0108] tests only (GT6_CASH_LOG)
         loadFileRules();
         writePPTable(s);
         fillNames(false);

@@ -1,0 +1,50 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index c24fe43..8bb58fa 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -122,6 +122,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
+ #include <d3d12.h>
+ #include <d3d12sdklayers.h>
+ #include <dxgi1_4.h>
++#include <dxgi1_6.h>   /* [GT6 0106] IDXGIFactory6::EnumAdapterByGpuPreference */
+ #include <d3dcompiler.h>
+ #include "rsx_pso_warmup.h"
+ #include "rsx_fp_compile_init.h"
+@@ -16545,8 +16546,35 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+     ld_enable_dred();
+     IDXGIFactory4* factory = NULL;
+     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory))) return -1;
+-    if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&g.dev))) {
+-        factory->lpVtbl->Release(factory); return -1;
++    /* [GT6 0106] The GPU: the high-performance one (IDXGIFactory6::EnumAdapterByGpuPreference) instead of Windows'
++     * default adapter - on a laptop with two GPUs the default is usually the integrated one (a player's RTX 3050
++     * laptop ran the game on its Radeon iGPU). One GPU: the same adapter as before. GT6_GPU=default = Windows'
++     * default adapter as before, GT6_GPU=low = the low-power one. */
++    g.dev = NULL;
++    { const char* ge = getenv("GT6_GPU");
++      IDXGIFactory6* f6 = NULL;
++      if (!(ge && !_stricmp(ge, "default")) &&
++          SUCCEEDED(factory->lpVtbl->QueryInterface(factory, &IID_IDXGIFactory6, (void**)&f6))) {
++          const DXGI_GPU_PREFERENCE pref = (ge && !_stricmp(ge, "low")) ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
++                                                                       : DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
++          IDXGIAdapter1* ad = NULL;
++          for (UINT ai = 0; !g.dev && f6->lpVtbl->EnumAdapterByGpuPreference(f6, ai, pref, &IID_IDXGIAdapter1,
++                                                                             (void**)&ad) != DXGI_ERROR_NOT_FOUND; ai++) {
++              DXGI_ADAPTER_DESC1 d; memset(&d, 0, sizeof d);
++              if (ad && SUCCEEDED(ad->lpVtbl->GetDesc1(ad, &d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
++                  SUCCEEDED(D3D12CreateDevice((IUnknown*)ad, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&g.dev)))
++                  fprintf(stderr, "[gpu] %ls, %llu MB video memory: the %s GPU\n", d.Description,
++                          (unsigned long long)(d.DedicatedVideoMemory >> 20),
++                          pref == DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE ? "high-performance" : "low-power");
++              if (ad) { ad->lpVtbl->Release(ad); ad = NULL; }
++          }
++          f6->lpVtbl->Release(f6);
++      } }
++    if (!g.dev) {
++        if (FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&g.dev))) {
++            factory->lpVtbl->Release(factory); return -1;
++        }
++        fprintf(stderr, "[gpu] Windows' default adapter\n");
+     }
+ #if defined(YZ_PERF_PROFILE)
+     {
