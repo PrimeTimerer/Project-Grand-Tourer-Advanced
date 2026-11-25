@@ -1,0 +1,78 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 2b315ce..de7b580 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -170,7 +170,11 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ #define LD_SWAP_BUFFERS  2
+ #define MAX_SURFACES     512  /* GT6 courtesy-car selection + Toscana exceeds 64 distinct RT layouts.
+                               * Reserve descriptor/metadata slots here; GPU textures remain lazy. */
+-#define MAX_TEXTURES     4096   /* a Gran Turismo 6 race filled 1,024 and evicted as many again [GT6 0036] */
++/* 8192 since [GT6 0134] (it was 4096; before that 1,024, which a Gran Turismo 6 race filled and evicted as many again
++ * [GT6 0036]): a 12-car race at Indianapolis stood at 4096 / 4096 and pushed textures out in bursts ("FULL cap=4096",
++ * a player's log of 2026-11-25) - each one decoded, created and uploaded again on the draw thread when it is next
++ * bound. An entry is 130 bytes and one CPU descriptor; g_tex_hash_next holds a place + 1 in 16 bits (65534 at most). */
++#define MAX_TEXTURES     8192
+ #define MAX_RETIRED_TEXTURES 4096
+ #define MAX_VTEX         64
+ #define MAX_SAMPLERS     128
+@@ -208,7 +212,14 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ /* Per-surface copy a draw samples when it reads its own render target. */
+ #define SRV_FEEDBACK_BASE (UAV_ZDEPTH_BASE + MAX_SURFACES)
+ /* Top-left windows of a surface for smaller textures that alias it (see surface_window). */
+-#define LD_SWIN_PER       8   /* GT6's glare passes read six sizes of one surface every frame [GT6 0036]; was 2 */
++/* 128 since [GT6 0136] (it was 8; before that 2 - GT6's glare passes read six sizes of one surface every frame
++ * [GT6 0036]). Gran Turismo 6 draws its texts into one surface (2048x2176 at 0x22C0000) and reads each of them back
++ * as a window of its own size - 362x22, 179x22, 234x71, 115x71, 120x52 ... - and a results table or a replay's
++ * captions have far more than eight. Each size not among the eight threw the oldest window out and made a new
++ * committed resource, in every frame again: 12 ms a frame of the draw thread in the system's graphics calls
++ * (win32u.dll under surface_window_at) in the 15 - 25 fps scenes after a race at Indianapolis, test drive ind2.
++ * An entry is 48 bytes and one CPU descriptor a surface; a window's texture is made only when a size is first read. */
++#define LD_SWIN_PER       128
+ #define SRV_SURF_WIN_BASE (SRV_FEEDBACK_BASE + MAX_SURFACES)
+ /* Each zeta read as an A8R8G8B8 texture (zstencil_view): its stencil plane, and the views as UAV and as SRV.
+  * A view is as large as the texture that reads it; a title reads one zeta at more than one size (Gran Turismo 6:
+@@ -225,7 +236,12 @@ extern volatile unsigned long long g_yz_auto_start_tick;
+ #define SRV_VERTEX_PULL (SRV_ZDEPTH_VIEW_BASE + 16)
+ #define SRV_CPU_HEAP_SLOTS (SRV_VERTEX_PULL + 1)
+ #define SRV_TABLE_SIZE   16
+-#define SRV_RING_TABLES  4096
++/* 8192 since [GT6 0134] (it was 4096): a draw takes one or two tables and one block of each constant ring, and a dense
++ * race start has more than 4,096 of them in a frame - then the ring is full in the middle of the frame and the draw
++ * thread waits for the GPU (ld_flush "descriptor_ring", one to six times in five seconds in the dense-start runs
++ * b10 .. b12). Twice the tables: 131,072 shader-visible descriptors a frame context, and the two constant rings 69 MB
++ * each instead of 35 (CB_RING_BYTES) - 277 MB of upload heap over both contexts, 138 MB more than before. */
++#define SRV_RING_TABLES  8192
+ 
+ #define SMP_DEFAULT      0
+ #define SMP_CACHE_SLOTS  MAX_SAMPLERS
+@@ -9545,7 +9561,10 @@ typedef struct {
+     u32 shadow_units;                  /* units using only supported TEX/TXP comparisons */
+     u32 n_const;                       /* inline constant slots; UINT32_MAX = not listed (too many, or malformed) */
+     u16 const_at[LD_FP_MEMO_CONSTS];   /* their places in 16-byte units (rsx_fp_constant_places) */
+-    u8  bytes[4096];
++    /* 16384 since [GT6 0134] (it was 4096): a fragment program larger than this is never kept and is measured, hashed
++     * and walked again at every draw that uses it - 830 .. 2,200 times in five seconds in a race ("too large" in
++     * [ld-flush]). 2,048 entries of this are 34 MB. */
++    u8  bytes[16384];
+ } ld_fp_memo;
+ /* [GT6 0036, block 5] Both memos in sets: a twelve-car race uses about 600 program pairs, and with 128 vertex
+  * entries (searched one after the other, replaced in turn) and 512 fragment entries (one place each) 100 vertex
+@@ -12145,7 +12164,17 @@ static int ld_vs_on(void)
+             on = 0;
+         if (on) {
+             const char* m = getenv("LD_VTX_SLAB_MB");
+-            long mb = m ? strtol(m, NULL, 10) : 1024;
++            /* [GT6 0134] 1024 MB whatever the machine had: a 12-car race reached it with 800 MB of it free - free
++             * blocks are kept by size and stride and do not serve another class - and 7,600 groups in five seconds
++             * found no room ("full" in [vslab]) and were converted at every draw instead. A sixteenth of the
++             * machine's memory now, 1024 MB at least and 4096 at most (the arena is upload-heap memory, not VRAM). */
++            long def_mb = 1024;
++            { MEMORYSTATUSEX ms; ms.dwLength = sizeof ms;
++              if (GlobalMemoryStatusEx(&ms)) {
++                  const unsigned long long part = (ms.ullTotalPhys >> 20) / 16u;
++                  def_mb = part < 1024u ? 1024 : part > 4096u ? 4096 : (long)part;
++              } }
++            long mb = m ? strtol(m, NULL, 10) : def_mb;
+             if (mb < 64) mb = 64;
+             if (mb > 64 * (long)LD_VS_MAX_CHUNKS) mb = 64 * (long)LD_VS_MAX_CHUNKS;
+             g_vs_chunk_cap = (u32)(mb / 64);

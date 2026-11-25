@@ -510,6 +510,40 @@ namespace GT6Launcher
             File.Move(temp, path);
         }
 
+        // [GT6 0141] The game's own language ("GameLang": "" = by Windows' display language, else a code the game's
+        // runtime knows - en, en-gb, fr ...), read by the game when it starts (public issue #15).
+        static readonly Regex LangKey = new Regex("\"GameLang\"\\s*:\\s*(\"[A-Za-z-]*\")");
+
+        public static string GameLang(string path)
+        {
+            try
+            {
+                Match m = LangKey.Match(File.ReadAllText(path));
+                return m.Success ? m.Groups[1].Value.Trim('"') : "";
+            }
+            catch (Exception)
+            {
+                return "";
+            }
+        }
+
+        public static void SetGameLang(string path, string code)
+        {
+            if (!Regex.IsMatch(code ?? "", "^[A-Za-z-]{0,7}$"))
+                return;
+            string text = File.Exists(path) ? File.ReadAllText(path) : "";
+            string next = Put(text, LangKey, "GameLang", "\"" + code + "\"");
+            if (next == text)
+                return;
+            if (File.Exists(path))
+                File.Copy(path, path + ".launcher.bak", true);
+            string temp = path + ".launcher.tmp";
+            File.WriteAllText(temp, next, new UTF8Encoding(false));
+            if (File.Exists(path))
+                File.Delete(path);
+            File.Move(temp, path);
+        }
+
         // One key's value replaced in place, or the key added first in the object (no file yet: the menu adds the rest
         // with its defaults).
         static string Put(string text, Regex key, string name, string value)

@@ -8,6 +8,15 @@ namespace GT6Launcher
         static readonly Dictionary<string, string> Table = new Dictionary<string, string>
         {
             {"  ·  네이티브 PC 포트", "  ·  Native PC port"},
+            {" 설치 도구(RPCS3)가 필요한 DLL이 없어 시작하지 못했습니다. 대개 Microsoft Visual C++ 2015-2022 재배포 패키지(x64)가 없을 때입니다 - 설치한 뒤 다시 해 주세요.", " The setup tool (RPCS3) could not start because a DLL it needs is missing. Usually that is the Microsoft Visual C++ 2015-2022 Redistributable (x64) - install it and start the setup again."},
+            {" 설치 도구(RPCS3)가 이 PC의 CPU에서 실행되지 않았습니다 (필요한 명령이 없습니다).", " The setup tool (RPCS3) does not run on this PC's CPU (it lacks instructions RPCS3 needs)."},
+            {" 설치 도구(RPCS3)가 게임 로더의 부팅을 거부했습니다. RPCS3가 댄 이유를 setup.log에 적었습니다.", " The setup tool (RPCS3) refused to boot the game's loader. The reason it gave is in setup.log."},
+            {" 설치 도구(RPCS3)가 게임 로더를 실행하다가 스스로 종료했습니다. 종료 코드와 그 로그의 끝을 setup.log에 적었습니다."," The setup tool (RPCS3) ended by itself while running the game's loader. Its exit code and the end of its log are in setup.log."},
+            {" 설치 도구(RPCS3)가 게임 로더를 제시간에 실행하지 못했습니다. 그때 떠 있던 창과 그 로그의 끝을 setup.log에 적었습니다.", " The setup tool (RPCS3) did not get the game's loader running in time. The windows it had open and the end of its log are in setup.log."},
+            {"게임 언어", "Game language"},
+            {"게임 자체의 글과 음성의 언어입니다. 자동은 Windows의 표시 언어를 따릅니다. 이 게임 데이터에 그 언어가 들어 있을 때만 바뀌고, 없으면 영어로 나옵니다.", "The language of the game's own text and voices. Automatic follows Windows' display language. It only changes if this copy of the game carries that language; otherwise the game shows English."},
+            {"게임 언어는 게임을 다시 시작하면 바뀝니다.", "The game language changes the next time the game starts."},
+            {"게임이 꺼져 있을 때 바꿀 수 있습니다.", "This can be changed while the game is not running."},
             {"  설치하기", "  Set up"},
             {"  플레이", "  Play"},
             {" (1.22 필요)", " (1.22 required)"},

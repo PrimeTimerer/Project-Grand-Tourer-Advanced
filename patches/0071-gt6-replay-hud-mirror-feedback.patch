@@ -1,0 +1,244 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -5762,6 +5762,44 @@
+     if (on < 0) { const char* e = getenv("LD_SEQ_FEEDBACK"); on = (e && *e == '0') ? 0 : 1; }
+     return on;
+ }
++/* A post-effect can read a subrect of its current render target through a
++ * different guest offset. A separate surface at that offset can be leftover
++ * from an older pass. Use the current target when it wrote newer, fully
++ * covers the texture, and has the same guest layout. */
++static int ld_feedback_subrect(u32 target, const rsx_dsp_texture* t, int sampled, u32* x, u32* y)
++{
++    const surface_t* s = &g.surfaces[target];
++    if (!ld_seq_feedback_on() || t->cubemap || t->dimension != 2u ||
++        !(t->format & TEX_FMT_LINEAR) || !s->tex || !s->pitch || t->pitch != s->pitch ||
++        t->location != s->location || t->offset <= s->offset)
++        return 0;
++    const u32 texel = ld_tex_texel_bytes(t->format);
++    const u32 surface_texel = s->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
++    if (texel != surface_texel) return 0;
++    const u32 offset = t->offset - s->offset;
++    const u32 row = offset / s->pitch;
++    const u32 column = offset % s->pitch;
++    if (row >= s->gh || column % texel) return 0;
++    const u32 col = column / texel;
++    if (sampled >= 0) {
++#if !defined(YZ_PERF_CLEAN)
++        const surface_t* old = &g.surfaces[sampled];
++        if (s->guard_frame != g_ld_frames + 1u || s->guard_dead ||
++            !ld_surface_has_colour(s) || col >= s->gw ||
++            t->width > s->gw - col || t->height > s->gh - row ||
++            t->width > (s->pitch - column) / texel ||
++            g_ld_surface_generation - s->last_write_generation >=
++                g_ld_surface_generation - old->last_write_generation)
++            return 0;
++#else
++        return 0;
++#endif
++    }
++    *x = col;
++    *y = row;
++    return 1;
++}
++
+ static int surface_window_at(u32 si, const rsx_dsp_texture* t, int dbg, u32 ox, u32 oy);
+ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
+ {
+@@ -6222,7 +6260,8 @@
+ {
+     surface_t* s = &g.surfaces[pi];
+     const u32 x0 = s->mx0, y0 = s->my0, x1 = s->mx1, y1 = s->my1;
+-    const u32 lo = s->offset + y0 * s->pitch, hi = s->offset + (y1 - 1u) * s->pitch + x1 * 4u;
++    const u32 lo = s->offset + y0 * s->pitch + x0 * 4u;
++    const u32 hi = s->offset + (y1 - 1u) * s->pitch + x1 * 4u;
+     u32 sx, sy, qx, qy, w, h;
+     for (u32 i = 0; i < g.n_surfaces; i++) {
+         const surface_t* o = &g.surfaces[i];
+@@ -6291,13 +6330,19 @@
+ /* Guest bytes [lo, hi) of a location are about to be read as they are. */
+ static void ld_mirror_sync_range(u32 location, u32 lo, u32 hi)
+ {
+-    if (!g_ld_mirror_pending) return;
++    if (!g_ld_mirror_pending || lo >= hi) return;
+     int any = 0;
+     for (u32 i = 0; i < g.n_surfaces; i++) {
+         surface_t* s = &g.surfaces[i];
+         if (s->gx1 <= s->gx0 || s->gy1 <= s->gy0 || s->location != location || !s->pitch) continue;
+         const u32 a = s->offset + s->gy0 * s->pitch + s->gx0 * 4u, b = s->offset + (s->gy1 - 1u) * s->pitch + s->gx1 * 4u;
+         if (a >= hi || b <= lo) continue;
++        /* The span from first to last pixel includes the gaps between rows. */
++        if (lo > a) {
++            const u32 in_row = (lo - a) % s->pitch;
++            if (in_row >= (s->gx1 - s->gx0) * 4u && hi - lo <= s->pitch - in_row)
++                continue;
++        }
+         static u32 said;
+         if (said < 24u) {
+             said++;
+@@ -6467,7 +6512,14 @@
+     if (v < 0) { const char* e = getenv("LD_SURFACE_MIRROR"); v = (e && *e) ? atol(e) : 0; if (v < 0) v = 0; }
+     return (u32)v;
+ }
+-static void ld_surface_mirror_step(u32 target, u32 color_mask, u32 vx, u32 vy, u32 vw, u32 vh)
++static u32 ld_mirror_row_width(const surface_t* s)
++{
++    const u32 pitch_width = s->pitch / 4u;
++    return s->w < pitch_width ? s->w : pitch_width;
++}
++
++/* Finish the old target and prepare its successor before the draw can sample either. */
++static void ld_surface_mirror_step(u32 target)
+ {
+     const u32 maxpx = ld_surface_mirror_max();
+     if (!maxpx || target >= g.n_surfaces) return;
+@@ -6492,11 +6544,12 @@
+                     }
+                 }
+                 /* older pixels that only surfaces hold go down first, this target's on top of them */
+-                if (g_ld_mirror_pending) ld_mirror_sync_range(s->location, s->offset, s->offset + s->pitch * s->h);
++                const u32 lo = s->offset + s->my0 * s->pitch + s->mx0 * 4u;
++                const u32 hi = s->offset + (s->my1 - 1u) * s->pitch + s->mx1 * 4u;
++                if (g_ld_mirror_pending) ld_mirror_sync_range(s->location, lo, hi);
+                 u8* dst = (u8*)guest_ptr(s->location, s->offset + s->my0 * s->pitch + s->mx0 * 4u,
+                                          s->pitch * (h - 1u) + w * 4u);
+                 if (dst && ld_surface_download(s, s->mx0, s->my0, w, h, dst, s->pitch)) {
+-                    const u32 lo = s->offset + s->my0 * s->pitch, hi = s->offset + (s->my1 - 1u) * s->pitch + s->mx1 * 4u;
+                     for (u32 i = 0; i < g.n_surfaces; i++) {
+                         surface_t* o = &g.surfaces[i];
+                         if (i == prev || !o->tex || o->location != s->location || !o->pitch ||
+@@ -6527,10 +6580,13 @@
+           } }
+         if (t->mirror_stale) {
+             t->mirror_stale = 0;
+-            if (g_ld_mirror_pending && t->pitch) ld_mirror_sync_range(t->location, t->offset, t->offset + t->pitch * t->h);
+-            const u8* srcp = (t->pitch && t->fmt == DXGI_FORMAT_R8G8B8A8_UNORM)
+-                ? guest_ptr(t->location, t->offset, t->pitch * (t->h - 1u) + t->w * 4u) : NULL;
+-            if (srcp && ld_surface_upload(t, srcp, t->pitch, t->w, t->h)) {
++            const u32 w = ld_mirror_row_width(t);
++            const u32 bytes = w && t->h ? t->pitch * (t->h - 1u) + w * 4u : 0;
++            if (g_ld_mirror_pending && bytes)
++                ld_mirror_sync_range(t->location, t->offset, t->offset + bytes);
++            const u8* srcp = bytes && t->fmt == DXGI_FORMAT_R8G8B8A8_UNORM
++                ? guest_ptr(t->location, t->offset, bytes) : NULL;
++            if (srcp && ld_surface_upload(t, srcp, t->pitch, w, t->h)) {
+                 ld_flush(LD_FLUSH_READBACK);        /* the upload buffer is free again for the next one */
+                 static u32 said = 0;
+                 if (PS3_LOG_FIRST(said, 12))
+@@ -6539,10 +6595,36 @@
+             }
+         }
+     }
++}
++
++/* Track the rasterised colour rectangle in guest memory. Some HUD bands
++ * declare a clip wider than their linear pitch, which must not spill into
++ * the next atlas row. The viewport transforms vertices; it is not a clip. */
++static void ld_surface_mirror_note_draw(u32 target, D3D12_RECT rect)
++{
++    const u32 maxpx = ld_surface_mirror_max();
+     surface_t* s = &g.surfaces[target];
+-    if (!color_mask || s->fmt != DXGI_FORMAT_R8G8B8A8_UNORM || ld_upscaled(s) || (u64)s->w * s->h > maxpx) return;
+-    u32 x0 = vx < s->w ? vx : s->w, y0 = vy < s->h ? vy : s->h;
+-    u32 x1 = vx + vw < s->w ? vx + vw : s->w, y1 = vy + vh < s->h ? vy + vh : s->h;
++    if (!maxpx || s->fmt != DXGI_FORMAT_R8G8B8A8_UNORM ||
++        ld_upscaled(s) || (u64)s->w * s->h > maxpx)
++        return;
++    static int by_viewport = -1;
++    if (by_viewport < 0) {
++        const char* e = getenv("LD_MIRROR_VIEWPORT");
++        by_viewport = e && *e == '1';
++    }
++    if (by_viewport) {
++        rsx_dsp_viewport vp;
++        rsx_dsp_get_viewport(&g.rsx, &vp);
++        const u32 win = rsx_dsp_reg(&g.rsx, 0x02B8);
++        rect.left = vp.x + (win & 0xFFFFu);
++        rect.top = vp.y + (win >> 16);
++        rect.right = rect.left + vp.w;
++        rect.bottom = rect.top + vp.h;
++    }
++    const u32 width = ld_mirror_row_width(s);
++    const u32 x0 = (u32)rect.left, y0 = (u32)rect.top;
++    const u32 x1 = (u32)rect.right < width ? (u32)rect.right : width;
++    const u32 y1 = (u32)rect.bottom < s->h ? (u32)rect.bottom : s->h;
+     if (x1 <= x0 || y1 <= y0) return;
+     if (s->mx1 <= s->mx0 || s->my1 <= s->my0) { s->mx0 = x0; s->my0 = y0; s->mx1 = x1; s->my1 = y1; }
+     else {
+@@ -15315,31 +15397,7 @@
+       if (skipk == 1) { const char* e = getenv("LD_SKIP_PSO"); skipk = e ? _strtoui64(e, 0, 16) : 0; }
+       if (skipk && live_legacy_pso_key() == skipk) return; }
+     ld_surface_take_guest_writes(target);       /* a picture the title wrote into this display buffer's memory */
+-    /* LD_SURFACE_MIRROR. Also for an upscaled target [GT6 0102]: the step notices the change of target, and that is
+-     * when the small target left behind goes into guest memory (the HUD's 1628x92 name bands, read from there by the
+-     * very next draws); the upscaled target itself is never mirrored (ld_surface_mirror_step, ld_mirror_seed). */
+-    if (ld_surface_mirror_max()) {
+-        rsx_dsp_viewport mvp;
+-        rsx_dsp_get_viewport(&g.rsx, &mvp);
+-        const u32 mwo = rsx_dsp_reg(&g.rsx, 0x02B8);        /* the window offset moves the picture */
+-        /* What a draw can reach is the scissor, not the viewport rectangle: the viewport is a transform here, and
+-         * Gran Turismo 6 draws the mip levels of a reflection-map face BELOW the 256x256 viewport of the face's
+-         * target, in the same target. With the viewport as the reach, only level 0 was ever copied into guest
+-         * memory and the cube texture decoded from there had never-written levels [GT6 0036].
+-         * LD_MIRROR_VIEWPORT=1 = the viewport rectangle, as before. */
+-        static int by_viewport = -1;
+-        if (by_viewport < 0) { const char* e = getenv("LD_MIRROR_VIEWPORT"); by_viewport = (e && *e == '1') ? 1 : 0; }
+-        u32 rx = mvp.x + (mwo & 0xFFFFu), ry = mvp.y + (mwo >> 16), rw = mvp.w, rh = mvp.h;
+-        if (!by_viewport) {
+-            const u32 sch = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), scv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+-            const u32 sx0 = sch & 0xFFFFu, sy0 = scv & 0xFFFFu, sx1 = sx0 + (sch >> 16), sy1 = sy0 + (scv >> 16);
+-            const u32 x1 = rx + rw > sx1 ? rx + rw : sx1, y1 = ry + rh > sy1 ? ry + rh : sy1;
+-            if (sx0 < rx) rx = sx0;
+-            if (sy0 < ry) ry = sy0;
+-            rw = x1 - rx; rh = y1 - ry;
+-        }
+-        ld_surface_mirror_step(target, rsx_dsp_reg(&g.rsx, M_COLOR_MASK), rx, ry, rw, rh);
+-    }
++    ld_surface_mirror_step(target);
+     /* MRT: colour targets B..D, resolved (and created) here, before any of
+      * this draw's commands are recorded. They share A's format and clip. */
+     u32 mrt[4] = { target, 0, 0, 0 };
+@@ -15443,6 +15501,7 @@
+         if (!t.enabled) continue;
+         if (!((g_ld_fp_units >> u) & 1u) && !ld_bind_all_units()) continue;   /* not sampled: see g_ld_fp_units */
+         int fw_at = -1;
++        u32 fb_x, fb_y;
+         texture_mask |= 1u << u;
+         smp_slots[u] = sampler_slot(&t, sampler_key(&t));
+         /* Pick WHICH surface at this offset to sample.
+@@ -15641,17 +15700,8 @@
+                 g_ld_fb_bound[g_ld_fb_bound_n].k = fw >= 0 ? g_ld_swin_last_k : LD_SWIN_PER;
+                 g_ld_fb_bound_n++;
+             }
+-        } else if (sampled < 0 && !zeta_pref && ld_seq_feedback_on() && !t.cubemap && t.dimension == 2u &&
+-                   (t.format & TEX_FMT_LINEAR) && g.surfaces[target].tex &&
+-                   ((g.surfaces[target].fmt == DXGI_FORMAT_R8G8B8A8_UNORM && ld_tex_texel_bytes(t.format) == 4u) ||
+-                    (g.surfaces[target].fmt == DXGI_FORMAT_R16G16B16A16_FLOAT && ld_tex_texel_bytes(t.format) == 8u)) &&
+-                   g.surfaces[target].location == t.location && g.surfaces[target].pitch &&
+-                   t.pitch == g.surfaces[target].pitch && t.offset > g.surfaces[target].offset &&
+-                   t.offset - g.surfaces[target].offset < g.surfaces[target].pitch * g.surfaces[target].gh &&
+-                   ((t.offset - g.surfaces[target].offset) % g.surfaces[target].pitch) % ld_tex_texel_bytes(t.format) == 0u &&
+-                   (fw_at = surface_window_at(target, &t, LD_DIAG_ENABLED("LD_ALIAS_DBG"),
+-                        ((t.offset - g.surfaces[target].offset) % g.surfaces[target].pitch) / ld_tex_texel_bytes(t.format),
+-                        (t.offset - g.surfaces[target].offset) / g.surfaces[target].pitch)) >= 0) {
++        } else if (!zeta_pref && ld_feedback_subrect(target, &t, sampled, &fb_x, &fb_y) &&
++                   (fw_at = surface_window_at(target, &t, LD_DIAG_ENABLED("LD_ALIAS_DBG"), fb_x, fb_y)) >= 0) {
+             /* The texture is the target's own memory from some row on (see ld_seq_feedback_on).
+              * GT6 motion blur also reads the lower half of an FP16 atlas: 0x2590000 = 0x22C0000 + 8192*360. */
+             slots[u] = (u32)fw_at;
+@@ -16199,9 +16249,13 @@
+     }
+     /* [GT6 0119] a draw that cannot write the colour target leaves that target's surface as it was (see
+      * ld_surface_has_colour) */
+-    if (ld_masked_draw_stamp_all() || (sf.color_target != 0u && (rsx_dsp_reg(&g.rsx, M_COLOR_MASK) & 0x01010101u) != 0u))
++    const int writes_colour = sf.color_target != 0u &&
++        (rsx_dsp_reg(&g.rsx, M_COLOR_MASK) & 0x01010101u) != 0u &&
++        sc.right > sc.left && sc.bottom > sc.top;
++    if (writes_colour || ld_masked_draw_stamp_all())
+         ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
+     else g_ld_masked_draws++;
++    if (writes_colour) ld_surface_mirror_note_draw(target, sc);
+     for (u32 r = 1; r < n_mrt; r++)
+         ld_surface_note_write(mrt[r], LD_SURFACE_WRITE_DRAW);
+     if (current_zslot) {

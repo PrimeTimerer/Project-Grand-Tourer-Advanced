@@ -111,11 +111,38 @@ static const uint8_t* rsx_live_guest_ptr(void* user, uint32_t location,
     (void)user;
     if (!vm_base) return nullptr;
     uint32_t ea;
+    /* [GT6 0143] RSX local memory is at most 256 MB. An offset beyond it used to be added to the local base all the
+     * same and wrapped round the 32 bits into main memory: at the start of the Sierra Time Rally a draw asks for
+     * offset 0x809F0000, which became 0x409F0000 - a block of the game's heap that it had given back two minutes
+     * earlier - and the drawing thread then waited for good for an answer to a page fault that nobody handles
+     * (public issue #16, the second stop after the course's own; gt6_host.cpp names the instruction). Such an
+     * offset is no memory of the RSX: the read is refused and the draw goes without that array, as it does for
+     * every other address that resolves to nothing.
+     * What the game means by it: the offsets seen there (0x80901640, 0x80973390, 0x809E50E0 ...) are ADDRESSES of
+     * its heap, in a megabyte it has mapped for the RSX (0x80900000 <-> IO 0x00900000). On the console that heap is
+     * at 0x40000000 and the code that turns an address into an offset there assumes so; here the heap is at
+     * 0x80000000 and the address came through unchanged. So when the IO table itself says that this very address
+     * is what the offset's low 28 bits map to, the address is used: the draw gets the data it was made for. */
+    const bool beyond_local = offset >= 0x10000000u;
     if (location == 0) {
-        ea = cellGcmResolveLocated(1, offset);
+        ea = beyond_local ? 0u : cellGcmResolveLocated(1, offset);
     } else {
         ea = cellGcmResolveIO(offset);
-        if (!ea) ea = cellGcmResolveLocated(0, offset);
+        if (!ea && beyond_local && cellGcmResolveIO(offset & 0x0FFFFFFFu) == offset) {
+            ea = offset;
+            static LONG told;
+            if (InterlockedIncrement(&told) == 1)
+                fprintf(stderr, "[gt6] RSX offset 0x%08X is an address of the game's heap that the RSX has mapped: read there "
+                                "(the console's heap is at 0x40000000, this one's at 0x80000000)\n", offset);
+        }
+        if (!ea) ea = beyond_local ? 0u : cellGcmResolveLocated(0, offset);
+    }
+    if (!ea && beyond_local) {
+        static LONG said;
+        if (InterlockedIncrement(&said) <= 8)
+            fprintf(stderr, "[gt6] RSX read refused: location %u offset 0x%08X (%u bytes) is not RSX memory (frame %u)\n",
+                    location, offset, min_bytes, rsx_live_draw_get_last_draws());
+        return nullptr;
     }
     if (!ea || ea == 0xFFFFFFFFu || (uint64_t)ea + min_bytes > 0x100000000ull) return nullptr;
     return (const uint8_t*)vm_base + ea;
@@ -173,6 +200,7 @@ static int g_gt6_lan = 0;                             /* [GT6 0114] this run boo
 extern "C" int gt6_lan_mode(void) { return g_gt6_lan; }
 extern "C" int gt6_menu_setting_real_res(void);     /* gt6_menu_engine.cpp */
 extern "C" int gt6_menu_setting_lan_mode(void);     /* gt6_menu_engine.cpp [GT6 0114] */
+extern "C" int gt6_menu_setting_game_language(char* out, int n);   /* gt6_menu_engine.cpp [GT6 0141] */
 extern "C" void rsx_live_draw_reports_tick(void);   /* rsx_live_draw.c: ZPASS counts the title may be waiting for [0056] */
 extern "C" int g_spu_force_ch_block;        /* runtime/spu/spu_channels.c: an empty SPU channel read sleeps */
 static long long s_last_pending_present = 0;
@@ -923,6 +951,15 @@ int main(int argc, char** argv)
     /* Defaults a plain start needs (the environment still overrides each):
      * argv[0] as the loader EBOOT hands it to EMAIN, and the live renderer. */
     if (!getenv("PS3_BOOT_PATH")) _putenv_s("PS3_BOOT_PATH", "/dev_hdd0/game/BCES01893/USRDIR/EMAIN.SELF");
+    /* [GT6 0141] THE GAME'S LANGUAGE (public issue #15): the runtime tells the game Windows' display language; the
+     * launcher's Settings -> Language can name another ("GameLang" of the menu's settings file). PS3_LANG in the
+     * environment goes first, as before. */
+    { const char* e = getenv("PS3_LANG");
+      char code[8];
+      if (!(e && *e) && gt6_menu_setting_game_language(code, (int)sizeof code)) {
+          _putenv_s("PS3_LANG", code);
+          fprintf(stderr, "[gt6] game language: %s (the settings file's GameLang)\n", code);
+      } }
     /* [GT6 0114] LAN MODE (Settings -> Network; public issue #6, and Mabec's GT6 PC build for RPCS3 brought GT6's own LAN
      * play back: the game's hidden boot argument "lanmode" - RPCS3's "Process ARGV" - with the network up and no PSN).
      * Each PC also needs a name of its own: the game tells the consoles apart by their Open PSID, which the runtime
@@ -944,6 +981,10 @@ int main(int argc, char** argv)
           }
           fprintf(stderr, "[gt6] LAN mode: boot argument \"%s\", network on, player \"%s\"\n", getenv("PS3_ARGV"), getenv("PS3_NP_ONLINE_ID"));
       } }
+    /* Match the packaged SGX scheduling on a direct EXE launch as well.
+     * A full FIFO without backpressure discards the oldest PCM block. */
+    if (!getenv("GT6_AUDIO_FIFO_WAIT")) _putenv_s("GT6_AUDIO_FIFO_WAIT", "1");
+    if (!getenv("GT6_AUDIO_PERSISTENT_WORKER")) _putenv_s("GT6_AUDIO_PERSISTENT_WORKER", "1");
     if (!getenv("RSX_LIVE_DRAW")) _putenv_s("RSX_LIVE_DRAW", "1");
     /* Retain unchanged vertex arrays on the GPU. LD_VTX_SLAB=0 keeps the
      * ordinary upload path available for diagnosis and comparison. */
@@ -975,6 +1016,16 @@ int main(int argc, char** argv)
      * own windows and returned 0x70000000: blocks in the lower half were not found any more, realloc() returned
      * NULL, and libc's atexit (which leaves its lock held on that path) blocked the next thread that used it. */
     if (!getenv("PS3_MAPPER_SELF_ALIGN")) _putenv_s("PS3_MAPPER_SELF_ALIGN", "1");
+    /* [GT6 0144] (public issue #12.) A racing wheel is no game controller to SDL and did nothing in the game; the
+     * pad library now plays one as controller 1 by a table (ps3recomp libs\input\cellPad.c, "racing wheels"). The
+     * table's file is GT6Wheel.txt beside the exe: read at start, written with the table in use the first time a
+     * wheel is found. */
+    if (!getenv("PAD_WHEEL_MAP")) {
+        char path[MAX_PATH];
+        const DWORD n = GetModuleFileNameA(nullptr, path, (DWORD)sizeof path);
+        char* slash = (n && n < sizeof path - 16) ? strrchr(path, '\\') : nullptr;
+        if (slash) { strcpy(slash + 1, "GT6Wheel.txt"); _putenv_s("PAD_WHEEL_MAP", path); }
+    }
     /* Paths outside every mount point fail as on the console. The game probes "/specdb" and "/database" for
      * development copies of its databases and, unless told they are not mounted, creates and uses them. */
     if (!getenv("PS3_FS_STRICT_MOUNTS")) _putenv_s("PS3_FS_STRICT_MOUNTS", "1");

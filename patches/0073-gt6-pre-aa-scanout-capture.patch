@@ -1,0 +1,22 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -18184,6 +18184,18 @@
+     g_ld_last_present_target = target;
+     rsx_live_draw_picture_log("present display buffer %u", buffer_id);
+     ld_surface_take_guest_writes(target);       /* written after the last draw into it (no overlay this frame) */
++    if (dump_now) {
++        const char* dir = getenv("LD_PRE_AA_DUMP");
++        if (dir && *dir) {
++            const surface_t* source = &g.surfaces[target];
++            char path[MAX_PATH * 2];
++            snprintf(path, sizeof path, "%s\\pre_aa_%06u.ppm", dir, dump_n - 1u);
++            ld_dump_surface_ppm(path, source);
++            fprintf(stderr, "[scanout-capture] capture=%u frame=%u display=%u surface=%u address=%u:0x%X pitch=%u guest=%ux%u host=%ux%u\n",
++                    dump_n - 1u, g_ld_frames, buffer_id, target, source->location, source->offset,
++                    source->pitch, source->gw, source->gh, source->w, source->h);
++        }
++    }
+     ld_present_aa(target, buffer_id);
+     if (dump_now) {
+         char path[MAX_PATH * 2];

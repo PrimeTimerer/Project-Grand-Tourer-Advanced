@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -285,6 +286,8 @@ namespace GT6Launcher
     public static class SetupAgent
     {
         public const int Ok = 0, NoDialog = 2, Timeout = 3, Failed = 4, WrongResult = 5, BadCall = 6;
+        // ([GT6 0142] the key step: RPCS3 ended by itself - for any reason, for a missing DLL, on a CPU it cannot run on)
+        public const int Exited = 7, ExitedNoDll = 8, ExitedCpu = 9, NoBoot = 10;   // (10: RPCS3 refused to boot the loader)
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         static extern IntPtr FindWindowW(string className, string title);
@@ -583,23 +586,145 @@ namespace GT6Launcher
             return File.Exists(made);
         }
 
+        // [GT6 0142] The titles and texts of the windows on this (hidden) desktop: RPCS3's, and those of the second
+        // rpcs3.exe it starts to show a fatal error. (Nothing else opens a window here.)
+        static string Windows()
+        {
+            var text = new StringBuilder();
+            try
+            {
+                int self = Process.GetCurrentProcess().Id;
+                foreach (AutomationElement window in AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition))
+                {
+                    if (window.Current.ProcessId == self || string.IsNullOrEmpty(window.Current.Name))
+                        continue;
+                    text.Append("[").Append(window.Current.Name).Append("]");
+                    int count = 0;
+                    foreach (AutomationElement part in window.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text)))
+                    {
+                        string name = part.Current.Name;
+                        if (!string.IsNullOrEmpty(name) && count++ < 12)
+                            text.Append(" | ").Append(name.Length > 300 ? name.Substring(0, 300) : name);
+                    }
+                    text.Append("  ");
+                }
+            }
+            catch (Exception)
+            {
+            }
+            return Private(text.ToString().Trim());
+        }
+
+        // The last lines of RPCS3's log for setup.log: its own messages only (they begin with a middle dot; the settings
+        // it prints at a boot do not), no line that names a licence or a console identifier or gives a key, and none
+        // with 32 hex digits in a row; the user's own folder out of the paths.
+        static string Tail(string log)
+        {
+            string[] lines = log.Replace("\r", "").Split('\n');
+            var kept = new List<string>();
+            for (int i = lines.Length - 1; i >= 0 && kept.Count < 30; i--)
+            {
+                string line = lines[i];
+                if (!line.StartsWith("·", StringComparison.Ordinal) ||
+                    Regex.IsMatch(line, @"KLIC|PSID|IDPS|console.?id|licen[cs]e|\.rap\b|\bkey\b[^/\\]{0,3}(0x)?[0-9A-Fa-f]{8}|[0-9A-Fa-f]{32}", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+                    continue;
+                kept.Insert(0, "    " + Private(line.Length > 260 ? line.Substring(0, 260) : line));
+            }
+            return string.Join("\r\n", kept.ToArray());
+        }
+
+        static string Private(string text)
+        {
+            try
+            {
+                string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (!string.IsNullOrEmpty(home))
+                    text = Regex.Replace(text, Regex.Escape(home), "%USERPROFILE%", RegexOptions.IgnoreCase);
+                string user = Environment.UserName;
+                if (!string.IsNullOrEmpty(user) && user.Length >= 3)
+                    text = Regex.Replace(text, @"(?<![A-Za-z0-9])" + Regex.Escape(user) + @"(?![A-Za-z0-9])", "%USERNAME%", RegexOptions.IgnoreCase);
+            }
+            catch (Exception)
+            {
+            }
+            return text;
+        }
+
         // The licence key of the main executable: the game's loader hands it to the system when it asks whether the
         // executable may run. RPCS3 runs the loader (interpreter, no picture) and writes that question into its log,
         // key included; it is ended at that line - before the game itself would start - and the key is used once, here.
+        // [GT6 0142] (public issue #14: "the game's executable could not be prepared (code 3)" and nothing to go by -
+        // code 3 stood both for RPCS3 ending by itself and for four minutes without the line, and RPCS3's log was
+        // deleted either way.) When no key comes: whether RPCS3 ended by itself (and with which exit code) or was still
+        // running, what its windows on this hidden desktop say - a box nobody sees is a reason it waits - and the end of
+        // its log go into setup.log first, without any line that holds an identifier or a key. While RPCS3's log
+        // still grows the wait goes on past the four minutes, up to eight (a slow disc).
+        // When RPCS3 refuses to boot the loader it says so in its log and then shows a "fatal error" box (rpcs3.cpp,
+        // --no-gui: report_fatal_error) - on this desktop nobody sees or answers it, which was the four minutes'
+        // wait; the wait ends at that line now (code 10).
         static int Key(string tool, string loader, string self, string wantedSha256)
         {
-            string key = null;
+            string key = null, windows = "", tail = "";
+            bool ended = false, refused = false;
+            int exitCode = 0;
+            double seconds = 0;
             Process process = Start(tool, "--no-gui \"" + loader + "\"");
             try
             {
                 var watch = Stopwatch.StartNew();
-                while (watch.Elapsed.TotalSeconds < 240 && !process.HasExited && key == null)
+                long size = -1;
+                double grew = 0;
+                while (!process.HasExited && key == null)
                 {
-                    Match match = Regex.Match(Log(tool), "KLIC=0x([0-9A-Fa-f]{32})");
+                    string log = Log(tool);
+                    Match match = Regex.Match(log, "KLIC=0x([0-9A-Fa-f]{32})");
+                    if (match.Success)
+                    {
+                        key = match.Groups[1].Value;
+                        break;
+                    }
+                    double now = watch.Elapsed.TotalSeconds;
+                    if (log.Length != size)
+                    {
+                        size = log.Length;
+                        grew = now;
+                    }
+                    if (log.IndexOf("with cli argument failed", StringComparison.Ordinal) >= 0)
+                    {
+                        refused = true;
+                        Thread.Sleep(700);   // (its box comes up right after the line)
+                        break;
+                    }
+                    if (now >= 480 || (now >= 240 && now - grew > 30))
+                        break;
+                    Thread.Sleep(100);
+                }
+                seconds = watch.Elapsed.TotalSeconds;
+                if (key == null)
+                {
+                    Thread.Sleep(300);
+                    string log = Log(tool);
+                    Match match = Regex.Match(log, "KLIC=0x([0-9A-Fa-f]{32})");   // (it ended right after the line)
                     if (match.Success)
                         key = match.Groups[1].Value;
                     else
-                        Thread.Sleep(100);
+                    {
+                        ended = process.HasExited;
+                        if (ended)
+                        {
+                            try
+                            {
+                                exitCode = process.ExitCode;
+                            }
+                            catch (Exception)
+                            {
+                            }
+                        }
+                        // (RPCS3 shows a fatal error from a second rpcs3.exe and ends itself: the line decides)
+                        refused = refused || log.IndexOf("with cli argument failed", StringComparison.Ordinal) >= 0;
+                        windows = Windows();
+                        tail = Tail(log);
+                    }
                 }
             }
             finally
@@ -616,8 +741,18 @@ namespace GT6Launcher
             }
             if (key == null)
             {
-                Note("key: the loader did not get as far as asking");
-                return Timeout;
+                Note(refused ? "key: RPCS3 refused to boot the loader (after " + seconds.ToString("0.0", CultureInfo.InvariantCulture) + " s)"
+                     : ended ? "key: RPCS3 ended by itself after " + seconds.ToString("0.0", CultureInfo.InvariantCulture) + " s, exit code 0x" + exitCode.ToString("X8") + ", before the loader asked"
+                             : "key: the loader did not get as far as asking in " + seconds.ToString("0", CultureInfo.InvariantCulture) + " s; RPCS3 was still running");
+                if (windows != "")
+                    Note("key: RPCS3's windows: " + windows);
+                if (tail != "")
+                    Note("key: the end of RPCS3's log (lines with identifiers left out):\r\n" + tail);
+                if (refused)
+                    return NoBoot;
+                if (!ended)
+                    return Timeout;
+                return (uint)exitCode == 0xC0000135u ? ExitedNoDll : (uint)exitCode == 0xC000001Du ? ExitedCpu : Exited;
             }
             bool made = Decrypt(tool, self, key);
             key = null;
@@ -748,6 +883,63 @@ namespace GT6Launcher
                 string volume = Path.Combine(DiscDir, "PS3_GAME", "USRDIR", "GT.VOL");
                 return File.Exists(volume) && new FileInfo(volume).Length == SetupFacts.VolumeSize && File.Exists(Path.Combine(DiscDir, "PS3_GAME", "PARAM.SFO"));
             }
+        }
+
+        // [GT6 0142] (public issue #14.) The disc folder's mark. The game does not open PS3_DISC.SFB and a folder copied
+        // off a disc may lack it (so step 1 lets it be missing) - but step 5 runs the game's loader in RPCS3, the loader
+        // is a disc game's update, and RPCS3 takes game\dev_bdvd for its disc only with a PS3_DISC.SFB that begins
+        // with ".SFB" (System.cpp: "Booting patch data" -> IsValidSfb); without one the boot is refused, RPCS3 shows a
+        // box nobody sees and the step ended as "code 3" after four minutes. So a missing (or broken) one is written
+        // here: the usual 0x600 bytes with the two entries of a disc's own file (HYBRID_FLAG, TITLE_ID). A good one is
+        // left alone.
+        internal static byte[] DiscMark()
+        {
+            var b = new byte[0x600];
+            Action<int, string> text = delegate(int at, string s) { Encoding.ASCII.GetBytes(s).CopyTo(b, at); };
+            Action<int, uint> number = delegate(int at, uint v) { b[at] = (byte)(v >> 24); b[at + 1] = (byte)(v >> 16); b[at + 2] = (byte)(v >> 8); b[at + 3] = (byte)v; };
+            text(0, ".SFB");
+            number(4, 0x00010000);
+            text(0x20, "HYBRID_FLAG");
+            number(0x30, 0x200);
+            number(0x34, 0x20);
+            text(0x40, "TITLE_ID");
+            number(0x50, 0x220);
+            number(0x54, 0x10);
+            text(0x200, "g");
+            text(0x220, GameFiles.TitleId.Substring(0, 4) + "-" + GameFiles.TitleId.Substring(4));
+            return b;
+        }
+
+        internal static bool DiscMarkGood(string file)
+        {
+            try
+            {
+                using (var f = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    var head = new byte[4];
+                    return f.Read(head, 0, 4) == 4 && head[0] == '.' && head[1] == 'S' && head[2] == 'F' && head[3] == 'B';
+                }
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+        }
+
+        void EnsureDiscMark()
+        {
+            string mark = Path.Combine(DiscDir, "PS3_DISC.SFB");
+            if (DiscMarkGood(mark))
+                return;
+            bool was = File.Exists(mark);
+            if (was)
+                File.SetAttributes(mark, FileAttributes.Normal);   // (a file copied off a disc is often read-only)
+            File.WriteAllBytes(mark, DiscMark());
+            Note("disc: game\\dev_bdvd\\PS3_DISC.SFB " + (was ? "was not a disc's mark" : "was missing") + " - a stand-in is written (RPCS3 needs it to run the game's loader)");
         }
 
         public string InstalledVersion { get { return Sfo.Get(Sfo.Read(Path.Combine(launcher.TitleDir, "PARAM.SFO")), "APP_VER"); } }
@@ -1413,6 +1605,7 @@ namespace GT6Launcher
             File.Copy(self, Path.Combine(small, "work", "EMAIN.SELF"));
             At(0.3, null);
             QuietTool();
+            EnsureDiscMark();   // ([GT6 0142] RPCS3 boots the loader only with the disc folder marked as a disc)
             PointTool(Path.Combine(small, "dev_hdd0"));
             int code;
             try
@@ -1425,7 +1618,15 @@ namespace GT6Launcher
             }
             string elf = Path.Combine(small, "work", "EMAIN.elf");
             if (code != SetupAgent.Ok || !File.Exists(elf) || Hashes.Sha256(elf) != SetupFacts.ElfSha256)
-                throw new SetupFailed(L.T("게임 실행 파일을 준비하지 못했습니다 (코드 ") + code + L.T("). logs\\launcher\\setup.log를 봐 주세요."));
+            {
+                // ([GT6 0142] what is known of the reason, in words; the rest is in setup.log - see SetupAgent.Key)
+                string why = code == SetupAgent.ExitedNoDll ? L.T(" 설치 도구(RPCS3)가 필요한 DLL이 없어 시작하지 못했습니다. 대개 Microsoft Visual C++ 2015-2022 재배포 패키지(x64)가 없을 때입니다 - 설치한 뒤 다시 해 주세요.")
+                           : code == SetupAgent.ExitedCpu ? L.T(" 설치 도구(RPCS3)가 이 PC의 CPU에서 실행되지 않았습니다 (필요한 명령이 없습니다).")
+                           : code == SetupAgent.NoBoot ? L.T(" 설치 도구(RPCS3)가 게임 로더의 부팅을 거부했습니다. RPCS3가 댄 이유를 setup.log에 적었습니다.")
+                           : code == SetupAgent.Exited ? L.T(" 설치 도구(RPCS3)가 게임 로더를 실행하다가 스스로 종료했습니다. 종료 코드와 그 로그의 끝을 setup.log에 적었습니다.")
+                           : code == SetupAgent.Timeout ? L.T(" 설치 도구(RPCS3)가 게임 로더를 제시간에 실행하지 못했습니다. 그때 떠 있던 창과 그 로그의 끝을 setup.log에 적었습니다.") : "";
+                throw new SetupFailed(L.T("게임 실행 파일을 준비하지 못했습니다 (코드 ") + code + L.T("). logs\\launcher\\setup.log를 봐 주세요.") + why);
+            }
             Directory.CreateDirectory(launcher.GameDir);
             File.Copy(elf, launcher.Elf, true);
             Directory.Delete(small, true);

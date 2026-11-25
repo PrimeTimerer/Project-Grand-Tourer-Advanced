@@ -522,6 +522,26 @@ extern "C" int gt6_page_fault(EXCEPTION_POINTERS* ep, uint32_t guest_addr)
 {
     /* 1 = the title's pager has mapped the page (or is not needed): try the access again.
      * 0 = not a page the title pages itself: main.cpp commits it. */
+    /* [GT6 0143] (diagnostic.) The game's heap region (0x40000000-0x4FFFFFFF here) is paged by nobody: the game maps
+     * and unmaps its 64 KB blocks itself and never touches one that is not there, so a fault in it is a read of
+     * memory the game has given back - and the thread then waits for an answer that never comes (str_r2: the
+     * drawing thread, at the start of the Sierra Time Rally). Who it was: the instruction and the callers. */
+    if (guest_addr >= 0x40000000u && guest_addr < 0x50000000u) {
+        static LONG said;
+        if (InterlockedIncrement(&said) <= 8) {
+            const uintptr_t exe = (uintptr_t)GetModuleHandleW(nullptr);
+            void* frames[24];
+            const USHORT n = CaptureStackBackTrace(0, 24, frames, nullptr);
+            char bt[24 * 12 + 4]; int p = 0; bt[0] = 0;
+            for (USHORT i = 0; i < n && p < (int)sizeof bt - 12; i++) {
+                const uintptr_t a = (uintptr_t)frames[i];
+                p += snprintf(bt + p, sizeof bt - p, " %llx", (unsigned long long)(a >= exe && a - exe < 0x20000000ull ? a - exe : 0));
+            }
+            fprintf(stderr, "[gt6] heap page fault: %s 0x%08X by host thread %lu at rva %llx; callers (rva, 0 = outside the exe):%s\n",
+                    ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "write to" : "read of", guest_addr, GetCurrentThreadId(),
+                    (unsigned long long)((uintptr_t)ep->ContextRecord->Rip - exe), bt);
+        }
+    }
     return ps3_mmapper_page_fault(guest_addr, ep->ExceptionRecord->ExceptionInformation[0] == 1);
 }
 
@@ -816,6 +836,33 @@ static void gt6_patches_init(void)
         for (unsigned k = 0; k < d.len; k++) vm_write8(d.addr + k, d.bytes[k]);
         fprintf(stderr, "[gt6-patch] %u bytes written at 0x%08X\n", d.len, d.addr);
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * [GT6 0143] (public issue #16: "Sierra Time Rally won't start - a black screen with the music playing".)
+ * Circuito de la Sierra is a generated course ("crs/<name>.pwy", the course maker's format): its pack is fixed up by
+ * func_00C8CD90, whose first test compares the pack's base field with the pack's own address as SIGNED numbers
+ * (0x00C8CDB8 cmpw r0, r3 / bgt). The game's heap is at 0x40000000 on the console and at 0x80000000 here, where an
+ * address is negative as a signed number: the test took the pack for fixed up already and left every pointer in it
+ * a file offset. What followed in the run that showed it (str_r1, 2026-11-25): func_004FCDF0 read the pack's table
+ * through the offset 0x660 ([null-read] NULL+0x660 ... +0x67C), no part of the course matched, the road's triangle
+ * file (/dev_hdd1/cache/.../tmp_rwy_triangle.dat) was written with 0 bytes, and the logic thread then walked a
+ * particle set's 65,535 "entries" of the same unfixed data (func_008E15C8 under func_004E0E30) for more than a minute
+ * a name - no frame was shown again.
+ * tools\post_lift.py makes that one comparison unsigned (the same answer as the console's for every address below
+ * 0x80000000). GT6_CRS_RELOC=game keeps the game's own comparison.
+ * Not changed: where the heap is. Other code of the game that compares addresses as signed numbers would go wrong
+ * in the same way; none other is known.
+ * -------------------------------------------------------------------------*/
+extern "C" int gt6_crs_reloc_signed(void)
+{
+    static const int game = []() {
+        const char* e = getenv("GT6_CRS_RELOC");
+        const int v = (e && !strcmp(e, "game")) ? 1 : 0;
+        if (v) fprintf(stderr, "[gt6] GT6_CRS_RELOC=game: the generated course's pack is tested as the game does (signed)\n");
+        return v;
+    }();
+    return game;
 }
 
 /* ---------------------------------------------------------------------------

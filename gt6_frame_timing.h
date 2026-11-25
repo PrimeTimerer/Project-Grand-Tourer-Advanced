@@ -1,10 +1,29 @@
-/* Diagnostic frame pacing experiment for EMAIN 1.22. Included only by
- * gt6_host.cpp, after ppu_context and the guarded peek helpers.
+/* Frame pacing for EMAIN 1.22. Included only by gt6_host.cpp, after
+ * ppu_context and the guarded peek helpers.
  *
- * GT6_RENDER_INTERVAL=0/1 changes only the VBlank target at 0x008A8A44.
- * The shared frame interval, the 60 Hz VBlank clock, and guest time remain
- * untouched. This is deliberately opt-in until real race/replay timing is
- * verified. GT6_FRAME_TIMING_TRACE=1 observes raw update arguments once/sec.
+ * The game presents every VBlank in a race and every second one in a replay,
+ * in the scenes before and after a race and in its B-Spec view: its frame
+ * interval (graphics root + 0x1C) is 1 or 2, and the wait at 0x008A8A44 asks
+ * for "the VBlank of the last frame + the interval".
+ *
+ * [GT6 0133, 2026-11-25] Every VBlank everywhere (B-Spec, the replay and
+ * the scene before the first drive were locked to 30 fps - all of them are
+ * unlocked to 60). Only the wait's target changes, to "+ 1"; the shared interval,
+ * the 60 Hz VBlank clock and guest time are untouched. That is enough: the
+ * update takes the time that really passed (the first argument of 001F90FC
+ * is the measured frame time, GT6_FRAME_TIMING_TRACE: 60 calls a second
+ * adding up to 1.01 s of game time a second in a replay with the target
+ * moved, 27 calls adding up to the same without). Test drive ind1 (a
+ * 12-car race at Tsukuba, then its replay): the replay ran at 37 .. 60 fps
+ * instead of 30, at the right speed, for as long as the run lasted.
+ * It was opt-in from 2026-11-17 ("until real race/replay timing is
+ * verified"); an early try then met a wait in the SPU job queue that never
+ * ended (docs\OPTIMIZATION_20261117.md) - ind1 showed none in 330 s. Why
+ * that wait is gone was not looked into.
+ *
+ * GT6_RENDER_INTERVAL=2: the game's own pace (off). =0: no VBlank wait at
+ * all (tests). GT6_FRAME_TIMING_TRACE=1 observes raw update arguments
+ * once/sec.
  */
 #pragma once
 #include <cmath>
@@ -14,10 +33,12 @@ namespace {
 struct Gt6FrameTimingConfig {
     int interval;
     bool trace;
-    Gt6FrameTimingConfig() : interval(-1), trace(false) {
+    Gt6FrameTimingConfig() : interval(1), trace(false) {
         const char* value = getenv("GT6_RENDER_INTERVAL");
         if (value && (value[0] == '0' || value[0] == '1') && value[1] == 0)
             interval = value[0] - '0';
+        else if (value && value[0] == '2' && value[1] == 0)
+            interval = -1;   /* the game's own pace */
         const char* diagnostic = getenv("GT6_FRAME_TIMING_TRACE");
         trace = diagnostic && diagnostic[0] == '1';
     }
@@ -86,8 +107,10 @@ extern "C" void gt6_render_wait_target(ppu_context* ctx)
     ctx->gpr[4] = sample.previous_vblank + (uint32_t)config.interval;
     static thread_local bool reported = false;
     if (!reported) {
-        fprintf(stderr, "[gt6-render-interval] experimental wait target %d -> %d; "
-                "guest interval and VBlank clock unchanged\n", sample.interval, config.interval);
+        fprintf(stderr, "[gt6-render-interval] the game asks for every %d. VBlank here (a replay, "
+                "the scene before or after a race): presented every %d. instead; its interval and "
+                "the VBlank clock unchanged (GT6_RENDER_INTERVAL=2 = the game's own pace)\n",
+                sample.interval, config.interval);
         reported = true;
     }
 }

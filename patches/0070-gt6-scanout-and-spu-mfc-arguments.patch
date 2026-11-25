@@ -1,0 +1,60 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -18078,13 +18078,34 @@
+     u32 target = LD_INVALID_SURFACE;
+     if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
+         const display_buffer_t* display = &g.display_buffers[buffer_id];
+-        for (u32 i = 0; i < g.n_surfaces; i++) {
+-            if (g.surfaces[i].location == display->location &&
+-                g.surfaces[i].offset == display->offset) {
+-                target = i;
+-                break;
++        u32 colour_target = LD_INVALID_SURFACE;
++        u32 youngest_colour_age = UINT32_MAX;
++        const int indexed = ld_surface_key_index_on() && !g.surface_key_index_failed;
++        const u32 first = indexed
++            ? rsx_surface_key_first(&g.surface_keys, display->location, display->offset) : 0u;
++        for (u32 i = first; i < g.n_surfaces;
++             i = indexed ? rsx_surface_key_next(&g.surface_keys, i) : i + 1u) {
++            const surface_t* s = &g.surfaces[i];
++            if (s->location != display->location || s->offset != display->offset)
++                continue;
++            if (target == LD_INVALID_SURFACE) target = i;
++            /* The offset alone can also name a smaller offscreen surface.
++             * Use the guest extent here, since actual resolution scales the backing. */
++            if (!s->tex || s->fmt != DXGI_FORMAT_R8G8B8A8_UNORM ||
++                s->gw < display->width || s->gh < display->height ||
++                (display->pitch && s->pitch && display->pitch != s->pitch) ||
++                !ld_surface_has_colour(s))
++                continue;
++            u32 age = 0;
++#if !defined(YZ_PERF_CLEAN)
++            age = g_ld_surface_generation - s->last_write_generation;
++#endif
++            if (colour_target == LD_INVALID_SURFACE || age < youngest_colour_age) {
++                colour_target = i;
++                youngest_colour_age = age;
+             }
+         }
++        if (colour_target != LD_INVALID_SURFACE) target = colour_target;
+     }
+     if (target == LD_INVALID_SURFACE && buffer_id < 8 &&
+         g.display_buffers[buffer_id].valid && g.display_buffers[buffer_id].resolve_src > 0 &&
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1187,6 +1187,13 @@
+               for (int i = 0; i < 128; i++) if (w[i])
+                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
+     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
++
++    /* The five DMA argument channels only write registers in this context.
++     * Look up the engine when a command or an engine-backed channel needs it. */
++    if (channel >= MFC_LSA && channel <= MFC_TagID) {
++        mfc_channel_write(NULL, ctx, channel, v);
++        return;
++    }
+ 
+     if (channel_is_mfc(channel)) {
+         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,

@@ -167,6 +167,13 @@ if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
     if(PORT_ENABLE_POLICY_LIFT AND POLICY_LIFTED AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/spu_policy/policy_register.c")
         message(STATUS "Lifted SPU policy module: yes")
         list(APPEND SPU_SOURCES ${POLICY_LIFTED} "${CMAKE_CURRENT_SOURCE_DIR}/spu_policy/policy_register.c")
+        # [GT6 0138] The SPURS system service module (firmware libsre; what an SPU runs when it has no workload, and
+        # between workloads), lifted by tools/lift_sysservice_module.py into spu_policy/gt6_sysrv (the glob above has
+        # its source). GT6_SYSRV_LIFT=0 at run time leaves it to the interpreter.
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/spu_policy/sysrv_register.c")
+            message(STATUS "Lifted SPURS system service module: yes")
+            list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/spu_policy/sysrv_register.c")
+        endif()
     endif()
     # SGX audio codec and DSP jobs, generated only for observed LS load addresses.
     # Runtime byte verification keeps unknown/replaced code in the interpreter.
@@ -417,6 +424,49 @@ elseif(MSVC)
         _CRT_SECURE_NO_WARNINGS
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# [GT6 0132] The instruction set and the profile of everything in this target
+# ---------------------------------------------------------------------------
+# GT6_PPU_ARCH (OFF | V3): the lifted PPU code and the port's own sources were compiled for baseline x86-64 - every
+# big-endian load and store of the guest a mov + bswap, cntlzw a bsr with a branch, fmadd a call into the C library -
+# while the lifted SPU code already needs AVX2 + FMA (GT6_SPU_SIMD), so the port runs on no CPU without them anyway.
+# V3 = AVX2, FMA, BMI1/2, LZCNT, MOVBE, POPCNT, F16C (x86-64-v3: every CPU that has AVX2). -ffp-contract=off keeps the
+# compiler from fusing a multiply and an add by itself: the guest's fmul + fadd stay two roundings, its fmadd one.
+set(GT6_PPU_ARCH "OFF" CACHE STRING "Instruction set of the lifted PPU code and the port's sources: OFF (baseline x86-64) or V3")
+# (both options go to the engine's runtime library as well - the renderer, the FIFO walker, the SPU channels and
+# interpreter, the system calls: the draw thread and a tenth of the SPU threads' time are in there)
+set(_gt6_tuned_targets ${PROJECT_NAME} ps3recomp_runtime)
+if(GT6_PPU_ARCH STREQUAL "V3" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    foreach(_t ${_gt6_tuned_targets})
+        target_compile_options(${_t} PRIVATE -mavx2 -mfma -mbmi -mbmi2 -mlzcnt -mmovbe -mpopcnt -mf16c /clang:-ffp-contract=off)
+    endforeach()
+endif()
+message(STATUS "PPU / port instruction set: ${GT6_PPU_ARCH}")
+# GT6_PGO (OFF | GEN | USE): profile-guided optimisation. GEN builds the instrumented exe (it writes its counters to
+# default_*.profraw in the working directory every 20 s, gt6_pgo.cpp); merge them with llvm-profdata and build again
+# with USE and GT6_PGO_DATA=<file.profdata>.
+set(GT6_PGO "OFF" CACHE STRING "Profile-guided optimisation: OFF, GEN (instrumented) or USE (optimised with GT6_PGO_DATA)")
+set(GT6_PGO_DATA "" CACHE FILEPATH "The merged profile (.profdata) for GT6_PGO=USE")
+if(GT6_PGO STREQUAL "GEN" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    foreach(_t ${_gt6_tuned_targets})
+        target_compile_options(${_t} PRIVATE /clang:-fprofile-generate)
+    endforeach()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE GT6_PGO_GEN)
+    target_sources(${PROJECT_NAME} PRIVATE gt6_pgo.cpp)
+    # (CMake drives the linker itself, so the compiler's driver does not add the profile runtime)
+    get_filename_component(_gt6_cl_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    file(GLOB _gt6_prof_lib "${_gt6_cl_dir}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${_gt6_prof_lib})
+elseif(GT6_PGO STREQUAL "USE" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    if(NOT EXISTS "${GT6_PGO_DATA}")
+        message(FATAL_ERROR "GT6_PGO=USE needs GT6_PGO_DATA=<file.profdata>")
+    endif()
+    foreach(_t ${_gt6_tuned_targets})
+        target_compile_options(${_t} PRIVATE "/clang:-fprofile-use=${GT6_PGO_DATA}" -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+    endforeach()
+endif()
+message(STATUS "Profile-guided optimisation: ${GT6_PGO}")
 
 # The lifted translation units are machine-generated and can run to hundreds of
 # thousands of lines each, so they get their own flags:

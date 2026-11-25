@@ -1,0 +1,521 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index c0b74a4..ca9a895 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -463,6 +463,464 @@ static void pad_sdl_rumble_send(int i)
+     r->sent_ms = on ? pad_now_ms() : 0;
+ }
+ 
++/* ---- racing wheels and other plain joysticks -------------------------------
++ * SDL lists a racing wheel as a joystick, not as a game controller: it has no
++ * entry in the controller database, so SDL_IsGameController() says no and the
++ * scan below used to pass it by - the wheel showed in Windows and did nothing
++ * in the title. Such a device is opened as a plain joystick here and turned
++ * into pad input by a table: one axis is the left stick's X (steering), two
++ * are the pedals, buttons and the hat are pad buttons.
++ *
++ * Its state is MERGED into port 0, on top of whatever is there (a pad, the
++ * keyboard fallback): buttons are OR-ed, a stick takes whichever source is
++ * further from the centre. So a wheel never takes input away - the keyboard
++ * and a pad keep working beside it, which matters while a wheel's table is
++ * still wrong.
++ *
++ * Which devices: SDL's type "wheel" (its own list of wheels), the Logitech
++ * wheels by product id, and any device that has a section of its own in the
++ * table file. Everything else is named once in the log and left alone: a
++ * flight stick's throttle lever or a pedal set that is a USB device of its
++ * own must not steer or hold the brake.
++ *
++ * The table file: PAD_WHEEL_MAP=<path>. Read once; when it does not exist and
++ * a wheel is opened, a commented file with the table in use is written there.
++ *     [046d:c266]                 vendor:product in hex, or [*] for the rest
++ *     steer    = axis 0           axis N [invert|direct] | button N | hat N up|down|left|right | none
++ *     throttle = axis 1 invert    a pedal: invert = rests at its maximum, direct = at its minimum,
++ *     brake    = axis 2 invert    neither = found out from the end it is first seen resting at
++ *     pedals   = stick            stick (right stick up / down) | buttons (cross / square pressure) | triggers (R2 / L2)
++ *     range    = 100              per cent of the wheel's travel that is full lock
++ *     deadzone = 0                per cent
++ *     cross = button 0  ...       select l3 r3 start up right down left l2 r2 l1 r1 triangle circle cross square
++ * PAD_WHEEL_LOG=1 prints every button, hat and large axis change with its
++ * number - what a table is written from.
++ * PAD_WHEEL_SELFTEST="<s>:<what><n>:<value>,..." attaches a virtual wheel
++ * (046d:c266, 4 axes, 25 buttons, 1 hat) and sets its inputs at those seconds
++ * after start: b9:1 presses button 9, a0:-20000 sets axis 0, h0:2 the hat
++ * (SDL_HAT_* bits). The whole path from SDL to the pad data, without a wheel.
++ * -------------------------------------------------------------------------*/
++#define PAD_RIG_MAX      4
++#define PAD_RIG_SECTIONS 24
++enum { RIG_NONE = 0, RIG_AXIS, RIG_BUTTON, RIG_HAT };
++typedef struct { u8 kind, index, arg, invert; } PadRigSrc;   /* arg: a hat's direction (SDL_HAT_*); invert: 1 invert, 2 direct */
++typedef struct {
++    u16       vendor, product;      /* 0:0 = any device */
++    PadRigSrc steer, throttle, brake;
++    PadRigSrc btn[16];              /* by CELL_PAD_CTRL bit number */
++    u8        pedals;               /* 0 right stick, 1 cross / square pressure, 2 R2 / L2 */
++    u8        deadzone, range;      /* per cent */
++} PadRigMap;
++typedef struct {
++    SDL_Joystick*  joy;
++    SDL_JoystickID id;
++    PadRigMap      map;
++    signed char    axis_rest[16];   /* a pedal's axis: 0 not known yet, 1 rests at its maximum, -1 at its minimum */
++    Sint16         log_axis[16];
++    u32            log_buttons;
++    u8             log_hat;
++} PadRig;
++static PadRig     s_rig[PAD_RIG_MAX];
++static PadRigMap  s_rig_file[PAD_RIG_SECTIONS];
++static int        s_rig_file_n, s_rig_file_read, s_rig_file_exists;
++static int        s_rig_virtual = -1;     /* device index of the self-test wheel */
++static SDL_JoystickID s_rig_passed[16];   /* joysticks named in the log as not used */
++static int        s_rig_passed_n;
++
++static const struct { const char* name; u16 bit; } k_rig_buttons[16] = {
++    { "select", CELL_PAD_CTRL_SELECT }, { "l3", CELL_PAD_CTRL_L3 }, { "r3", CELL_PAD_CTRL_R3 },
++    { "start", CELL_PAD_CTRL_START },   { "up", CELL_PAD_CTRL_UP }, { "right", CELL_PAD_CTRL_RIGHT },
++    { "down", CELL_PAD_CTRL_DOWN },     { "left", CELL_PAD_CTRL_LEFT }, { "l2", CELL_PAD_CTRL_L2 },
++    { "r2", CELL_PAD_CTRL_R2 },         { "l1", CELL_PAD_CTRL_L1 }, { "r1", CELL_PAD_CTRL_R1 },
++    { "triangle", CELL_PAD_CTRL_TRIANGLE }, { "circle", CELL_PAD_CTRL_CIRCLE },
++    { "cross", CELL_PAD_CTRL_CROSS },   { "square", CELL_PAD_CTRL_SQUARE },
++};
++
++static int rig_button_slot(const char* name)
++{
++    for (int i = 0; i < 16; i++) if (!strcmp(name, k_rig_buttons[i].name)) return i;
++    return -1;
++}
++
++static int rig_logitech_wheel(u16 product)
++{
++    static const u16 ids[] = { 0xC24F /* G29 */, 0xC260 /* G29, PS4 mode */, 0xC262 /* G920 */, 0xC266, 0xC267 /* G923 PlayStation */,
++                               0xC26D, 0xC26E /* G923 Xbox */, 0xC294 /* Driving Force */, 0xC295 /* Momo Force */,
++                               0xC298 /* Driving Force Pro */, 0xC299 /* G25 */, 0xC29A /* Driving Force GT */,
++                               0xC29B /* G27 */, 0xC29C /* Speed Force Wireless */, 0xCA03 /* Momo Racing */, 0xC272 /* Pro Racing Wheel */ };
++    for (unsigned i = 0; i < sizeof ids / sizeof ids[0]; i++) if (ids[i] == product) return 1;
++    return 0;
++}
++
++/* The built-in table of a device. Logitech's wheels send the wheel on the
++ * first axis and the pedals on the next two, each resting at its maximum; the
++ * buttons are numbered as on a G29 (cross, square, circle, triangle, the two
++ * paddles, R2, L2, share, options, R3, L3) or, on the Xbox models, as on a
++ * G920 (A, B, X, Y, the paddles, menu, view, the two stick buttons). The
++ * paddles are R2 / L2: Gran Turismo's own pad layout shifts with those. */
++static void rig_builtin(PadRigMap* m, u16 vendor, u16 product)
++{
++    static const u8 ps[][2]   = { {14, 0}, {15, 1}, {13, 2}, {12, 3}, {9, 4}, {8, 5}, {11, 6}, {10, 7}, {0, 8}, {3, 9}, {2, 10}, {1, 11} };
++    static const u8 xbox[][2] = { {14, 0}, {13, 1}, {15, 2}, {12, 3}, {9, 4}, {8, 5}, {3, 6}, {0, 7}, {2, 8}, {1, 9} };
++    const int x = vendor == 0x046D && (product == 0xC262 || product == 0xC26D || product == 0xC26E);
++    const u8 rests_high = vendor == 0x046D ? 1 : 0;      /* Logitech: known; another make: looked for (rig_amount) */
++    memset(m, 0, sizeof *m);
++    m->vendor = vendor; m->product = product;
++    m->steer    = (PadRigSrc){ RIG_AXIS, 0, 0, 0 };
++    m->throttle = (PadRigSrc){ RIG_AXIS, 1, 0, rests_high };
++    m->brake    = (PadRigSrc){ RIG_AXIS, 2, 0, rests_high };
++    m->range = 100;
++    for (unsigned i = 0; i < (x ? sizeof xbox : sizeof ps) / 2; i++) {
++        const u8* e = x ? xbox[i] : ps[i];
++        m->btn[e[0]] = (PadRigSrc){ RIG_BUTTON, e[1], 0, 0 };
++    }
++    m->btn[4] = (PadRigSrc){ RIG_HAT, 0, SDL_HAT_UP, 0 };
++    m->btn[5] = (PadRigSrc){ RIG_HAT, 0, SDL_HAT_RIGHT, 0 };
++    m->btn[6] = (PadRigSrc){ RIG_HAT, 0, SDL_HAT_DOWN, 0 };
++    m->btn[7] = (PadRigSrc){ RIG_HAT, 0, SDL_HAT_LEFT, 0 };
++}
++
++static int rig_parse_src(char* v, PadRigSrc* out)
++{
++    char kind[16] = "", extra[16] = ""; int n = 0;
++    const int got = sscanf(v, "%15s %d %15s", kind, &n, extra);
++    if (got >= 1 && !strcmp(kind, "none")) { memset(out, 0, sizeof *out); return 1; }
++    if (got < 2 || n < 0 || n > 255) return 0;
++    if (!strcmp(kind, "axis")) {
++        const u8 how = got == 3 ? (!strcmp(extra, "invert") ? 1 : !strcmp(extra, "direct") ? 2 : 0xFF) : 0;
++        if (how == 0xFF) return 0;
++        *out = (PadRigSrc){ RIG_AXIS, (u8)n, 0, how };
++        return 1;
++    }
++    if (!strcmp(kind, "button")) { *out = (PadRigSrc){ RIG_BUTTON, (u8)n, 0, 0 }; return got == 2; }
++    if (!strcmp(kind, "hat") && got == 3) {
++        const u8 d = !strcmp(extra, "up") ? SDL_HAT_UP : !strcmp(extra, "down") ? SDL_HAT_DOWN
++                   : !strcmp(extra, "left") ? SDL_HAT_LEFT : !strcmp(extra, "right") ? SDL_HAT_RIGHT : 0;
++        if (!d) return 0;
++        *out = (PadRigSrc){ RIG_HAT, (u8)n, d, 0 };
++        return 1;
++    }
++    return 0;
++}
++
++/* The table file, once. A section starts from the device's built-in table. */
++static void rig_read_file(void)
++{
++    if (s_rig_file_read) return;
++    s_rig_file_read = 1;
++    const char* path = getenv("PAD_WHEEL_MAP");
++    FILE* f = (path && *path) ? fopen(path, "r") : NULL;
++    if (!f) return;
++    s_rig_file_exists = 1;
++    char line[256]; PadRigMap* m = NULL; int ln = 0, bad = 0;
++    while (fgets(line, sizeof line, f)) {
++        ln++;
++        char* hash = strchr(line, '#'); if (hash) *hash = 0;
++        char* s = line; while (*s == ' ' || *s == '\t') s++;
++        size_t n = strlen(s); while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) s[--n] = 0;
++        if (!n) continue;
++        for (char* c = s; *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
++        if (*s == '[') {
++            unsigned v = 0, p = 0;
++            m = NULL;
++            if (s_rig_file_n >= PAD_RIG_SECTIONS) { bad++; continue; }
++            if (!strncmp(s, "[*]", 3)) { m = &s_rig_file[s_rig_file_n++]; rig_builtin(m, 0, 0); }
++            else if (sscanf(s, "[%x:%x]", &v, &p) == 2 && v <= 0xFFFF && p <= 0xFFFF && (v || p)) { m = &s_rig_file[s_rig_file_n++]; rig_builtin(m, (u16)v, (u16)p); }
++            else bad++;
++            continue;
++        }
++        char* eq = strchr(s, '=');
++        if (!m || !eq) { bad++; continue; }
++        *eq = 0;
++        char* k = s; size_t kn = strlen(k); while (kn && (k[kn - 1] == ' ' || k[kn - 1] == '\t')) k[--kn] = 0;
++        char* v = eq + 1; while (*v == ' ' || *v == '\t') v++;
++        int ok = 1;
++        if (!strcmp(k, "steer")) ok = rig_parse_src(v, &m->steer);
++        else if (!strcmp(k, "throttle")) ok = rig_parse_src(v, &m->throttle);
++        else if (!strcmp(k, "brake")) ok = rig_parse_src(v, &m->brake);
++        else if (!strcmp(k, "pedals")) { if (!strcmp(v, "stick")) m->pedals = 0; else if (!strcmp(v, "buttons")) m->pedals = 1; else if (!strcmp(v, "triggers")) m->pedals = 2; else ok = 0; }
++        else if (!strcmp(k, "range"))    { const int r = atoi(v); if (r >= 5 && r <= 100) m->range = (u8)r; else ok = 0; }
++        else if (!strcmp(k, "deadzone")) { const int d = atoi(v); if (d >= 0 && d <= 50) m->deadzone = (u8)d; else ok = 0; }
++        else { const int b = rig_button_slot(k); if (b < 0) ok = 0; else ok = rig_parse_src(v, &m->btn[b]); }
++        if (!ok) { bad++; fprintf(stderr, "[cellPad] wheel table %s line %d: not understood (\"%s = %s\")\n", path, ln, k, v); }
++    }
++    fclose(f);
++    fprintf(stderr, "[cellPad] wheel table %s: %d section(s)%s\n", path, s_rig_file_n, bad ? ", some lines not understood" : "");
++}
++
++static const PadRigMap* rig_file_section(u16 vendor, u16 product, int any)
++{
++    rig_read_file();
++    for (int i = 0; i < s_rig_file_n; i++)
++        if (any ? (!s_rig_file[i].vendor && !s_rig_file[i].product)
++                : (s_rig_file[i].vendor == vendor && s_rig_file[i].product == product)) return &s_rig_file[i];
++    return NULL;
++}
++
++static void rig_print_src(FILE* f, const char* key, PadRigSrc s)
++{
++    if (s.kind == RIG_AXIS)        fprintf(f, "%-8s = axis %u%s\n", key, s.index, s.invert == 1 ? " invert" : s.invert == 2 ? " direct" : "");
++    else if (s.kind == RIG_BUTTON) fprintf(f, "%-8s = button %u\n", key, s.index);
++    else if (s.kind == RIG_HAT)    fprintf(f, "%-8s = hat %u %s\n", key, s.index, s.arg == SDL_HAT_UP ? "up" : s.arg == SDL_HAT_DOWN ? "down" : s.arg == SDL_HAT_LEFT ? "left" : "right");
++    else                           fprintf(f, "%-8s = none\n", key);
++}
++
++/* No table file yet: write one that holds the table in use, to be edited. */
++static void rig_write_file(const PadRigMap* m, const char* name)
++{
++    const char* path = getenv("PAD_WHEEL_MAP");
++    if (!path || !*path || s_rig_file_exists) return;
++    FILE* f = fopen(path, "r");
++    if (f) { fclose(f); s_rig_file_exists = 1; return; }
++    f = fopen(path, "w");
++    if (!f) return;
++    s_rig_file_exists = 1;
++    fprintf(f, "# How a racing wheel (or another joystick that is not a game controller) plays as controller 1.\n"
++               "# Written once with the table in use; edit it and start the game again. Delete it to get a fresh one.\n"
++               "#\n"
++               "#   [vendor:product]   the device, in hex as the log names it; [*] = every wheel without a section of its own\n"
++               "#   steer / throttle / brake = axis N [invert|direct] | button N | hat N up|down|left|right | none\n"
++               "#       a pedal: invert = it rests at the axis's maximum (Logitech pedals do), direct = at its minimum,\n"
++               "#       neither = found out from the end it is first seen resting at; steer: invert = the other way round\n"
++               "#   pedals = stick      right stick up / down - the game's default, works without changing its settings\n"
++               "#            buttons    cross / square by how far the pedal is pressed (both pedals at once work)\n"
++               "#            triggers   R2 / L2 (set accelerate / brake to R2 / L2 in the game's controller settings)\n"
++               "#   range = 100         per cent of the wheel's travel that is full lock (smaller = quicker)\n"
++               "#   deadzone = 0        per cent around the centre that is no steering\n"
++               "#   select l3 r3 start up right down left l2 r2 l1 r1 triangle circle cross square = the same forms\n"
++               "# Which number a button or an axis has: start the game with PAD_WHEEL_LOG=1 set and read the log.\n"
++               "# No force feedback. The game steers a controller its own way (speed-sensitive), so does the wheel.\n\n");
++    fprintf(f, "[%04x:%04x]   # %s\n", m->vendor, m->product, name ? name : "?");
++    rig_print_src(f, "steer", m->steer);
++    rig_print_src(f, "throttle", m->throttle);
++    rig_print_src(f, "brake", m->brake);
++    fprintf(f, "%-8s = %s\n%-8s = %u\n%-8s = %u\n", "pedals", m->pedals == 1 ? "buttons" : m->pedals == 2 ? "triggers" : "stick",
++            "range", m->range, "deadzone", m->deadzone);
++    for (int i = 0; i < 16; i++) rig_print_src(f, k_rig_buttons[i].name, m->btn[i]);
++    fclose(f);
++    fprintf(stderr, "[cellPad] wheel table written: %s (edit it to change what the wheel's axes and buttons do)\n", path);
++}
++
++/* A joystick SDL does not take for a game controller: use it as a wheel? */
++static void pad_rig_consider(int idx)
++{
++    const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(idx);
++    if (id < 0) return;
++    for (int i = 0; i < PAD_RIG_MAX; i++) if (s_rig[i].joy && s_rig[i].id == id) return;
++    const u16 vendor = SDL_JoystickGetDeviceVendor(idx), product = SDL_JoystickGetDeviceProduct(idx);
++    const SDL_JoystickType type = SDL_JoystickGetDeviceType(idx);
++    const PadRigMap* own = rig_file_section(vendor, product, 0);
++    const int wheel = type == SDL_JOYSTICK_TYPE_WHEEL || (vendor == 0x046D && rig_logitech_wheel(product));
++    if (!own && !wheel) {
++        for (int i = 0; i < s_rig_passed_n; i++) if (s_rig_passed[i] == id) return;
++        if (s_rig_passed_n < 16) s_rig_passed[s_rig_passed_n++] = id;
++        const char* nm = SDL_JoystickNameForIndex(idx);
++        fprintf(stderr, "[cellPad] joystick \"%s\" (%04x:%04x) is neither a game controller nor a known wheel: not used "
++                        "(a [%04x:%04x] section in the wheel table makes it one)\n", nm ? nm : "?", vendor, product, vendor, product);
++        return;
++    }
++    int slot = -1;
++    for (int i = 0; i < PAD_RIG_MAX && slot < 0; i++) if (!s_rig[i].joy) slot = i;
++    if (slot < 0) return;
++    SDL_Joystick* joy = SDL_JoystickOpen(idx);
++    if (!joy) { fprintf(stderr, "[cellPad] wheel %d: open failed: %s\n", idx, SDL_GetError()); return; }
++    PadRig* r = &s_rig[slot];
++    memset(r, 0, sizeof *r);
++    r->joy = joy; r->id = id;
++    const PadRigMap* any = own ? NULL : rig_file_section(0, 0, 1);
++    if (own) r->map = *own;
++    else if (any) { r->map = *any; r->map.vendor = vendor; r->map.product = product; }
++    else rig_builtin(&r->map, vendor, product);
++    const char* nm = SDL_JoystickName(joy);
++    fprintf(stderr, "[cellPad] wheel connected: \"%s\" (%04x:%04x), %d axes, %d buttons, %d hats; table: %s; plays as controller 1 (no force feedback)\n",
++            nm ? nm : "?", vendor, product, SDL_JoystickNumAxes(joy), SDL_JoystickNumButtons(joy), SDL_JoystickNumHats(joy),
++            own ? "its own section of the table file" : any ? "the [*] section of the table file" : "built in");
++    rig_write_file(&r->map, nm);
++}
++
++static void pad_rig_close_all(void)
++{
++    for (int i = 0; i < PAD_RIG_MAX; i++)
++        if (s_rig[i].joy) { SDL_JoystickClose(s_rig[i].joy); s_rig[i].joy = NULL; }
++}
++
++static int rig_on(const PadRig* r, PadRigSrc s)
++{
++    switch (s.kind) {
++    case RIG_BUTTON: return s.index < SDL_JoystickNumButtons(r->joy) && SDL_JoystickGetButton(r->joy, s.index);
++    case RIG_HAT:    return s.index < SDL_JoystickNumHats(r->joy) && (SDL_JoystickGetHat(r->joy, s.index) & s.arg);
++    case RIG_AXIS:   if (s.index >= SDL_JoystickNumAxes(r->joy)) return 0;
++                     { const int v = SDL_JoystickGetAxis(r->joy, s.index); return s.invert ? v < -16384 : v > 16384; }
++    default:         return 0;
++    }
++}
++
++/* A pedal: 0 = released .. 1 = on the floor. Which end of its axis it rests at
++ * is what the table says (invert / direct) or, unsaid, the end it is first
++ * seen near - a pedal at rest is at an end of its range, and a foot is not on
++ * it when the game starts. Until then, and while an axis has reported nothing
++ * but 0 (not heard from yet), it is released: a wrong guess must never hold
++ * the throttle or the brake down. */
++static float rig_amount(PadRig* r, PadRigSrc s)
++{
++    if (s.kind == RIG_AXIS) {
++        if (s.index >= SDL_JoystickNumAxes(r->joy) || s.index >= 16) return 0.0f;
++        const int v = SDL_JoystickGetAxis(r->joy, s.index);
++        signed char* rest = &r->axis_rest[s.index];
++        if (!*rest) {
++            if (s.invert == 1)      { if (v) *rest = 1; }
++            else if (s.invert == 2) { if (v) *rest = -1; }
++            else if (v > 24000) *rest = 1;
++            else if (v < -24000) *rest = -1;
++        }
++        if (!*rest) return 0.0f;
++        const float a = *rest > 0 ? (float)(32767 - v) / 65535.0f : (float)(v + 32768) / 65535.0f;
++        return a < 0.02f ? 0.0f : a > 0.98f ? 1.0f : a;
++    }
++    return rig_on(r, s) ? 1.0f : 0.0f;
++}
++
++static void rig_log_changes(PadRig* r, int slot)
++{
++    const int na = SDL_JoystickNumAxes(r->joy), nb = SDL_JoystickNumButtons(r->joy);
++    for (int a = 0; a < na && a < 16; a++) {
++        const Sint16 v = SDL_JoystickGetAxis(r->joy, a);
++        if (abs((int)v - (int)r->log_axis[a]) > 8000) { r->log_axis[a] = v; fprintf(stderr, "[cellPad] wheel %d: axis %d = %d\n", slot, a, (int)v); }
++    }
++    u32 now = 0;
++    for (int b = 0; b < nb && b < 32; b++) if (SDL_JoystickGetButton(r->joy, b)) now |= 1u << b;
++    for (int b = 0; b < 32; b++)
++        if ((now ^ r->log_buttons) & (1u << b)) fprintf(stderr, "[cellPad] wheel %d: button %d %s\n", slot, b, (now >> b) & 1 ? "down" : "up");
++    r->log_buttons = now;
++    const u8 hat = SDL_JoystickNumHats(r->joy) > 0 ? SDL_JoystickGetHat(r->joy, 0) : 0;
++    if (hat != r->log_hat) { r->log_hat = hat; fprintf(stderr, "[cellPad] wheel %d: hat 0 = %u (1 up, 2 right, 4 down, 8 left)\n", slot, hat); }
++}
++
++/* PAD_WHEEL_SELFTEST: the virtual wheel and its script. */
++static struct { double t; char what; int n, value, done; } s_rig_ev[64];
++static int s_rig_ev_n;
++static unsigned long long s_rig_ev_t0, s_rig_report_ms;
++static void rig_selftest_start(void)
++{
++#if SDL_VERSION_ATLEAST(2, 24, 0)
++    const char* e = getenv("PAD_WHEEL_SELFTEST");
++    if (!e || !*e || s_rig_virtual >= 0) return;
++    SDL_VirtualJoystickDesc d;
++    SDL_zero(d);
++    d.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
++    d.type = SDL_JOYSTICK_TYPE_WHEEL;
++    d.naxes = 4; d.nbuttons = 25; d.nhats = 1;
++    d.vendor_id = 0x046D; d.product_id = 0xC266;
++    d.name = "self-test wheel";
++    s_rig_virtual = SDL_JoystickAttachVirtualEx(&d);
++    if (s_rig_virtual < 0) { fprintf(stderr, "[cellPad] wheel self-test: no virtual joystick (%s)\n", SDL_GetError()); return; }
++    const char* p = e;
++    while (*p && s_rig_ev_n < 64) {
++        char* q;
++        const double t = strtod(p, &q);
++        if (q == p || *q != ':' || !q[1]) break;
++        const char what = q[1];
++        const int n = (int)strtol(q + 2, &q, 10);
++        if (*q != ':') break;
++        const int value = (int)strtol(q + 1, &q, 10);
++        s_rig_ev[s_rig_ev_n].t = t; s_rig_ev[s_rig_ev_n].what = what; s_rig_ev[s_rig_ev_n].n = n; s_rig_ev[s_rig_ev_n].value = value; s_rig_ev_n++;
++        p = q; while (*p == ',' || *p == ' ') p++;
++    }
++    s_rig_ev_t0 = pad_now_ms();
++    fprintf(stderr, "[cellPad] wheel self-test: a virtual wheel with %d scripted input(s)\n", s_rig_ev_n);
++#endif
++}
++static void rig_selftest_tick(void)
++{
++    if (s_rig_virtual < 0 || !s_rig_ev_n) return;
++    const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(s_rig_virtual);
++    SDL_Joystick* joy = NULL;
++    for (int i = 0; i < PAD_RIG_MAX; i++) if (s_rig[i].joy && s_rig[i].id == id) joy = s_rig[i].joy;
++    if (!joy) return;
++    const double now = (double)(pad_now_ms() - s_rig_ev_t0) / 1000.0;
++    for (int i = 0; i < s_rig_ev_n; i++) {
++        if (s_rig_ev[i].done || now < s_rig_ev[i].t) continue;
++        s_rig_ev[i].done = 1;
++        if (s_rig_ev[i].what == 'b')      SDL_JoystickSetVirtualButton(joy, s_rig_ev[i].n, (Uint8)(s_rig_ev[i].value != 0));
++        else if (s_rig_ev[i].what == 'a') SDL_JoystickSetVirtualAxis(joy, s_rig_ev[i].n, (Sint16)s_rig_ev[i].value);
++        else if (s_rig_ev[i].what == 'h') SDL_JoystickSetVirtualHat(joy, s_rig_ev[i].n, (Uint8)s_rig_ev[i].value);
++        fprintf(stderr, "[cellPad] wheel self-test t=%.1fs: %c%d = %d\n", now, s_rig_ev[i].what, s_rig_ev[i].n, s_rig_ev[i].value);
++        s_rig_report_ms = pad_now_ms() + 60;   /* what controller 1 reads once SDL has taken the input in */
++    }
++}
++
++/* Every open wheel into port 0, after the pads and the keyboard have been read. */
++static void pad_rig_merge(void)
++{
++    static int log = -1;
++    if (log < 0) log = getenv("PAD_WHEEL_LOG") ? 1 : 0;
++    rig_selftest_tick();
++    PadHostState* hs = &s_host_state[0];
++    int any = 0;
++    for (int k = 0; k < PAD_RIG_MAX; k++) {
++        PadRig* r = &s_rig[k];
++        if (!r->joy) continue;
++        if (!SDL_JoystickGetAttached(r->joy)) {
++            fprintf(stderr, "[cellPad] wheel disconnected (instance %d)\n", (int)r->id);
++            SDL_JoystickClose(r->joy); r->joy = NULL;
++            continue;
++        }
++        any = 1;
++        if (log) rig_log_changes(r, k);
++        const PadRigMap* m = &r->map;
++        if (m->steer.kind == RIG_AXIS && m->steer.index < SDL_JoystickNumAxes(r->joy)) {
++            float f = (float)SDL_JoystickGetAxis(r->joy, m->steer.index) / 32767.0f;
++            if (m->steer.invert) f = -f;
++            const float dz = (float)m->deadzone / 100.0f, full = (float)(m->range ? m->range : 100) / 100.0f;
++            const float mag = fabsf(f);
++            f = mag <= dz ? 0.0f : (f < 0 ? -1.0f : 1.0f) * ((mag - dz) / (full > dz ? full - dz : 1.0f));
++            if (f > 1.0f) f = 1.0f; else if (f < -1.0f) f = -1.0f;
++            const int lx = 128 + (int)(f * (f < 0 ? 128.0f : 127.0f));
++            if (abs(lx - 128) > abs((int)hs->analog_lx - 128)) hs->analog_lx = (u8)lx;
++        }
++        const float t = rig_amount(r, m->throttle), b = rig_amount(r, m->brake);
++        if (m->pedals == 0) {
++            int ry = 128 - (int)(t * 128.0f) + (int)(b * 127.0f);
++            ry = ry < 0 ? 0 : ry > 255 ? 255 : ry;
++            if (abs(ry - 128) > abs((int)hs->analog_ry - 128)) hs->analog_ry = (u8)ry;
++        } else if (m->pedals == 1) {
++            const u8 pt = (u8)(t * 255.0f), pb = (u8)(b * 255.0f);
++            if (pt > hs->press_cross)  hs->press_cross = pt;
++            if (pb > hs->press_square) hs->press_square = pb;
++            if (t > 0.08f) hs->buttons |= CELL_PAD_CTRL_CROSS;
++            if (b > 0.08f) hs->buttons |= CELL_PAD_CTRL_SQUARE;
++        } else {
++            const u8 pt = (u8)(t * 255.0f), pb = (u8)(b * 255.0f);
++            if (pt > hs->trigger_r2) hs->trigger_r2 = pt;
++            if (pb > hs->trigger_l2) hs->trigger_l2 = pb;
++            if (t > 0.12f) hs->buttons |= CELL_PAD_CTRL_R2;
++            if (b > 0.12f) hs->buttons |= CELL_PAD_CTRL_L2;
++        }
++        for (int i = 0; i < 16; i++) if (rig_on(r, m->btn[i])) hs->buttons |= k_rig_buttons[i].bit;
++    }
++    if (!any) return;
++    hs->connected = 1;
++    /* a button without a pressure of its own is pressed all the way */
++    if ((hs->buttons & CELL_PAD_CTRL_UP) && !hs->press_up)             hs->press_up = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_DOWN) && !hs->press_down)         hs->press_down = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_LEFT) && !hs->press_left)         hs->press_left = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_RIGHT) && !hs->press_right)       hs->press_right = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_TRIANGLE) && !hs->press_triangle) hs->press_triangle = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_CIRCLE) && !hs->press_circle)     hs->press_circle = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_CROSS) && !hs->press_cross)       hs->press_cross = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_SQUARE) && !hs->press_square)     hs->press_square = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_L1) && !hs->press_l1)             hs->press_l1 = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_R1) && !hs->press_r1)             hs->press_r1 = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_L2) && !hs->trigger_l2)           hs->trigger_l2 = 255;
++    if ((hs->buttons & CELL_PAD_CTRL_R2) && !hs->trigger_r2)           hs->trigger_r2 = 255;
++    if (s_rig_report_ms && pad_now_ms() >= s_rig_report_ms) {
++        s_rig_report_ms = 0;
++        fprintf(stderr, "[cellPad] wheel self-test: controller 1 reads buttons 0x%04X, left stick x %u, right stick y %u, "
++                        "cross %u square %u, R2 %u L2 %u\n", hs->buttons, hs->analog_lx, hs->analog_ry,
++                hs->press_cross, hs->press_square, hs->trigger_r2, hs->trigger_l2);
++    }
++}
++
+ /* ---- hot-plug ------------------------------------------------------------
+  * A DualSense over Bluetooth drops off when it is switched off or idles, and
+  * comes back as a NEW SDL device (a new instance id, maybe another index).
+@@ -514,7 +972,7 @@ static void pad_sdl_scan(void)
+ {
+     const int n = SDL_NumJoysticks();   /* also refreshes sdl2-compat's index list */
+     for (int idx = 0; idx < n; idx++) {
+-        if (!SDL_IsGameController(idx)) continue;
++        if (!SDL_IsGameController(idx)) { pad_rig_consider(idx); continue; }   /* a wheel, perhaps */
+         const SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(idx);
+         if (id < 0 || pad_sdl_port_of(id) >= 0) continue;
+         const SDL_JoystickGUID guid = SDL_JoystickGetDeviceGUID(idx);
+@@ -523,7 +981,7 @@ static void pad_sdl_scan(void)
+             if (!s_sdl_controllers[p] && s_sdl_had[p] && !memcmp(&s_sdl_last_guid[p], &guid, sizeof guid)) { port = p; back = 1; }
+         for (int p = 0; p < PAD_MAX_HOST_PORTS && port < 0; p++)
+             if (!s_sdl_controllers[p]) port = p;
+-        if (port < 0) return;                 /* every port has a controller */
++        if (port < 0) continue;               /* every port has a controller (a wheel further on is still looked at) */
+         SDL_GameController* gc = SDL_GameControllerOpen(idx);
+         if (!gc) {
+             fprintf(stderr, "[cellPad] SDL controller %d: open failed: %s\n", idx, SDL_GetError());
+@@ -562,6 +1020,7 @@ static void pad_sdl_hotplug(int force)
+         }
+     int free_port = 0;
+     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) if (!s_sdl_controllers[p]) free_port = 1;
++    for (int k = 0; k < PAD_RIG_MAX; k++) if (!s_rig[k].joy) free_port = 1;   /* a wheel needs no port, only a slot */
+     if (!free_port) return;
+     const unsigned long long now = pad_now_ms();
+     if (!changed && s_sdl_scan_ms && now - s_sdl_scan_ms < PAD_SDL_RESCAN_MS) return;
+@@ -668,6 +1127,7 @@ static void pad_init_backend(void)
+     }
+     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
+     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) s_sdl_ids[p] = -1;
++    rig_selftest_start();
+ 
+     /* Open any controllers already connected */
+     pad_sdl_hotplug(1);
+@@ -676,6 +1136,7 @@ static void pad_init_backend(void)
+ static void pad_shutdown_backend(void)
+ {
+     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) pad_sdl_close(i, 0);
++    pad_rig_close_all();
+     memset(s_rumble, 0, sizeof s_rumble);
+ }
+ 
+@@ -731,6 +1192,9 @@ static void pad_poll_backend(void)
+ #endif
+ #ifdef _WIN32
+     if (!s_host_state[0].connected) pad_poll_keyboard();
++#endif
++#if PAD_BACKEND_SDL2
++    pad_rig_merge();   /* wheels: on top of port 0's pad or keyboard */
+ #endif
+     pad_track_assign();
+     pad_unlock();

@@ -1,0 +1,315 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -9198,7 +9198,10 @@
+     if (alive_only < 0) { const char* e = getenv("LD_ASYNC_PSO_ALIVE"); alive_only = e && *e == '1'; }
+     /* (not while the host has paused background preparation - a movie plays: the pipeline workers stand still
+      * then, and a job waited its 600 frames out in the menu before the first race, b10_on1) */
+-    return ld_ap_on() && rs->depth_test && !g_ld_movie_mode && g_ld_pw.active && g_ld_ap_count < LD_AP_JOBS &&
++    /* Stencil draws can write a mask that subsequent HUD or post-process
++     * draws test. Dropping either draw changes the rest of this frame. */
++    return ld_ap_on() && rs->depth_test && !rs->stencil_enable &&
++           !g_ld_movie_mode && g_ld_pw.active && g_ld_ap_count < LD_AP_JOBS &&
+            g_ld_compile_jobs.state == LD_SCJ_RUNNING && !InterlockedCompareExchange(&g_ld_prepare_paused, 0, 0) &&
+            (!alive_only || ld_ap_target_alive());
+ }
+@@ -14918,6 +14921,42 @@
+     }
+ }
+ 
++/* NV4097's window origin moves the scissor together with the viewport.
++ * Keep clears and draws on the same sample grid, then scale their edges
++ * to host pixels. The game can clear just one view of a shared atlas. */
++static D3D12_RECT ld_surface_scissor(const rsx_dsp_surface* sf, const surface_t* target,
++                                      LONG* win_x, LONG* win_y)
++{
++    static int wo = -1;
++    if (wo < 0) {
++        const char* e = getenv("LD_WINDOW_OFFSET");
++        wo = !(e && *e == '0');
++    }
++    const u32 window = wo ? rsx_dsp_reg(&g.rsx, 0x02B8) : 0u;
++    *win_x = (LONG)ld_hx(target, (window & 0xFFFFu) * sf->aa_sx);
++    *win_y = (LONG)ld_hy(target, (window >> 16) * sf->aa_sy);
++    D3D12_RECT rect = {0, 0, (LONG)(target->w ? target->w : g.width),
++                            (LONG)(target->h ? target->h : g.height)};
++    if (g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] || g.rsx.seen[M_SCISSOR_VERTICAL >> 2]) {
++        /* A never-written scissor covers the target. An explicit zero size
++         * is empty and may not clear or draw anything. */
++        const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
++        const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
++        const u32 x = sh & 0xFFFFu, y = sv & 0xFFFFu;
++        const LONG left = (LONG)ld_hx(target, x * sf->aa_sx) + *win_x;
++        const LONG top = (LONG)ld_hy(target, y * sf->aa_sy) + *win_y;
++        const LONG right = (LONG)ld_hx(target, (x + (sh >> 16)) * sf->aa_sx) + *win_x;
++        const LONG bottom = (LONG)ld_hy(target, (y + (sv >> 16)) * sf->aa_sy) + *win_y;
++        if (left > rect.left) rect.left = left;
++        if (top > rect.top) rect.top = top;
++        if (right < rect.right) rect.right = right;
++        if (bottom < rect.bottom) rect.bottom = bottom;
++        if (rect.right < rect.left) rect.right = rect.left;
++        if (rect.bottom < rect.top) rect.bottom = rect.top;
++    }
++    return rect;
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -16098,55 +16137,9 @@
+     }
+     g.cb_used += CB_BLOCK_ALIGNED;
+ 
+-    /* NV4097_SET_WINDOW_OFFSET (0x02B8, x | y << 16): everything a draw rasterises -- viewport and scissor --
+-     * is moved by this many pixels. cellGcmSetSurface writes the surface's x/y origin there. Gran Turismo 6
+-     * renders face i of its reflection cube map into a target that starts i rows above the face (the address is
+-     * rounded down to 4 KB) and moves the picture down with a window offset of (0, i); ignored, every face but
+-     * the first sat i rows too high. LD_WINDOW_OFFSET=0 ignores it as before. */
+-    LONG win_x = 0, win_y = 0;
+-    { static int wo = -1;
+-      if (wo < 0) { const char* e = getenv("LD_WINDOW_OFFSET"); wo = (e && *e == '0') ? 0 : 1; }
+-      if (wo) { const u32 w32 = rsx_dsp_reg(&g.rsx, 0x02B8);
+-                win_x = (LONG)(w32 & 0xFFFFu) * (LONG)sf.aa_sx; win_y = (LONG)(w32 >> 16) * (LONG)sf.aa_sy;
+-                if (tup) { win_x = (LONG)((float)win_x * tux + 0.5f); win_y = (LONG)((float)win_y * tuy + 0.5f); } } }
+-    D3D12_VIEWPORT dvp = {(FLOAT)win_x, (FLOAT)win_y, W * tux, H * tuy, 0.0f, 1.0f};   /* [GT6 0102] host extent */
+-    D3D12_RECT sc = {
+-        0, 0,
+-        (LONG)(g.surfaces[target].w ? g.surfaces[target].w : g.width),
+-        (LONG)(g.surfaces[target].h ? g.surfaces[target].h : g.height)
+-    };
+-    /* Guest scissor, intersected with the surface rect. The nv40 reset value
+-     * is a full-window 4096x4096; never-written regs read 0 here, so an
+-     * unwritten scissor means "no scissor". A WRITTEN zero width or height is
+-     * a real, empty scissor and must clip everything: GH3's gameplay venue
+-     * sits under a ViewportElement whose clip window is off-screen (scissor
+-     * x=1039 w=0), and drawing it full-screen painted its never-rendered
+-     * texture over the whole scene. */
+-    {
+-        const u32 sh = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+-        const u32 sv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+-        /* The scissor is in pixels too: scale it to the sample grid. */
+-        const LONG ax = (LONG)sf.aa_sx, ay = (LONG)sf.aa_sy;
+-        LONG sx = (LONG)(sh & 0xFFFFu) * ax + win_x, sw = (LONG)(sh >> 16) * ax;
+-        LONG sy = (LONG)(sv & 0xFFFFu) * ay + win_y, svh = (LONG)(sv >> 16) * ay;
+-        if (tup) {                              /* [GT6 0102] each edge in host pixels */
+-            const float gx0 = (float)((LONG)(sh & 0xFFFFu) * ax), gy0 = (float)((LONG)(sv & 0xFFFFu) * ay);
+-            const LONG hx0 = (LONG)(gx0 * tux + 0.5f), hx1 = (LONG)((gx0 + (float)sw) * tux + 0.5f);
+-            const LONG hy0 = (LONG)(gy0 * tuy + 0.5f), hy1 = (LONG)((gy0 + (float)svh) * tuy + 0.5f);
+-            sx = hx0 + win_x; sw = hx1 - hx0;
+-            sy = hy0 + win_y; svh = hy1 - hy0;
+-        }
+-        const int written = g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] != 0 ||
+-                            g.rsx.seen[M_SCISSOR_VERTICAL >> 2] != 0;
+-        if (written) {
+-            if (sx > sc.left)            sc.left   = sx;
+-            if (sy > sc.top)             sc.top    = sy;
+-            if (sx + sw  < sc.right)     sc.right  = sx + sw;
+-            if (sy + svh < sc.bottom)    sc.bottom = sy + svh;
+-            if (sc.right  < sc.left)     sc.right  = sc.left;
+-            if (sc.bottom < sc.top)      sc.bottom = sc.top;
+-        }
+-    }
++    LONG win_x, win_y;
++    const D3D12_RECT sc = ld_surface_scissor(&sf, &g.surfaces[target], &win_x, &win_y);
++    D3D12_VIEWPORT dvp = {(FLOAT)win_x, (FLOAT)win_y, W * tux, H * tuy, 0.0f, 1.0f};
+     if (!ls_ok || memcmp(&g_ls.vp, &dvp, sizeof dvp) != 0) {
+         g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
+         g_ls.vp = dvp;
+@@ -16418,15 +16411,19 @@
+                 rsx_dsp_reg(&g.rsx, M_COLOR_MASK), rsx_dsp_clear_color(&g.rsx));
+         fflush(s_csv_file);
+     }
+-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
+-    /* [GT6 0119] with no colour target selected there is no colour to clear (see ld_surface_has_colour) */
+-    int colour_target = 1;
+-    if (!ld_masked_draw_stamp_all()) {
+-        rsx_dsp_surface csf;
+-        rsx_dsp_get_surface(&g.rsx, &csf);
+-        colour_target = csf.color_target != 0u;
+-    }
+-    if (colour_target && (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A))) {
++    rsx_dsp_surface sf;
++    rsx_dsp_get_surface(&g.rsx, &sf);
++    surface_t* const cts = &g.surfaces[target];
++    LONG win_x, win_y;
++    const D3D12_RECT rect = ld_surface_scissor(&sf, cts, &win_x, &win_y);
++    if (rect.right <= rect.left || rect.bottom <= rect.top) return;
++    const UINT partial = rect.left != 0 || rect.top != 0 ||
++        rect.right < (LONG)cts->w || rect.bottom < (LONG)cts->h;
++    /* [GT6 0119] a depth-only pass has no colour target to clear. */
++    if ((sf.color_target != 0u || ld_masked_draw_stamp_all()) &&
++        (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A))) {
++        D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
++        if (partial) ld_surface_mirror_step(target);
+         const u32 c = rsx_dsp_clear_color(&g.rsx);
+         float col[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+                          (c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f };
+@@ -16441,23 +16438,28 @@
+         { static int ct = -1;
+           if (ct < 0) ct = getenv("LD_CLEAR_TEST") ? 1 : 0;
+           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
+-        g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
++        g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, partial, partial ? &rect : NULL);
+         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
+         /* LD_SURFACE_MIRROR: the title has just defined this target's content; what guest memory holds under
+          * it must not be loaded over the clear. GT6 clears a reflection-map face to (0,0,0,1) and then draws
+          * with dst-alpha blending: loading guest memory (alpha 0) there turned every face black. */
+-        g.surfaces[target].mirror_stale = 0;
++        if (!partial) cts->mirror_stale = 0;
+     }
+     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
+-        rsx_dsp_surface sf;
+-        rsx_dsp_get_surface(&g.rsx, &sf);
+-        const surface_t* const cts = &g.surfaces[target];          /* [GT6 0102] an upscaled target's zeta */
+         const int cup = ld_upscaled(cts);
+         const u32 zslot = zdepth_get(sf.zeta_location, sf.zeta_offset,
+                                      cup ? ld_hx(cts, sf.clip_w) : sf.clip_w, cup ? ld_hy(cts, sf.clip_h) : sf.clip_h);
+-        if (zslot && zslot <= g.n_zdepths) {
+-            g.zdepths[zslot - 1u].ux = cup ? ld_fx(cts) : 1.0f;
+-            g.zdepths[zslot - 1u].uy = cup ? ld_fy(cts) : 1.0f;
++        zdepth_t* const z = zslot ? &g.zdepths[zslot - 1u] : NULL;
++        D3D12_RECT depth_rect = rect;
++        if (partial) {
++            const LONG w = (LONG)(z ? z->w : g.width), h = (LONG)(z ? z->h : g.height);
++            if (depth_rect.right > w) depth_rect.right = w;
++            if (depth_rect.bottom > h) depth_rect.bottom = h;
++            if (depth_rect.right <= depth_rect.left || depth_rect.bottom <= depth_rect.top) return;
++        }
++        if (z && (!partial || !z->cleared)) {
++            z->ux = cup ? ld_fx(cts) : 1.0f;
++            z->uy = cup ? ld_fy(cts) : 1.0f;
+         }
+         D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_handle(zslot);
+         D3D12_CLEAR_FLAGS clear_flags = (D3D12_CLEAR_FLAGS)0;
+@@ -16479,18 +16481,19 @@
+                            : z16 ? (float)(zs & 0xFFFFu) / 65535.0f
+                                  : (float)(zs >> 8) / 16777215.0f;
+             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
+-                clear_flags, cd, z16 ? (UINT8)0 : (UINT8)(zs & 0xFFu), 0, NULL);
+-        }
+-        if (zslot) {
+-            g.zdepths[zslot - 1].cleared = 1;
+-            g.zdepths[zslot - 1].stencil_gen++;
++                clear_flags, cd, z16 ? (UINT8)0 : (UINT8)(zs & 0xFFu),
++                partial, partial ? &depth_rect : NULL);
++        }
++        if (z) {
++            z->cleared = 1;
++            z->stencil_gen++;
+             if (mask & RSX_CLEAR_DEPTH) {
+-                g.zdepths[zslot - 1].had_write = 0;
++                if (!partial) z->had_write = 0;
+                 /* Each guest zeta owns a distinct live resource.  A clear
+                  * invalidates its older published image; do not resolve it
+                  * speculatively.  The first later texture consumer resolves
+                  * the newly written pass exactly once. */
+-                g.zdepths[zslot - 1].snapshot_valid = 0;
++                z->snapshot_valid = 0;
+             }
+         } else {
+             if (mask & RSX_CLEAR_DEPTH)
+diff --git a/libs/video/tests/test_live_draw_replay_clear.c b/libs/video/tests/test_live_draw_replay_clear.c
+new file mode 100644
+--- /dev/null
++++ b/libs/video/tests/test_live_draw_replay_clear.c
+@@ -0,0 +1,100 @@
++/* D3D12 live-draw regression for a split colour/depth/stencil atlas.
++ * Clearing the right half (or an empty scissor) must preserve the other
++ * half and any stencil mask used by later draws.
++ * Build and run: see live_draw_test_harness.h.
++ */
++#include "live_draw_test_harness.h"
++
++#define T "test_live_draw_replay_clear"
++#define SURF 0x00010000u
++
++static void check_pixels(const char* file)
++{
++    uint8_t rgb[8 * 8 * 3];
++    u32 w = 0, h = 0;
++    const int read = ldh_read_rgb(SURF, file, rgb, 8, 8, &w, &h) == 0 && w == 8 && h == 8;
++    ldh_check("8x8 color target read", read);
++    if (!read) return;
++    u32 left_red = 0, right_green = 0;
++    for (u32 y = 0; y < h; ++y) {
++        for (u32 x = 0; x < w; ++x) {
++            const uint8_t* pixel = rgb + (y * w + x) * 3;
++            if (x < 4 && pixel[0] > 200 && pixel[1] < 10 && pixel[2] < 10) ++left_red;
++            if (x >= 4 && pixel[1] > 200 && pixel[0] < 10 && pixel[2] < 10) ++right_green;
++        }
++    }
++    printf("red left=%u/32, green right=%u/32\n", left_red, right_green);
++    ldh_check("the other atlas half is preserved", left_red == 32 && right_green == 32);
++}
++
++static void red_clear(void)
++{
++    ldh_m(NV4097_SET_SCISSOR_HORIZONTAL, 8u << 16);
++    ldh_m(NV4097_SET_COLOR_CLEAR_VALUE, 0xFFFF0000u);
++    ldh_m(NV4097_CLEAR_SURFACE, 0xF0u);
++}
++
++static void check_depth_stencil(const char* file, int white_on_left)
++{
++    uint8_t rgb[8 * 8 * 3];
++    u32 w = 0, h = 0, kept = 0;
++    if (ldh_read_rgb(SURF, file, rgb, 8, 8, &w, &h) == 0 && w == 8 && h == 8)
++        for (u32 y = 0; y < h; ++y)
++            for (u32 x = 0; x < w; ++x) {
++                const u32 i = (y * w + x) * 3u;
++                const int white = (x < 4) == white_on_left;
++                kept += rgb[i] > 200 && (white ? rgb[i + 1] > 200 && rgb[i + 2] > 200 :
++                                                rgb[i + 1] < 10 && rgb[i + 2] < 10);
++            }
++    printf("%s preserved=%u/64\n", file, kept);
++    ldh_check("scissored clear keeps the adjacent depth/stencil", kept == 64);
++}
++
++static void verify_zeta(void)
++{
++    ldh_surface(0x8u | (0x1u << 8) | (2u << 5), SURF, 32, 0x200000u, 32, 8, 8);
++    ldh_m(NV4097_SET_COLOR_MASK, 0x01010101u);
++    ldh_setup_quad(0, 1, 1, 0, 0);
++    rsx_test_fp_mov_r0_col0(ldh_main + 0x1000, RSX_TEST_FP_SWZ_IDENT);
++    red_clear();
++    ldh_m(NV4097_SET_ZSTENCIL_CLEAR_VALUE, 1u);
++    ldh_m(NV4097_CLEAR_SURFACE, 1u);
++    ldh_m(NV4097_SET_SCISSOR_HORIZONTAL, (4u << 16) | 4u);
++    ldh_m(NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xFFFFFF00u);
++    ldh_m(NV4097_CLEAR_SURFACE, 1u);
++    ldh_m(NV4097_SET_SCISSOR_HORIZONTAL, 8u << 16);
++    ldh_draw(0x1000, 0x40, 1, 0, 0x201);
++    check_depth_stencil("depth_replay_clear.ppm", 0);
++
++    red_clear();
++    ldh_m(NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xFFFFFF01u);
++    ldh_m(NV4097_CLEAR_SURFACE, 2u);
++    ldh_m(NV4097_SET_SCISSOR_HORIZONTAL, (4u << 16) | 4u);
++    ldh_m(NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xFFFFFF00u);
++    ldh_m(NV4097_CLEAR_SURFACE, 2u);
++    ldh_m(NV4097_SET_SCISSOR_HORIZONTAL, 8u << 16);
++    ldh_m(NV4097_SET_STENCIL_TEST_ENABLE, 1u);
++    ldh_m(NV4097_SET_STENCIL_FUNC, 0x202u);
++    ldh_m(NV4097_SET_STENCIL_FUNC_REF, 1u);
++    ldh_m(NV4097_SET_STENCIL_FUNC_MASK, 0xFFu);
++    ldh_draw(0x1000, 0x40, 1, 0, 0x207);
++    check_depth_stencil("stencil_replay_clear.ppm", 1);
++}
++
++int main(void)
++{
++    if (ldh_init(T) != 0) return 2;
++    ldh_surface(0x8u | (0x1u << 8), SURF, 32, 0x200000u, 32, 8, 8);
++    ldh_m(NV4097_SET_COLOR_CLEAR_VALUE, 0xFFFF0000u);
++    ldh_m(NV4097_CLEAR_SURFACE, 0xF0u);
++    ldh_m(NV4097_SET_SCISSOR_HORIZONTAL, (4u << 16) | 4u);
++    ldh_m(NV4097_SET_COLOR_CLEAR_VALUE, 0xFF00FF00u);
++    ldh_m(NV4097_CLEAR_SURFACE, 0xF0u);
++    check_pixels("partial_replay_clear.ppm");
++    ldh_m(NV4097_SET_SCISSOR_HORIZONTAL, 0);
++    ldh_m(NV4097_SET_COLOR_CLEAR_VALUE, 0xFF0000FFu);
++    ldh_m(NV4097_CLEAR_SURFACE, 0xF0u);
++    check_pixels("empty_replay_clear.ppm");
++    verify_zeta();
++    return ldh_done(T);
++}

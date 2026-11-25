@@ -251,6 +251,40 @@ SPURS_RULES = ((SPURS_ASK_OLD, SPURS_ASK_NEW, '/*GT6_SPURS_ASK*/'), (SPURS_CLAMP
 spurs_done = 0
 
 
+# [GT6 0143] func_00C8CD90, the fix-up of a generated course's pack (the "crs/<name>.pwy" courses: Circuito de la
+# Sierra, tracks from the course maker). Its first test, 0x00C8CDB8 cmpw r0, r3 / bgt, asks whether the pack's base
+# field (still an offset) lies below the pack's own address - as SIGNED numbers. On the console the game's heap starts
+# at 0x40000000; here it starts at 0x80000000 (sys_memory.c: the mapper steps over the runtime's own windows), an
+# address that is negative as a signed number, so the test said "done already" and no pointer of the pack was fixed.
+# The two addresses are compared as what they are (unsigned): the same answer as on the console for every address
+# below 0x80000000. GT6_CRS_RELOC=game keeps the game's own comparison (gt6_host.cpp: gt6_crs_reloc_signed).
+CRS_RELOC_HEAD = 'void func_00C8CD90(ppu_context* ctx) {\n'
+CRS_RELOC_DECL = 'extern "C" int gt6_crs_reloc_signed(void);\n'
+CRS_RELOC_TAIL = (' uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u);'
+                  ' ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }')
+CRS_RELOC_BRANCH = '\n        if (((ctx->cr >> 2) & 1)) goto loc_00C8CEC0;\n'
+CRS_RELOC_OLD = ('        { int64_t a = (int32_t)ctx->gpr[0]; int64_t b = (int32_t)ctx->gpr[3];'
+                 + CRS_RELOC_TAIL + CRS_RELOC_BRANCH)
+CRS_RELOC_NEW = ('        { const int s = gt6_crs_reloc_signed();'
+                 ' int64_t a = s ? (int64_t)(int32_t)ctx->gpr[0] : (int64_t)(uint32_t)ctx->gpr[0];'
+                 ' int64_t b = s ? (int64_t)(int32_t)ctx->gpr[3] : (int64_t)(uint32_t)ctx->gpr[3];'
+                 + CRS_RELOC_TAIL + ' /*GT6_CRS_RELOC*/' + CRS_RELOC_BRANCH)
+crs_reloc_done = 0
+
+
+def apply_crs_reloc(text):
+    if '/*GT6_CRS_RELOC*/' in text:
+        if text.count(CRS_RELOC_NEW) != 1 or text.count(CRS_RELOC_DECL + CRS_RELOC_HEAD) != 1:
+            raise ValueError('partial or moved /*GT6_CRS_RELOC*/')
+        return text, 1
+    if CRS_RELOC_HEAD not in text:
+        return text, 0
+    if text.count(CRS_RELOC_OLD) != 1:
+        raise ValueError('GT6_CRS_RELOC: the comparison of func_00C8CD90 was not found exactly once')
+    text = text.replace(CRS_RELOC_OLD, CRS_RELOC_NEW).replace(CRS_RELOC_HEAD, CRS_RELOC_DECL + CRS_RELOC_HEAD)
+    return text, 1
+
+
 def apply_spurs_spus(text):
     n = 0
     for old, new, mark in SPURS_RULES:
@@ -327,6 +361,8 @@ for p in sorted(glob.glob(os.path.join(d, 'ppu_recomp_*.cpp'))):
     bgm_file_done += bgm_file_count
     t, spurs_count = apply_spurs_spus(t)
     spurs_done += spurs_count
+    t, crs_reloc_count = apply_crs_reloc(t)
+    crs_reloc_done += crs_reloc_count
     for m in list(TRACE_BLOCK.finditer(t)):
         f = m.group(1)
         if f not in trace:
@@ -379,6 +415,8 @@ if bgm_file_done != 2:
     raise SystemExit(f'GT6_SGX_FILE_HANDLE: expected callback hook and branch, found {bgm_file_done}')
 if spurs_done != 3:
     raise SystemExit(f'GT6_SPURS_SPUS: expected the request, the clamp and the job list hook once each, found {spurs_done}')
+if crs_reloc_done != 1:
+    raise SystemExit(f'GT6_CRS_RELOC: expected the one comparison of func_00C8CD90, found {crs_reloc_done}')
 if trace - traced:
     raise SystemExit('not lifted function entries: ' + ', '.join(sorted(trace - traced)))
 if tail_calls:

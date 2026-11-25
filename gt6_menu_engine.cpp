@@ -804,6 +804,7 @@ std::string settingsToJson(const Settings& s)
     w.kv("CameraChaseAngle", s.camAngle);
     w.kv("NetLanMode", s.lanMode);
     w.kv("MenuLang", s.menuLang);
+    w.kv("GameLang", s.gameLang);
     w.kv("MenuLastPage", s.lastPage);
     w.close('}');
     w.o += "\n";
@@ -874,6 +875,9 @@ void settingsFromJson(const J& j, Settings& s, bool menuKeys)
         B("NetLanMode", s.lanMode);
         I("MenuLang", s.menuLang);
         s.menuLang = std::clamp(s.menuLang, 0, 2);
+        S("GameLang", s.gameLang);
+        if (s.gameLang.size() > 7)
+            s.gameLang.clear();
         I("MenuLastPage", s.lastPage);
     }
 }
@@ -932,6 +936,34 @@ extern "C" int gt6_menu_setting_lan_mode(void)
             return 0;
         const J* x = j.get("NetLanMode");
         return x && x->t == J::Bool && x->b ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// [GT6 0141] The game's own language (public issue #15: a player could not get English - the runtime tells the game
+// the language of Windows' display, and nothing chose another). "GameLang" of the settings file as it stands on the
+// disk: "" or no key = by Windows, else a code the runtime knows (cellSysutil.c: en, en-gb, fr, es, de, it, nl, pt,
+// pt-br, ru, pl, tr, ja, ko, zh-t, zh-s, fi, sv, da, no). main.cpp hands it on as PS3_LANG before the game starts;
+// PS3_LANG in the environment goes first. The launcher writes the key (Settings -> Language). Returns 1 with the code.
+extern "C" int gt6_menu_setting_game_language(char* out, int n)
+{
+    if (!out || n < 2)
+        return 0;
+    out[0] = 0;
+    try {
+        std::string text;
+        J j;
+        if (!readFile(settingsPath(), text) || !jsonParse(text, j) || j.t != J::Obj)
+            return 0;
+        const J* x = j.get("GameLang");
+        if (!x || x->t != J::Str || x->s.empty() || x->s.size() >= (size_t)n)
+            return 0;
+        for (char c : x->s)
+            if (!(std::isalnum((unsigned char)c) || c == '-'))
+                return 0;
+        std::memcpy(out, x->s.c_str(), x->s.size() + 1);
+        return 1;
     } catch (...) {
         return 0;
     }
@@ -1724,6 +1756,11 @@ void toast(const std::string& text, bool warn)
 
 unsigned toastSeq() { return g_toastSeqA.load(std::memory_order_relaxed); }
 
+
+extern "C" int gt6_menu_super_held(void)
+{
+    return 0;
+}
 
 void padSample(unsigned port, unsigned buttons)
 {

@@ -55,6 +55,7 @@ struct Settings {
     double screenBright = 1.0;     // Brightness (2026-11-24, a player's report: "image is very dim"): the picture goes to the window as
                                    // out = in^(1 / this) - 1 = as the game draws it, live [GT6 0101]
     int menuLang = 0;              // [GT6 0087] 0 = by Windows' display language, 1 = Korean, 2 = English (from the next start)
+    std::string gameLang;          // [GT6 0141] the game's own language: "" = by Windows' display language, else a code of the runtime's (en, en-gb, fr ...; main.cpp gt6_menu_setting_game_language)
     int lastPage = 0;
 };
 

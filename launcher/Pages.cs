@@ -491,9 +491,38 @@ namespace GT6Launcher
                 Window.Toast(L.T("언어는 런처를 다시 열면 바뀝니다."));
             }, "", L.T("자동 (Windows)"), "ko", "한국어", "en", "English");
 
+            // [GT6 0141] The game's own language (public issue #15): the game takes Windows' display language unless
+            // this names another; written into the menu's settings file, read by the game when it starts.
+            string gameLangNow = MenuSettings.GameLang(build.SettingsFile);
+            ComboBox gameLanguage = null;
+            gameLanguage = Ui.Choices(gameLangNow, delegate(string key)
+            {
+                if (key == gameLangNow)
+                    return;
+                if (GameRunning)
+                {
+                    Window.Toast(L.T("게임이 꺼져 있을 때 바꿀 수 있습니다."));
+                    return;
+                }
+                try
+                {
+                    MenuSettings.SetGameLang(build.SettingsFile, key);
+                    gameLangNow = key;
+                    Window.Toast(L.T("게임 언어는 게임을 다시 시작하면 바뀝니다."));
+                }
+                catch (Exception error)
+                {
+                    Window.Error(L.T("설정 파일을 쓰지 못했습니다"), error);
+                }
+            }, "", L.T("자동 (Windows)"), "en", "English (US)", "en-gb", "English (UK)", "fr", "Français", "de", "Deutsch", "es", "Español",
+               "it", "Italiano", "nl", "Nederlands", "pt", "Português (Portugal)", "pt-br", "Português (Brasil)", "ru", "Русский",
+               "pl", "Polski", "tr", "Türkçe", "ja", "日本語", "ko", "한국어", "zh-t", "中文 (繁體)", "zh-s", "中文 (简体)",
+               "fi", "Suomi", "sv", "Svenska", "da", "Dansk", "no", "Norsk");
+
             return Ui.Page(L.T("설정"), L.T("런처의 설정은 launcher.ini에, 게임 안 메뉴의 설정은 메뉴의 설정 파일에 그대로 남습니다."),
                 Ui.Card("언어 · Language",
-                    Ui.Setting("언어 · Language", L.T("런처와 게임 안 메뉴(F2)의 언어입니다. 자동은 Windows의 표시 언어를 따릅니다."), language)),
+                    Ui.Setting("언어 · Language", L.T("런처와 게임 안 메뉴(F2)의 언어입니다. 자동은 Windows의 표시 언어를 따릅니다."), language),
+                    Ui.Setting(L.T("게임 언어"), L.T("게임 자체의 글과 음성의 언어입니다. 자동은 Windows의 표시 언어를 따릅니다. 이 게임 데이터에 그 언어가 들어 있을 때만 바뀌고, 없으면 영어로 나옵니다."), gameLanguage)),
                 Ui.Card(L.T("게임 빌드"),
                     Ui.Setting(L.T("플레이 버튼이 시작하는 빌드"), L.T("패키지에 든 두 실행 파일 중 하나입니다. 시험판은 자기 설정 파일을 따로 씁니다."), BuildPicker())),
                 Ui.Card(L.T("화면"), screen),
