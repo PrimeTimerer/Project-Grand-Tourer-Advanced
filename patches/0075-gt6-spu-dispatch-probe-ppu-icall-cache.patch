@@ -1,0 +1,211 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 6b1f910..61955e1 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2802,6 +2802,8 @@ typedef void (*ppu_fn)(ppu_context*);
+ static uint32_t g_addr[PPU_HASH_SIZE];
+ static ppu_fn   g_fn[PPU_HASH_SIZE];
+ static uint32_t g_fn_count = 0;
++/* Bumped after every change of the table: the generation of the per-thread indirect-call cache below. */
++static volatile long g_fn_gen = 1;
+ 
+ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
+ {
+@@ -2810,8 +2812,8 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
+     /* Bounded probe: never loop past the whole table. A full table (function
+      * count >= PPU_HASH_SIZE) would otherwise spin forever here at startup. */
+     for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
+-        if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; return; }
+-        if (g_addr[i] == a) { g_fn[i] = fn; return; }   /* overwrite */
++        if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; __atomic_add_fetch(&g_fn_gen, 1, __ATOMIC_RELEASE); return; }
++        if (g_addr[i] == a) { g_fn[i] = fn; __atomic_add_fetch(&g_fn_gen, 1, __ATOMIC_RELEASE); return; }   /* overwrite */
+         i = (i + 1) & PPU_HASH_MASK;
+     }
+     static int warned = 0;
+@@ -2859,6 +2861,29 @@ static ppu_fn ppu_lookup(uint32_t a)
+     return nullptr;
+ }
+ 
++/* [GT6 0146] The indirect call's lookup, from a small table of this thread's own. The registry above is 3 MB in two
++ * arrays (262,144 addresses, 262,144 pointers), so each ppu_lookup touches two cache lines far apart; a frame of
++ * Gran Turismo 6 makes its indirect calls to a few hundred targets. Sampled 2026-11-26 in a 16-car start:
++ * ps3_indirect_call_impl = 1.4 ms of the logic thread's frame and 0.6 ms of the render thread's.
++ * 2,048 entries of 16 bytes = 32 KB a thread. An entry is this thread's alone (no torn pair of address and
++ * pointer), holds only hits, and is good for the registry generation it was read under - any registration, also
++ * one that replaces a function, bumps the generation after the table is changed. PPU_ICALL_CACHE=0: off. */
++struct ppu_icall_entry { uint32_t addr; long gen; ppu_fn fn; };
++#define PPU_ICALL_CACHE_SIZE 2048u
++static PPU_THREAD_LOCAL ppu_icall_entry t_icall_cache[PPU_ICALL_CACHE_SIZE];
++static inline ppu_fn ppu_lookup_icall(uint32_t a)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PPU_ICALL_CACHE"); on = !(e && *e == '0'); }
++    if (!on) return ppu_lookup(a);
++    ppu_icall_entry* const e = &t_icall_cache[(a * 2654435761u) >> 21];   /* the top 11 bits */
++    const long gen = __atomic_load_n(&g_fn_gen, __ATOMIC_ACQUIRE);
++    if (e->addr == a && e->gen == gen) return e->fn;
++    const ppu_fn fn = ppu_lookup(a);
++    if (fn) { e->addr = a; e->gen = gen; e->fn = fn; }
++    return fn;
++}
++
+ extern "C" uint32_t ppu_function_count(void) { return g_fn_count; }
+ 
+ /* Correct native memmove override for the game's hand-optimized memmove at
+@@ -3507,7 +3532,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
+         }
+     }
+ 
+-    ppu_fn fn = ppu_lookup(addr);
++    ppu_fn fn = ppu_lookup_icall(addr);
+     if (!fn) {
+         /* OPD-swap clobber fixup: a malformed memcpy (game func_0036FA74) writes
+          * some handler/vtable OPDs as {TOC, func} (code & toc SWAPPED), so lifted
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 63346d6..7a69ba5 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1920,7 +1920,7 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
+  * read before the walk, so a registration that races the walk leaves the entry
+  * stale and the next lookup redoes it. */
+ typedef struct { uint32_t addr, gen; int image; spu_fn fn; } spu_lookup_memo;
+-#define SPU_LOOKUP_MEMO_SIZE 512   /* power of two */
++#define SPU_LOOKUP_MEMO_SIZE 2048  /* power of two; 512 until the indirect-branch fast path asked it too ([GT6 0146]) */
+ static SPU_TLS spu_lookup_memo t_lookup_memo[SPU_LOOKUP_MEMO_SIZE];
+ static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
+ {
+@@ -1933,6 +1933,10 @@ static spu_fn spu_lookup_memoized(uint32_t addr, int image_id)
+     }
+     return m->fn;
+ }
++/* The same answer as spu_lookup, from the per-thread memo: for the clang-built fast path (spu_dispatch_mt.c), which
++ * asked spu_lookup itself on every indirect branch - two walks of the address's hash chain, one entry per image
++ * registered at that address, and for a job module resident in a code slot both of them misses. */
++spu_fn spu_lookup_cached(uint32_t addr, int image_id) { return spu_lookup_memoized(addr, image_id); }
+ 
+ /* Which image registered a function at this LS address, or -1 if none did.
+  *
+@@ -2903,6 +2907,73 @@ static int spu_taskset_resident_image(const spu_context* ctx)
+  * at LS 0x3000 (below it is the SPURS kernel/policy/context, 0x290..0x2FFF). */
+ #define SPU_TASKSET_TASK_LO 0x3000u
+ 
++/* ---- [GT6 0146] The plain indirect branch, answered from the dispatch cache alone -------------------------------
++ * spu_indirect_branch_mt (the clang fast path) knows the registry by image only. A job module resident in one of
++ * the context's code slots is not found there, so every such branch fell into spu_indirect_branch, which walks all
++ * of its special cases before it reaches the dispatch cache that spu_lifted_lookup keeps. Sampled 2026-11-26 in a
++ * 16-car start: spu_lifted_lookup + spu_lookup + spu_indirect_branch = 1.9 ms of each PDI SPU thread's 24.5 ms a
++ * frame.
++ * This answers a branch only when every step spu_indirect_branch takes before its dispatch is a no-op for this
++ * context and pc and the dispatch cache already holds the function:
++ *   - no interrupt return pending (irq_saved);
++ *   - no resident task, and no task ELFs or task entries registered (the adoption of a task then cannot happen);
++ *   - not one of the six addresses spu_gt6_irq_lookup answers, not the job return address;
++ *   - no overlay recheck and no native capture armed (both read 0 once the full path has run), none of the branch
++ *     diagnostics asked for by environment.
++ *   - not the policy service addresses, the taskset syscall address or the resolver-only image.
++ * Asked first thing by spu_indirect_branch. NULL = "the full resolver decides". The function it returns has had
++ * spu_check_stack_reset, as further down in spu_indirect_branch.
++ * SPU_FAST_DISPATCH=0: off. =shadow: every hit is compared with the full lookup; disagreements are counted, said
++ * (16 times) and answered by the full resolver. */
++static unsigned long long s_fast_shadow_hits, s_fast_shadow_bad;
++spu_fn spu_indirect_fast(spu_context* ctx, uint32_t pc)
++{
++    static int s_mode = -1;   /* 0 off, 1 on, 2 shadow */
++    int mode = __atomic_load_n(&s_mode, __ATOMIC_RELAXED);
++    if (mode < 0) {
++        const char* e = getenv("SPU_FAST_DISPATCH");
++        mode = !e ? 1 : (!strcmp(e, "0") || !strcmp(e, "off")) ? 0 : !strcmp(e, "shadow") ? 2 : 1;
++        if (getenv("SPU_IBCOV") || getenv("SPU_POLLTRACE") || getenv("YDKJ_POLTRACE") || getenv("SPU_JOBTRACE") ||
++            getenv("LBP_HLE_JOBDONE") || getenv("SPU_JOBEXEC") || getenv("SPU_IRQTRACE"))
++            mode = 0;         /* those lines are written by spu_indirect_branch */
++        __atomic_store_n(&s_mode, mode, __ATOMIC_RELAXED);
++    }
++    if (!mode) return NULL;
++    if ((ctx->policy_mode && (pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS)) ||
++        pc == SPURS_TASKSET_PM_SYSCALL_LS || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID) return NULL;
++    if (ctx->irq_saved || ctx->resident_task || s_task_elf_count || s_task_entry_count) return NULL;
++    switch (pc) {
++    case 0xA2C: case 0xA30: case 0xA34: case 0xA84: case 0xA90: case 0x3FEC0:   /* spu_gt6_irq_lookup's */
++    case SPU_JOB_RETURN_LS:
++        return NULL;
++    default:
++        break;
++    }
++    if (__atomic_load_n(&s_overlay_recheck, __ATOMIC_ACQUIRE) != 0 ||
++        __atomic_load_n(&g_spu_native_capture_state, __ATOMIC_ACQUIRE) != 0 || spu_dcache_mode() != 1) return NULL;
++    const uint32_t id = ctx->dcache_id;
++    if (!id) return NULL;     /* the full lookup hands the id out */
++    const uint32_t rgen = __atomic_load_n(&s_registry_count, __ATOMIC_ACQUIRE);
++    const spu_dcache_ent* e = &t_dcache[((pc >> 2) ^ (id * 0x9E3779B1u)) & (SPU_DCACHE_ENTRIES - 1)];
++    if (!e->fn || e->id != id || e->lsa != pc || e->rgen != rgen || e->residency != ctx->dcache_residency ||
++        e->image != ctx->image_id || e->ovl != ctx->resident_ovl || e->task != 0) return NULL;
++    const spu_fn fn = (spu_fn)e->fn;
++    if (mode == 2) {
++        const unsigned long long hits = __atomic_add_fetch(&s_fast_shadow_hits, 1, __ATOMIC_RELAXED);
++        if ((spu_fn)spu_lifted_lookup_full(ctx, pc) != fn) {
++            if (__atomic_fetch_add(&s_fast_shadow_bad, 1, __ATOMIC_RELAXED) < 16)
++                fprintf(stderr, "[spu-fast] shadow mismatch img=%d ovl=%d lsa=0x%05X\n", ctx->image_id, ctx->resident_ovl, pc);
++            return NULL;
++        }
++        if ((hits & ((1ull << 22) - 1)) == 0)
++            fprintf(stderr, "[spu-fast] shadow: %llu hits, %llu mismatches\n", hits,
++                    __atomic_load_n(&s_fast_shadow_bad, __ATOMIC_RELAXED));
++    }
++    ctx->pc = pc;
++    spu_check_stack_reset(ctx, fn);
++    return fn;
++}
++
+ /* Content-signature variant: FMOD COPIES codec overlays to the heap before
+  * streaming them into the swap slot, so the source EA is unknowable ahead of
+  * time -- match the first 16 bytes of the streamed content instead. */
+@@ -3524,6 +3595,17 @@ void spu_indirect_branch(spu_context* ctx)
+      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
+      * masking is a no-op for already-valid targets. */
+     ctx->pc &= SPU_LS_MASK;
++    /* [GT6 0146] The plain case first (see spu_indirect_fast): a return at host depth 0 comes here through the
++     * trampoline (SPU_RET), not through spu_indirect_branch_mt. */
++    { const spu_fn fast = spu_indirect_fast(ctx, ctx->pc);
++      if (fast) {
++#if defined(__clang__)
++          __attribute__((musttail)) return fast(ctx);
++#else
++          fast(ctx);
++          return;
++#endif
++      } }
+     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
+      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
+      * enforce the preserve-all-registers hardware contract here -- the first
+diff --git a/runtime/spu/spu_dispatch_mt.c b/runtime/spu/spu_dispatch_mt.c
+index d9f86bb..8b27071 100644
+--- a/runtime/spu/spu_dispatch_mt.c
++++ b/runtime/spu/spu_dispatch_mt.c
+@@ -18,7 +18,7 @@
+ #include <stdlib.h>
+ 
+ typedef void (*spu_dispatch_fn)(spu_context*);
+-spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
++spu_dispatch_fn spu_lookup_cached(uint32_t addr, int image_id);     /* spu_channels.c: spu_lookup through the per-thread memo */
+ void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
+ 
+ void spu_indirect_branch_mt(spu_context* ctx)
+@@ -58,12 +58,16 @@ void spu_indirect_branch_mt(spu_context* ctx)
+         /* Resident overlay first (mirrors the full resolver): streamed plugin
+          * code owns its LS range; base-image entries at the same address are
+          * stale bytes and must lose. */
+-        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
+-        if (!fn) fn = spu_lookup(pc, ctx->image_id);
++        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup_cached(pc, ctx->resident_ovl) : 0;
++        if (!fn) fn = spu_lookup_cached(pc, ctx->image_id);
+         if (fn) {
+             ctx->pc = pc;
+             __attribute__((musttail)) return fn(ctx);
+         }
++        /* [GT6 0146] A function of a job module resident in a code slot is not in the registry under this
++         * context's image; the full resolver's dispatch cache knows it, and spu_indirect_branch asks that cache
++         * first now (spu_indirect_fast) - the two lookups above stay ahead of it, so their answers are what they
++         * always were. */
+     }
+     /* slow / special path: full resolver (diagnostics, intercepts, miss log) */
+     __attribute__((musttail)) return spu_indirect_branch(ctx);

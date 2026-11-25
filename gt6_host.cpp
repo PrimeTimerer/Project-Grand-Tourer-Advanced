@@ -633,12 +633,30 @@ void install_traces(void)
  * -----------------------------------------------------------------------*/
 extern "C" uint8_t* vm_base;
 
+/* [GT6 0146] One byte of each page through the kernel's copy routine (ReadProcessMemory on this process): it fails
+ * for memory that is not there instead of faulting, and sets off neither the port's lazy commit nor the title's
+ * pager - the same answer as before for committed, reserved and no-access pages.
+ * This asked VirtualQuery until 2026-11-26. VirtualQuery walks the whole run of pages that share a state - inside
+ * the 4 GB write-watch reservation about half a millisecond a call - and since [GT6 0133] (2026-11-25) the frame
+ * timing hook asks three times a frame on the game's render thread: 1.8 - 2.0 ms of every frame in every scene
+ * (the sampler's "gt6_frame_timing_sample" line), and the renderer's GetWriteWatch calls, which need the same
+ * lock, went from 15 - 20 us to 70 - 130 us each (0.5 - 1.0 -> 4 - 6 ms a frame; the [ww] lines of the kept logs
+ * before and after 11:00 that day). The game bridge's hooks had the same fault and the same cure on 2026-11-18
+ * (probe in gt6_trainer.cpp). GT6_PEEK_VQ=1 = VirtualQuery as before (for comparison). */
 bool peek_ok(uint32_t ea, uint32_t len)
 {
-    MEMORY_BASIC_INFORMATION mbi;
+    static const bool vq = []() { const char* e = getenv("GT6_PEEK_VQ"); return e && *e == '1'; }();
+    if (!vm_base) return false;
     for (uint64_t a = ea & ~0xFFFull; a < (uint64_t)ea + len; a += 0x1000) {
-        if (!VirtualQuery(vm_base + a, &mbi, sizeof mbi)) return false;
-        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+        if (a > 0xFFFFFFFFull) return false;
+        if (vq) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(vm_base + a, &mbi, sizeof mbi)) return false;
+            if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+            continue;
+        }
+        uint8_t b; SIZE_T n = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), vm_base + a, &b, 1, &n) || n != 1) return false;
     }
     return true;
 }
