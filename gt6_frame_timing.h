@@ -21,9 +21,13 @@
  * ended (docs\OPTIMIZATION_20261117.md) - ind1 showed none in 330 s. Why
  * that wait is gone was not looked into.
  *
- * GT6_RENDER_INTERVAL=2: the game's own pace (off). =0: no VBlank wait at
- * all (tests). GT6_FRAME_TIMING_TRACE=1 observes raw update arguments
- * once/sec.
+ * [GT6 0145, 2026-11-25] That was not enough: see gt6_scene_interval below.
+ * The race scene's own choice of the interval is answered with 1 now; the
+ * moved wait target stays for scenes whose interval comes from elsewhere.
+ *
+ * GT6_RENDER_INTERVAL=2: the game's own pace (off). =1: only the wait's
+ * target, as [GT6 0133] was. =0: no VBlank wait at all (tests).
+ * GT6_FRAME_TIMING_TRACE=1 observes raw update arguments once/sec.
  */
 #pragma once
 #include <cmath>
@@ -33,12 +37,16 @@ namespace {
 struct Gt6FrameTimingConfig {
     int interval;
     bool trace;
-    Gt6FrameTimingConfig() : interval(1), trace(false) {
+    bool own;   /* [GT6 0145] the game's own choice of 2 becomes 1 (gt6_scene_interval); off with =1, =0, =2 */
+    Gt6FrameTimingConfig() : interval(1), trace(false), own(true) {
         const char* value = getenv("GT6_RENDER_INTERVAL");
-        if (value && (value[0] == '0' || value[0] == '1') && value[1] == 0)
+        if (value && (value[0] == '0' || value[0] == '1') && value[1] == 0) {
             interval = value[0] - '0';
-        else if (value && value[0] == '2' && value[1] == 0)
+            own = false;     /* =1: only the wait's target, as [GT6 0133] was */
+        } else if (value && value[0] == '2' && value[1] == 0) {
             interval = -1;   /* the game's own pace */
+            own = false;
+        }
         const char* diagnostic = getenv("GT6_FRAME_TIMING_TRACE");
         trace = diagnostic && diagnostic[0] == '1';
     }
@@ -89,9 +97,41 @@ struct Gt6FrameTimingStats {
 };
 } // namespace
 
+/* [GT6 0145] The game's own choice of the scene's frame interval, at the one place where it is made (func_001F90FC,
+ * 0x001F9468 / 0x001F9470; tools\post_lift.py routes both values through here): 1 in a race, 2 in a replay, in the
+ * scenes before and after a race and under the replay camera. Everything of the game reads the word this value is
+ * stored in (graphics root + 0x1C). With only the wait's target moved ([GT6 0133]) the game went on taking such a
+ * scene for a half-rate one: its 2D layer - the panels and the menu row before a race, the result panels - was
+ * drawn in some frames only, in runs seconds long (shown 2026-11-25 by an A/B of the scene before a race: steady
+ * with the game's own pace, gone in most frames with the target moved; the draw records of the frames without it
+ * hold no draw of the 2D layer at all).
+ * Now the choice itself becomes 1, so every reader agrees (the default; GT6_RENDER_INTERVAL=1 = only the wait's
+ * target as [GT6 0133] was, =2 = the game's own pace). Measured 2026-11-25, Special Stage Route 7 at night, 16 cars,
+ * 1080p real resolution, hidden runs: the scene before a race 60.0 fps for 250 s with its panels in every picture
+ * (27 .. 42 fps with the target moved, 29 at the game's own pace); the replay camera while driving 46 .. 60 fps
+ * (20 .. 38); the results panel and the replay's own display in every picture; game time 0.96 .. 1.02 s a second.
+ * What the game chose is kept for code that must know that a scene is a replay (gt6_scene_interval_game). */
+static volatile LONG g_gt6_scene_interval_game = 0;
+extern "C" int gt6_scene_interval(int game)
+{
+    InterlockedExchange(&g_gt6_scene_interval_game, game);
+    if (game == 2 && gt6_frame_timing_config().own) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            fprintf(stderr, "[gt6-render-interval] the game chooses a frame interval of 2 here (a replay, the scene "
+                    "before or after a race, the replay camera): answered 1, so its own word says every VBlank\n");
+        }
+        return 1;
+    }
+    return game;
+}
+extern "C" int gt6_scene_interval_game(void) { return (int)g_gt6_scene_interval_game; }
+
 extern "C" void gt6_render_wait_target(ppu_context* ctx)
 {
     const Gt6FrameTimingConfig& config = gt6_frame_timing_config();
+    gt6_watch_write_tick();   /* (test tool, once a frame; nothing unless GT6_WATCH_WRITE is set) */
     if (config.interval < 0 || !ctx || ctx->lr != 0x008A8A48u || ctx->gpr[5] != 1)
         return;
     Gt6FrameTimingSample sample;

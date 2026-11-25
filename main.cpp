@@ -123,17 +123,35 @@ static const uint8_t* rsx_live_guest_ptr(void* user, uint32_t location,
      * at 0x40000000 and the code that turns an address into an offset there assumes so; here the heap is at
      * 0x80000000 and the address came through unchanged. So when the IO table itself says that this very address
      * is what the offset's low 28 bits map to, the address is used: the draw gets the data it was made for. */
+    /* GT6_RSX_HEAP_OFFSET=old (a test switch): resolve as before [GT6 0143] - for comparing a scene with and without
+     * it (the replay's triangle, [GT6 0145]). How often the heap-address reads happen is said at 1, 10, 100 ... */
+    static const bool old_way = []() { const char* e = getenv("GT6_RSX_HEAP_OFFSET"); return e && !strcmp(e, "old"); }();
+    static LONG heap_reads;
     const bool beyond_local = offset >= 0x10000000u;
+    if (old_way) {
+        if (beyond_local) {
+            const LONG k = InterlockedIncrement(&heap_reads);
+            if (k == 1 || k == 10 || k == 100 || k == 1000 || k == 10000 || k == 100000 || k == 1000000)
+                fprintf(stderr, "[gt6] RSX offsets beyond local memory, resolved the old way: %ld so far (location %u offset 0x%08X)\n",
+                        (long)k, location, offset);
+        }
+        if (location == 0) ea = cellGcmResolveLocated(1, offset);
+        else { ea = cellGcmResolveIO(offset); if (!ea) ea = cellGcmResolveLocated(0, offset); }
+        if (!ea || ea == 0xFFFFFFFFu || (uint64_t)ea + min_bytes > 0x100000000ull) return nullptr;
+        return (const uint8_t*)vm_base + ea;
+    }
     if (location == 0) {
         ea = beyond_local ? 0u : cellGcmResolveLocated(1, offset);
     } else {
         ea = cellGcmResolveIO(offset);
         if (!ea && beyond_local && cellGcmResolveIO(offset & 0x0FFFFFFFu) == offset) {
             ea = offset;
-            static LONG told;
-            if (InterlockedIncrement(&told) == 1)
+            const LONG k = InterlockedIncrement(&heap_reads);
+            if (k == 1)
                 fprintf(stderr, "[gt6] RSX offset 0x%08X is an address of the game's heap that the RSX has mapped: read there "
                                 "(the console's heap is at 0x40000000, this one's at 0x80000000)\n", offset);
+            else if (k == 10 || k == 100 || k == 1000 || k == 10000 || k == 100000 || k == 1000000)
+                fprintf(stderr, "[gt6] RSX heap-address reads: %ld so far\n", (long)k);
         }
         if (!ea) ea = beyond_local ? 0u : cellGcmResolveLocated(0, offset);
     }

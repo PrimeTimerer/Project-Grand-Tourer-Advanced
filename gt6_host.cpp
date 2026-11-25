@@ -1093,4 +1093,5 @@ void gt6_audio_trace_completed(ppu_context* ctx)
 }
 
 /* Experimental render pacing stays independent of the guest's time sources. */
+#include "gt6_watch_write.h"
 #include "gt6_frame_timing.h"

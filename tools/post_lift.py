@@ -285,6 +285,39 @@ def apply_crs_reloc(text):
     return text, 1
 
 
+# [GT6 0145] func_001F90FC, the race scene's update, decides the frame interval of the scene every time it runs:
+# 0x001F9468 li r0, 1 (a race) / 0x001F9470 li r0, 2 (a replay, the scenes before and after a race, the replay camera
+# while driving), stored to the graphics root + 0x1C. Everything of the game reads that word - the VBlank the frame
+# waits for, the VBlank it is shown at, and whether the 2D layer is drawn in a frame. [GT6 0133] moved only the wait's
+# target and left the word at 2: the picture came every VBlank, but the game went on taking the scene for a half-rate
+# one and drew its panels and menus in some frames only. Both values now pass gt6_scene_interval (gt6_frame_timing.h),
+# which records the game's choice and may answer 1 for 2. The two lines are the lifter's --insn-patches forms.
+SCENE_INTERVAL_HEAD = 'void func_001F90FC(ppu_context* ctx) {\n'
+SCENE_INTERVAL_DECL = 'extern "C" int gt6_scene_interval(int game);\n'
+SCENE_INTERVAL_RULES = [
+    ('else { ctx->gpr[0] = (int64_t)(int32_t)(%d); }  /* insn patch 0x%08X:' % (v, a),
+     'else { ctx->gpr[0] = (int64_t)(int32_t)gt6_scene_interval(%d); /*GT6_SCENE_INTERVAL*/ }  /* insn patch 0x%08X:' % (v, a))
+    for v, a in ((1, 0x001F9468), (2, 0x001F9470))]
+scene_interval_done = 0
+
+
+def apply_scene_interval(text):
+    if SCENE_INTERVAL_HEAD not in text:
+        return text, 0
+    n = 0
+    for old, new in SCENE_INTERVAL_RULES:
+        if new in text:
+            n += 1
+        elif text.count(old) == 1:
+            text = text.replace(old, new)
+            n += 1
+    if n != 2:
+        raise ValueError('GT6_SCENE_INTERVAL: the two interval values of func_001F90FC were not both found')
+    if SCENE_INTERVAL_DECL + SCENE_INTERVAL_HEAD not in text:
+        text = text.replace(SCENE_INTERVAL_HEAD, SCENE_INTERVAL_DECL + SCENE_INTERVAL_HEAD)
+    return text, n
+
+
 def apply_spurs_spus(text):
     n = 0
     for old, new, mark in SPURS_RULES:
@@ -363,6 +396,8 @@ for p in sorted(glob.glob(os.path.join(d, 'ppu_recomp_*.cpp'))):
     spurs_done += spurs_count
     t, crs_reloc_count = apply_crs_reloc(t)
     crs_reloc_done += crs_reloc_count
+    t, scene_interval_count = apply_scene_interval(t)
+    scene_interval_done += scene_interval_count
     for m in list(TRACE_BLOCK.finditer(t)):
         f = m.group(1)
         if f not in trace:
@@ -417,6 +452,8 @@ if spurs_done != 3:
     raise SystemExit(f'GT6_SPURS_SPUS: expected the request, the clamp and the job list hook once each, found {spurs_done}')
 if crs_reloc_done != 1:
     raise SystemExit(f'GT6_CRS_RELOC: expected the one comparison of func_00C8CD90, found {crs_reloc_done}')
+if scene_interval_done != 2:
+    raise SystemExit(f'GT6_SCENE_INTERVAL: expected the two interval values of func_001F90FC, found {scene_interval_done}')
 if trace - traced:
     raise SystemExit('not lifted function entries: ' + ', '.join(sorted(trace - traced)))
 if tail_calls:
