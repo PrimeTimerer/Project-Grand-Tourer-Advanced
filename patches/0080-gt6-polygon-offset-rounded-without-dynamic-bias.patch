@@ -1,0 +1,55 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 6af6403..cc476f0 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -10434,6 +10434,35 @@ static ID3D12PipelineState* get_pso(
+         g_ld_draw_bias_on = 1;
+         rs.polygon_offset_factor = LD_DYN_BIAS_MARK;
+         rs.polygon_offset_units = 0;
++    } else if (rs.polygon_offset_factor | rs.polygon_offset_units) {
++        /* [GT6 0157, 2026-11-27] ... AND WHERE THE DEVICE DOES NOT OFFER IT, THE OFFSET ROUNDED (public issue #23: "textures
++         * disappear on the 3rd consecutive race in a championship", RTX 3080; #4's GTX 1650 SUPER the same device answer).
++         * Their log: "dynamic depth bias: off (not offered by this device)", so the offset that follows the camera stayed
++         * part of every pipeline state's identity - "[ld-flush] psos=32768" (MAX_PSOS) from frame 22,080 on, 1.49 million
++         * pipeline states asked for that were new by their offset alone, and from then on every draw that needed one more
++         * was dropped (drop{pso=} 1.62 million at the end, 1,190 a frame): the track went first, then everything. Here the
++         * two values keep 5 bits of their mantissa, rounded AWAY from zero - never less offset than the game asked, so
++         * nothing that did not fight in depth begins to; at most 1/16 more (-33,804 units -> -34,816; the depth buffer's
++         * own step is one unit) - and the states an offset can make stay bounded: 16 a doubling of the value. Past three
++         * quarters of MAX_PSOS 3 bits (4 a doubling, at most a third more). Test pso1 with 7 bits rounded to nearest,
++         * LD_DYNAMIC_DEPTH_BIAS=0, Special Stage Route 7, 16 cars, five minutes: no draw dropped, but 10,421 pipeline
++         * states (8,306 new by their offset alone) and still rising on the second lap. The device's own dynamic bias stays
++         * the first choice (above). LD_BIAS_EXACT=1: the exact values as before (tests). */
++        static int exact = -1;
++        if (exact < 0) exact = getenv("LD_BIAS_EXACT") != NULL;
++        if (!exact) {
++            const float steps = g.n_psos > (MAX_PSOS / 4u) * 3u ? 8.0f : 32.0f;
++            float v[2];
++            memcpy(&v[0], &rs.polygon_offset_factor, sizeof v[0]);
++            memcpy(&v[1], &rs.polygon_offset_units, sizeof v[1]);
++            for (int k = 0; k < 2; k++)
++                if (isfinite(v[k]) && v[k] != 0.0f) {
++                    int e; const float m = frexpf(v[k], &e);
++                    v[k] = ldexpf(copysignf(ceilf(fabsf(m) * steps) / steps, m), e);
++                }
++            memcpy(&rs.polygon_offset_factor, &v[0], sizeof v[0]);
++            memcpy(&rs.polygon_offset_units, &v[1], sizeof v[1]);
++        }
+     }
+     if (fm && fm->n_const != UINT32_MAX) {
+         /* The constants' places are known: read them there, as rsx_fp_collect_constants does at the end of its
+@@ -17389,10 +17418,12 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+       if (want && offered && g.list &&
+           FAILED(g.list->lpVtbl->QueryInterface(g.list, &IID_ID3D12GraphicsCommandList9, (void**)&g.list9)))
+           g.list9 = NULL;
+-      fprintf(stderr, "[live-draw] dynamic depth bias: %s\n",
++      fprintf(stderr, "[live-draw] dynamic depth bias: %s%s\n",
+               g.list9 ? "on (a polygon offset is command-list state, not part of a pipeline state)"
+                       : !want ? "off (LD_DYNAMIC_DEPTH_BIAS=0)"
+-                      : offered ? "off (no ID3D12GraphicsCommandList9)" : "off (not offered by this device)"); }
++                      : offered ? "off (no ID3D12GraphicsCommandList9)" : "off (not offered by this device)",
++              g.list9 ? "" : getenv("LD_BIAS_EXACT") ? " - offsets exact in the pipeline states (LD_BIAS_EXACT)"
++                                                     : " - offsets rounded up to 5 bits in the pipeline states ([GT6 0157])"); }
+     /* Runs of method words in one call (rsx_live_draw_method_run). LD_METHOD_RUN=0 = word by word, as before. */
+     { const char* e = getenv("LD_METHOD_RUN");
+       g_gcm_live_method_run = (e && *e == '0') ? NULL : rsx_live_draw_method_run; }
