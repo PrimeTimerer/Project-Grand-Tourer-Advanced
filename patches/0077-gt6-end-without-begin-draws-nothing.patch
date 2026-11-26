@@ -1,0 +1,111 @@
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index ec14803..58dc2e2 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -401,6 +401,21 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
+             if (rsx->sink.begin)
+                 rsx->sink.begin(rsx->sink.user, rsx, arg);
+         } else {
++            /* An END with no BEGIN before it draws nothing on the hardware. Gran Turismo 6's motion blur
++             * (008C7064) sends one after its third quad; the sink reads END as "draw what you have", and what
++             * it still had was that quad - drawn once more with the vertex formats already put back, so that
++             * its packed attributes were read as positions: the triangle from the top left corner to the
++             * middle of the picture in the replay camera [GT6 0148]. RSX_STRAY_END=1: drawn, as before. */
++            if (!rsx->in_begin_end) {
++                static int draws = -1;
++                static u32 seen;
++                if (draws < 0) { const char* e = getenv("RSX_STRAY_END"); draws = (e && *e == '1') ? 1 : 0; }
++                seen++;
++                if (seen <= 4 || (seen & (seen - 1)) == 0)
++                    fprintf(stderr, "[rsx-dispatch] END with no BEGIN before it (%u so far): %s\n", seen,
++                            draws ? "the group before it is drawn again (RSX_STRAY_END=1)" : "nothing is drawn");
++                if (!draws) break;
++            }
+             rsx->in_begin_end = 0;
+             /* Hand an inline stream over BEFORE end: the sink reads end as
+              * "draw what you have", so a batch delivered after it would be
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 2b6d4ce..2eb56d0 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -16390,11 +16390,80 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     ld_profile_note_ring_highwater();
+ }
+ 
++/* LD_IMM_LOG=1 [GT6 0148]: while the frame-dump gate is open, every group of immediate vertices is written out with
++ * its vertices and the state it is drawn with, and every other group of at most eight vertices by its counts -
++ * what a full-screen pass was handed, next to the picture of the same frame. Diagnosis only. */
++static int ld_imm_log_gate(void)
++{
++    static int on = -1; static const char* gate; static u32 frame = 0xFFFFFFFFu; static int open;
++    if (on < 0) { const char* e = getenv("LD_IMM_LOG"); on = (e && *e == '1') ? 1 : 0; gate = getenv("LD_FRAME_DUMP_GATE"); }
++    if (!on) return 0;
++    if (frame != g_ld_frames) {
++        frame = g_ld_frames; open = 1;
++        if (gate && *gate) { FILE* f = fopen(gate, "rb"); open = f != NULL; if (f) fclose(f); }
++    }
++    return open;
++}
++static float ld_imm_log_f(const u8* p)
++{
++    const u32 b = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
++    float f; memcpy(&f, &b, 4); return f;
++}
++static void ld_imm_log_group(const char* kind, u32 n)
++{
++    const u32* R = g.rsx.regs;
++    const u32 target = current_surface();
++    float vo[4], vs[4];
++    memcpy(vo, &R[0x0A20u >> 2], 16); memcpy(vs, &R[0x0AF0u >> 2], 16);
++    fprintf(stderr, "[imm] f=%u %s n=%u prim=%u tgt=%u", g_ld_frames, kind, n, g.rsx.current_primitive, target);
++    if (target != LD_INVALID_SURFACE)
++        fprintf(stderr, " 0x%X %ux%u", g.surfaces[target].offset, g.surfaces[target].gw, g.surfaces[target].gh);
++    fprintf(stderr, " vp=%08X/%08X sc(%.1f %.1f %.4f) of(%.1f %.1f %.4f) scis=%08X/%08X z=%u/%X/%u st=%u/%X/%X/%X/%X "
++                    "sop=%X/%X/%X bl=%X/%08X/%08X/%X cm=%08X at=%u/%X/%X cull=%u/%X/%X zmm=%X",
++            R[0x0A00u >> 2], R[0x0A04u >> 2], vs[0], vs[1], vs[2], vo[0], vo[1], vo[2],
++            R[0x08C0u >> 2], R[0x08C4u >> 2],
++            R[0x0A74u >> 2] & 1u, R[0x0A6Cu >> 2], R[0x0A70u >> 2] & 1u,
++            R[0x0328u >> 2] & 1u, R[0x0330u >> 2], R[0x0334u >> 2], R[0x0338u >> 2], R[0x032Cu >> 2],
++            R[0x033Cu >> 2], R[0x0340u >> 2], R[0x0344u >> 2],
++            R[0x0310u >> 2], R[0x0314u >> 2], R[0x0318u >> 2], R[0x0320u >> 2], R[0x0324u >> 2],
++            R[0x0304u >> 2] & 1u, R[0x0308u >> 2], R[0x030Cu >> 2],
++            R[0x183Cu >> 2] & 1u, R[0x1830u >> 2], R[0x1834u >> 2], R[0x1D78u >> 2]);
++    for (u32 t = 0; t < 4; t++)
++        if (R[(0x1A0Cu + t * 0x20u) >> 2] & 0x80000000u)
++            fprintf(stderr, " tex%u=%X/%X/%08X/%08X", t, R[(0x1A00u + t * 0x20u) >> 2], R[(0x1A04u + t * 0x20u) >> 2],
++                    R[(0x1A18u + t * 0x20u) >> 2], R[(0x1A08u + t * 0x20u) >> 2]);
++    fprintf(stderr, "\n");
++    if (kind[0] != 'i') return;
++    u32 mask = 1u;
++    for (u32 attr = 1; attr < 16; attr++) {
++        const u32 base = (0x1C00u + attr * 16u) >> 2;
++        if (g.rsx.seen[base] || g.rsx.seen[base + 1] || g.rsx.seen[base + 2] || g.rsx.seen[base + 3]) mask |= 1u << attr;
++    }
++    for (u32 v = 0; v < n && v < 8u; v++) {
++        const u8* s = g_ld_imm.data + (size_t)v * 256u;
++        fprintf(stderr, "[imm]   v%u", v);
++        for (u32 attr = 0; attr < 16; attr++)
++            if ((mask >> attr) & 1u)
++                fprintf(stderr, " a%u(%.5g %.5g %.5g %.5g)", attr, ld_imm_log_f(s + attr * 16u), ld_imm_log_f(s + attr * 16u + 4),
++                        ld_imm_log_f(s + attr * 16u + 8), ld_imm_log_f(s + attr * 16u + 12));
++        fprintf(stderr, "\n");
++    }
++}
++
+ static void sink_end(void* user, const rsx_dispatch* r)
+ {
+ #if defined(YZ_PERF_PROFILE)
+     const LONGLONG begin = ld_profile_qpc();
+ #endif
++    if (ld_imm_log_gate()) {
++        if (g_ld_imm.n && !dc.n_packets) ld_imm_log_group("imm", g_ld_imm.n);
++        else {
++            u32 total = 0;
++            for (u32 b = 0; b < dc.n_arr; b++) total += dc.arr[b].count;
++            for (u32 b = 0; b < dc.n_idx; b++) total += dc.idx[b].count;
++            if (total && total <= 8u) ld_imm_log_group(dc.n_idx ? "small-indexed" : "small-arrays", total);
++        }
++    }
+     /* A group of immediate vertices and nothing else: hand them over as an inline stream [GT6 0036]. */
+     u32 imm_fmt[16], imm_bytes = 0;
+     const int imm = g_ld_imm.n && !dc.n_packets && ld_immediate_pack(imm_fmt, &imm_bytes);

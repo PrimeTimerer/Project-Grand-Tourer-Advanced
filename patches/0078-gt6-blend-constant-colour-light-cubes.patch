@@ -1,0 +1,341 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 2eb56d0..6a647b4 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -602,8 +602,40 @@ static struct {
+     ID3D12PipelineState* pso;
+     ID3D12RootSignature* rs;
+     D3D12_VIEWPORT vp; D3D12_RECT sc; UINT sref; int topo;
++    float bf[4]; int have_bf;                    /* [GT6 0149] the blend constant colour as it stands on the list */
+ } g_ls;
+-static void ld_ls_invalidate(void) { g_ls.valid = 0; }
++static void ld_ls_invalidate(void) { g_ls.valid = 0; g_ls.have_bf = 0; }
++/* [GT6 0149] the blend constant colour (see the draw path): the switch, its run-time gate and the half-float reader */
++static struct { unsigned long long draws, mixed; } g_ld_blend_const;
++static u32 g_ld_frames;                          /* (defined further down) */
++static int ld_blend_constant_on(void)
++{
++    static int on = -1; static const char* gate; static u32 frame = 0xFFFFFFFFu; static int open = 1;
++    if (on < 0) {
++        const char* e = getenv("LD_BLEND_CONSTANT");
++        on = (e && *e == '0') ? 0 : 1;
++        gate = getenv("LD_BLEND_CONSTANT_GATE");
++        fprintf(stderr, "[blend-constant] %s (LD_BLEND_CONSTANT)%s\n", on ? "on: the title's blend colour is passed on" : "off: always (1, 1, 1, 1), as before",
++                gate && *gate ? ", only while the gate file exists" : "");
++    }
++    if (!on) return 0;
++    if (gate && *gate && frame != g_ld_frames) {
++        frame = g_ld_frames;
++        FILE* f = fopen(gate, "rb"); open = f != NULL; if (f) fclose(f);
++    }
++    return open;
++}
++static float ld_half_to_float(u16 h)
++{
++    const u32 sign = (u32)(h & 0x8000u) << 16, exp = (h >> 10) & 0x1Fu, man = h & 0x3FFu;
++    u32 bits;
++    if (exp == 0) {
++        if (man == 0) bits = sign;
++        else { u32 e = 113u, m = man; while (!(m & 0x400u)) { m <<= 1; e--; } bits = sign | (e << 23) | ((m & 0x3FFu) << 13); }
++    } else if (exp == 31) bits = sign | 0x7F800000u | (man << 13);
++    else bits = sign | ((exp + 112u) << 23) | (man << 13);
++    float f; memcpy(&f, &bits, 4); return f;
++}
+ static int ld_ls_on(void)
+ {
+     /* Opt-in (LD_STATE_CACHE=1): measured no gain in the driver's share of
+@@ -6496,6 +6528,164 @@ static int surface_cube_window(const rsx_dsp_texture* t)
+     return (int)(SRV_SURF_WIN_BASE + (u32)si * LD_SWIN_PER + k);
+ }
+ 
++/* [GT6 0149] A CUBE TEXTURE WHOSE SIX FACES ARE SIX RENDER TARGETS OF THEIR OWN. Gran Turismo 6's "additional light"
++ * maps (the shader's additionalLightMap0 .. 3) are the light each car throws - the head lamps' beam white ahead of it,
++ * the tail lamps red behind - as a 32x32 cube of 16-bit floats; the title draws each face into a 32x32 target of its
++ * own, face f at the cube's address + f x (pitch x height), and every road and scenery draw binds four such cubes. A
++ * cube texture that sits on a surface is decoded from guest memory (see the bind) unless one surface holds all of
++ * it (surface_cube_window: the reflection map, A8R8G8B8 with border texels) - and nothing copies those float targets
++ * into guest memory: the four cubes read as black. No lamp lit the road at night.
++ * Here such a cube is a host cube texture filled from its six face surfaces by GPU copies whenever one of them has
++ * been written since the last fill (not while the draw's own target is one of the faces: a cube is not read while
++ * it is being drawn). Plain cubes only - no border texels in the data, one level, a square face of A8R8G8B8 or
++ * W16Z16Y16X16 float - and only where all six faces are surfaces of that size and format; otherwise as before.
++ * LD_CUBE_FACES=0: as before. */
++#define LD_SWIN_CUBE_FACES 0x100u
++/* (tests) LD_LIGHT_DIAG=1: while the frame-dump gate is open, the fragment constants of the draws that bind such a
++ * cube are written out (the lamps' places and fall-off, which the road's shader divides the cube's value by) */
++static u32 g_ld_light_units;                       /* the units of the draw being bound that hold such a cube */
++static int ld_light_diag_gate(void)
++{
++    static int on = -1; static const char* gate; static u32 frame = 0xFFFFFFFFu; static int open;
++    if (on < 0) { const char* e = getenv("LD_LIGHT_DIAG"); on = (e && *e == '1') ? 1 : 0; gate = getenv("LD_FRAME_DUMP_GATE"); }
++    if (!on) return 0;
++    if (frame != g_ld_frames) {
++        frame = g_ld_frames; open = 1;
++        if (gate && *gate) { FILE* f = fopen(gate, "rb"); open = f != NULL; if (f) fclose(f); }
++    }
++    return open;
++}
++static int surface_cube_faces(const rsx_dsp_texture* t, u32 target)
++{
++    static int on = -1;
++    static const char* gate; static u32 gate_frame = 0xFFFFFFFFu; static int gate_open = 1;
++    /* (tests) LD_CUBE_FACES_TEST_GATE=<file>: while that file exists the six faces are cleared to a plain bright grey
++     * (60) before each fill - whatever a lamp lights then shows it, whichever way its beam points */
++    static const char* tgate; static int tgate_open = 0;
++    /* (tests) LD_CUBE_FACES_FLIP_GATE=<file>: while that file exists each face is filled upside down (row by row) */
++    static const char* fgate; static int fgate_open = 0;
++    if (on < 0) { const char* e = getenv("LD_CUBE_FACES"); on = (e && *e == '0') ? 0 : 1; gate = getenv("LD_CUBE_FACES_GATE");
++                  tgate = getenv("LD_CUBE_FACES_TEST_GATE"); fgate = getenv("LD_CUBE_FACES_FLIP_GATE"); }
++    if (on && gate_frame != g_ld_frames) {                             /* (tests: only while that file exists - an A/B in one run) */
++        gate_frame = g_ld_frames;
++        if (gate && *gate) { FILE* gf = fopen(gate, "rb"); gate_open = gf != NULL; if (gf) fclose(gf); }
++        if (tgate && *tgate) { FILE* tf = fopen(tgate, "rb"); tgate_open = tf != NULL; if (tf) fclose(tf); }
++        if (fgate && *fgate) { FILE* ff = fopen(fgate, "rb"); fgate_open = ff != NULL; if (ff) fclose(ff); }
++    }
++    if (!on || !gate_open || !t->cubemap || !(t->format & TEX_FMT_LINEAR) || !t->pitch || t->dimension != 2u) return -1;
++    if (t->width != t->height || !t->width || t->width > 1024u || (t->mipmaps ? t->mipmaps : 1u) != 1u) return -1;
++    if (ld_cube_border_texels(t)) return -1;
++    const u32 base = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
++    DXGI_FORMAT fmt;
++    if (base == TEX_FMT_A8R8G8B8) fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
++    else if (base == RSX_TEX_FMT_W16Z16Y16X16_FLOAT) fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
++    else return -1;
++    const u32 stride = t->pitch * t->height;                           /* a face of one level */
++    int face[6];
++    u32 gen = 0;
++    int drawing = 0;
++    for (u32 f = 0; f < 6u; f++) {
++        face[f] = -1;
++        for (u32 i = 0; i < g.n_surfaces; i++) {
++            const surface_t* c = &g.surfaces[i];
++            if (!c->tex || c->location != t->location || c->offset != t->offset + f * stride || c->fmt != fmt ||
++                c->gw != t->width || c->gh != t->height || ld_upscaled(c)) continue;
++            if (c->guard_dead && ld_surface_guard_on()) continue;
++            face[f] = (int)i;
++            break;
++        }
++        if (face[f] < 0) return -1;
++        gen += g.surfaces[face[f]].swin_wgen;
++        if ((u32)face[f] == target) drawing = 1;
++    }
++    surface_t* s = &g.surfaces[face[0]];
++    static u32 use_clock = 0x60000000u;        /* (above the 2D windows' clock and the cube windows') */
++    u32 k = LD_SWIN_PER;
++    for (u32 j = 0; j < LD_SWIN_PER; j++)
++        if (s->swin[j].tex && s->swin[j].src == s->tex && s->swin[j].cube == LD_SWIN_CUBE_FACES && s->swin[j].w == t->width) { k = j; break; }
++    if (k == LD_SWIN_PER) {
++        k = 0;
++        for (u32 j = 1; j < LD_SWIN_PER; j++)
++            if (!s->swin[j].tex || (s->swin[k].tex && s->swin[j].used < s->swin[k].used)) k = j;
++        if (s->swin[k].tex) retire_texture(s->swin[k].tex);
++        s->swin[k].tex = NULL; s->swin[k].cube = 0;
++        D3D12_RESOURCE_DESC rd = {0};
++        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++        rd.Width = t->width; rd.Height = t->width; rd.DepthOrArraySize = 6; rd.MipLevels = 1;
++        rd.Format = fmt; rd.SampleDesc.Count = 1;
++        D3D12_HEAP_PROPERTIES hp = {0};
++        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++        ID3D12Resource* wt = NULL;
++        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
++                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL, &IID_ID3D12Resource, (void**)&wt))) {
++            static u32 n_fail;
++            if (n_fail++ < 4) fprintf(stderr, "[cube-faces] create failed %u:0x%X %ux%u\n", t->location, t->offset, t->width, t->width);
++            return -1;
++        }
++        s->swin[k].tex = wt; s->swin[k].src = s->tex; s->swin[k].w = t->width; s->swin[k].h = t->width;
++        s->swin[k].ox = 0; s->swin[k].oy = 0; s->swin[k].cube = LD_SWIN_CUBE_FACES;
++        s->swin[k].wgen = gen - 1u;
++        D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
++        desc.Format = fmt;
++        desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
++        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        desc.TextureCube.MipLevels = 1;
++        g.dev->lpVtbl->CreateShaderResourceView(g.dev, wt, &desc, srv_cpu(SRV_SURF_WIN_BASE + (u32)face[0] * LD_SWIN_PER + k));
++        { static u32 told;
++          if (PS3_LOG_FIRST(told, 12))
++              fprintf(stderr, "[cube-faces] texture %u:0x%X %ux%u fmt=0x%02X remap=0x%04X: its six faces are the surfaces %d %d %d %d %d %d "
++                              "(%u bytes apart) - a host cube filled by GPU copies (slot %d.%u), frame %u\n", t->location, t->offset,
++                      t->width, t->width, t->format & 0xFFu, t->remap & 0xFFFFu, face[0], face[1], face[2], face[3], face[4], face[5],
++                      stride, face[0], k, g_ld_frames); }
++    }
++    s->swin[k].used = ++use_clock;
++    if (s->swin[k].wgen != gen && !drawing) {
++        D3D12_RESOURCE_BARRIER b = {0};
++        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b.Transition.pResource = s->swin[k].tex;
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
++        dst.pResource = s->swin[k].tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++        const D3D12_BOX box = { 0, 0, 0, t->width, t->width, 1 };
++        for (u32 f = 0; f < 6u; f++) {
++            surface_t* c = &g.surfaces[face[f]];
++            if (tgate_open) {                                          /* (tests, see above) */
++                const float grey[4] = { 60.0f, 60.0f, 60.0f, 1.0f };
++                g.list->lpVtbl->ClearRenderTargetView(g.list, rtv_handle(LD_SWAP_BUFFERS + (u32)face[f]), grey, 0, NULL);
++            }
++            D3D12_RESOURCE_BARRIER fb = {0};
++            fb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++            fb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++            fb.Transition.pResource = c->tex;
++            fb.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++            fb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++            g.list->lpVtbl->ResourceBarrier(g.list, 1, &fb);
++            src.pResource = c->tex;
++            dst.SubresourceIndex = f;
++            if (fgate_open) {                                          /* (tests, see above) */
++                for (u32 y = 0; y < t->width; y++) {
++                    const D3D12_BOX rb = { 0, y, 0, t->width, y + 1u, 1 };
++                    g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, t->width - 1u - y, 0, &src, &rb);
++                }
++            } else
++                g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &box);
++            fb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++            fb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++            g.list->lpVtbl->ResourceBarrier(g.list, 1, &fb);
++        }
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++        s->swin[k].wgen = gen;
++        g_ld_cube_copies++;
++    }
++    return (int)(SRV_SURF_WIN_BASE + (u32)face[0] * LD_SWIN_PER + k);
++}
++
+ /* LD_SURFACE_MIRROR=<max pixels>: small render targets are kept current in guest memory.
+  *
+  * GT6 renders the six faces of the car's reflection cube map into six small targets, builds the mip levels with
+@@ -15744,6 +15934,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             const int cw = surface_cube_window(&t);
+             if (cw >= 0) { slots[u] = (u32)cw; g_ld_bind_surf++; continue; }
+         }
++        /* ... or its six faces are six surfaces ([GT6 0149]: the cars' light maps) */
++        if (t.cubemap) {
++            const int cf = surface_cube_faces(&t, target);
++            if (cf >= 0) { slots[u] = (u32)cf; g_ld_bind_surf++; g_ld_light_units |= 1u << u; continue; }
++        }
+         if (sampled >= 0 && t.cubemap && ld_surface_mirror_max()) sampled = -1;
+         if (sampled < 0 && LD_DIAG_ENABLED("LD_ALIAS_DBG")) {
+             static u32 n_dbg = 0;
+@@ -15921,6 +16116,29 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         }
+     }
+ 
++    if (g_ld_light_units) {                            /* (tests: LD_LIGHT_DIAG, see surface_cube_faces) */
++        const u32 lu = g_ld_light_units;
++        g_ld_light_units = 0;
++        if (ld_light_diag_gate() && target < g.n_surfaces && g.surfaces[target].w >= 640u) {   /* (the scene itself; the small targets drawn before it used the lines up) */
++            static u32 frame = 0xFFFFFFFFu, n_frame, n_all, seen_t[8], seen_n[8], n_seen;
++            if (frame != g_ld_frames) { frame = g_ld_frames; n_frame = 0; n_seen = 0; }
++            const u32 toff = target < g.n_surfaces ? g.surfaces[target].offset : 0;
++            u32 q = 0;
++            for (; q < n_seen; q++) if (seen_t[q] == toff) break;
++            if (q == n_seen && n_seen < 8u) { seen_t[n_seen] = toff; seen_n[n_seen] = 0; n_seen++; }
++            if (q < n_seen && seen_n[q] < 6u && n_frame < 12u && n_all < 480u) {
++                seen_n[q]++; n_frame++; n_all++;
++                fprintf(stderr, "[light-diag] frame %u target 0x%X %ux%u units %04X blend %u constants %u:", g_ld_frames, toff,
++                        target < g.n_surfaces ? g.surfaces[target].w : 0u, target < g.n_surfaces ? g.surfaces[target].h : 0u, lu,
++                        rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u, g.fp_constants.count);
++                for (u32 ci = 0; ci < g.fp_constants.count && ci < 24u; ci++)
++                    fprintf(stderr, " c%u=(%g %g %g %g)", ci, ld_c2f(g.fp_constants.values[ci][0]), ld_c2f(g.fp_constants.values[ci][1]),
++                            ld_c2f(g.fp_constants.values[ci][2]), ld_c2f(g.fp_constants.values[ci][3]));
++                fprintf(stderr, "\n");
++            }
++        }
++    }
++
+     const u32 vtex_mask = vertex_texture_mask();
+     u32 vtex_slots[SRV_TABLE_SIZE];
+     for (u32 u = 0; u < SRV_TABLE_SIZE; u++)
+@@ -16190,6 +16408,55 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+           g.list->lpVtbl->OMSetStencilRef(g.list, sref);
+           g_ls.sref = sref;
+       } }
++    /* The blend constant colour, dynamic like the stencil reference [GT6 0149]. The factors 0x8001 .. 0x8004 (constant
++     * colour, constant alpha and their inverses) went to D3D12's BLEND_FACTOR / INV_BLEND_FACTOR, and nothing ever set
++     * that factor: it stood at D3D12's own (1, 1, 1, 1) - a constant colour was white, its inverse nothing. Gran
++     * Turismo 6 weights its glare passes with it (func_008C9310: CONSTANT_COLOR, ONE - every pass was added in full),
++     * keeps a running mean with it (func_008CF5B8: CONSTANT_ALPHA, ONE_MINUS_CONSTANT_ALPHA - the newest sample took
++     * the mean's place) and its materials carry one (func_008F65A4).
++     * The colour is NV4097_SET_BLEND_COLOR (0x031C): A8R8G8B8 for an 8-bit target. For a 16-bit float target the
++     * title writes four HALF FLOATS (its own setter FUN_00c3f1e0 converts each float with a float-to-half routine):
++     * red in the low and green in the high half of 0x031C, blue and alpha in those of 0x037C.
++     * D3D12 has one factor for the colour channels: where they ask for the constant ALPHA, alpha goes into all four.
++     * LD_BLEND_CONSTANT=0: as before. LD_BLEND_CONSTANT_GATE=<file>: only while that file exists (an A/B in one run). */
++    { const u32 sfac = rsx_dsp_reg(&g.rsx, 0x0314), dfac = rsx_dsp_reg(&g.rsx, 0x0318);
++      const u32 f4[4] = { sfac & 0xFFFFu, dfac & 0xFFFFu, sfac >> 16, dfac >> 16 };
++      int uses = 0, rgb_alpha = 0, rgb_colour = 0;
++      for (int q = 0; q < 4; q++)
++          if (f4[q] >= 0x8001u && f4[q] <= 0x8004u) {
++              uses = 1;
++              if (q < 2) { if (f4[q] >= 0x8003u) rgb_alpha = 1; else rgb_colour = 1; }
++          }
++      if (uses && (rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u)) {
++          float c[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
++          if (ld_blend_constant_on()) {
++              const u32 bc = rsx_dsp_reg(&g.rsx, 0x031C);
++              if (sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16) {
++                  const u32 bc2 = rsx_dsp_reg(&g.rsx, 0x037C);
++                  c[0] = ld_half_to_float((u16)bc); c[1] = ld_half_to_float((u16)(bc >> 16));
++                  c[2] = ld_half_to_float((u16)bc2); c[3] = ld_half_to_float((u16)(bc2 >> 16));
++              } else {
++                  c[0] = (float)((bc >> 16) & 0xFFu) / 255.0f; c[1] = (float)((bc >> 8) & 0xFFu) / 255.0f;
++                  c[2] = (float)(bc & 0xFFu) / 255.0f; c[3] = (float)(bc >> 24) / 255.0f;
++              }
++              for (int q = 0; q < 4; q++) if (!(c[q] == c[q])) c[q] = 0.0f;       /* (a half NaN) */
++              if (rgb_alpha && !rgb_colour) c[0] = c[1] = c[2] = c[3];
++              g_ld_blend_const.draws++;
++              if (rgb_alpha && rgb_colour) g_ld_blend_const.mixed++;
++              { static u32 told, told_float;
++                const int fl = sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
++                if (fl ? PS3_LOG_FIRST(told_float, 16) : PS3_LOG_FIRST(told, 6)) {
++                    const u32 tg = current_surface();
++                    fprintf(stderr, "[blend-constant] frame %u: factors %04X/%04X (alpha %04X/%04X), target 0x%X format %u, registers "
++                                    "%08X %08X -> (%.4f %.4f %.4f %.4f)\n", g_ld_frames, f4[0], f4[1], f4[2], f4[3],
++                            tg < g.n_surfaces ? g.surfaces[tg].offset : 0u, sf.color_format, bc, rsx_dsp_reg(&g.rsx, 0x037C),
++                            c[0], c[1], c[2], c[3]); } }
++          }
++          if (!ls_ok || !g_ls.have_bf || memcmp(g_ls.bf, c, sizeof c) != 0) {
++              g.list->lpVtbl->OMSetBlendFactor(g.list, c);
++              memcpy(g_ls.bf, c, sizeof c); g_ls.have_bf = 1;
++          }
++      } }
+ 
+     D3D12_VERTEX_BUFFER_VIEW vbv;
+     vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
+@@ -17950,6 +18217,31 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
+             fprintf(stderr, "[dump-raw] %s fmt=%d texel=%u bytes:", path, (int)surface->fmt, texel);
+             for (u32 bi = 0; bi < 16; bi++) fprintf(stderr, " %02X", r0[bi]);
+             fprintf(stderr, "\n");
++            if (fp16 && width <= 64u && height <= 64u) {   /* a small float target: the most of each channel and where */
++                float most[4] = {0, 0, 0, 0}, sum[3] = {0, 0, 0}; u32 at[3][2] = {{0, 0}, {0, 0}, {0, 0}}, lit = 0;
++                for (u32 yy = 0; yy < height; yy++)
++                    for (u32 xx = 0; xx < width; xx++) {
++                        const u8* q = px + (SIZE_T)yy * pitch + xx * 8u;
++                        int any = 0;
++                        for (u32 ch = 0; ch < 4u; ch++) {
++                            const float v = ld_half_to_float((u16)(q[ch * 2u] | (q[ch * 2u + 1u] << 8)));
++                            if (!(v == v)) continue;
++                            if (ch < 3u) { sum[ch] += v; if (v > 0.0f) any = 1; }
++                            if (v > most[ch]) { most[ch] = v; if (ch < 3u) { at[ch][0] = xx; at[ch][1] = yy; } }
++                        }
++                        lit += (u32)any;
++                    }
++                if (path) {                                    /* ... and the halves themselves, row by row, for a look at the values */
++                    char raw[MAX_PATH * 2];
++                    snprintf(raw, sizeof raw, "%s.f16", path);
++                    FILE* rf = fopen(raw, "wb");
++                    if (rf) { for (u32 yy = 0; yy < height; yy++) fwrite(px + (SIZE_T)yy * pitch, 1, (size_t)width * 8u, rf); fclose(rf); }
++                }
++                fprintf(stderr, "[dump-fp16] %s most (%g %g %g | alpha %g) at (%u,%u) (%u,%u) (%u,%u), mean (%g %g %g), %u of %u texels lit\n",
++                        path, most[0], most[1], most[2], most[3], at[0][0], at[0][1], at[1][0], at[1][1], at[2][0], at[2][1],
++                        sum[0] / (float)(width * height), sum[1] / (float)(width * height), sum[2] / (float)(width * height),
++                        lit, width * height);
++            }
+         }
+         FILE* f = g_ld_record_to ? g_ld_record_to : fopen(path, "wb");
+         if (f) {

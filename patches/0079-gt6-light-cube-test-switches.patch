@@ -1,0 +1,91 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 6a647b4..6af6403 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -6544,6 +6544,9 @@ static int surface_cube_window(const rsx_dsp_texture* t)
+ /* (tests) LD_LIGHT_DIAG=1: while the frame-dump gate is open, the fragment constants of the draws that bind such a
+  * cube are written out (the lamps' places and fall-off, which the road's shader divides the cube's value by) */
+ static u32 g_ld_light_units;                       /* the units of the draw being bound that hold such a cube */
++/* (tests) LD_CUBE_FACES_BLINK=1: such cubes on in even frames only (odd frames as before: black) - two frames in a
++ * row are the same place with and without the lamps; the frame dump's line says which (cubes=1 on, 2 held back) */
++static int g_ld_cube_blink_state;
+ static int ld_light_diag_gate(void)
+ {
+     static int on = -1; static const char* gate; static u32 frame = 0xFFFFFFFFu; static int open;
+@@ -6564,8 +6567,10 @@ static int surface_cube_faces(const rsx_dsp_texture* t, u32 target)
+     static const char* tgate; static int tgate_open = 0;
+     /* (tests) LD_CUBE_FACES_FLIP_GATE=<file>: while that file exists each face is filled upside down (row by row) */
+     static const char* fgate; static int fgate_open = 0;
++    static int blink = -1;
+     if (on < 0) { const char* e = getenv("LD_CUBE_FACES"); on = (e && *e == '0') ? 0 : 1; gate = getenv("LD_CUBE_FACES_GATE");
+-                  tgate = getenv("LD_CUBE_FACES_TEST_GATE"); fgate = getenv("LD_CUBE_FACES_FLIP_GATE"); }
++                  tgate = getenv("LD_CUBE_FACES_TEST_GATE"); fgate = getenv("LD_CUBE_FACES_FLIP_GATE");
++                  const char* b = getenv("LD_CUBE_FACES_BLINK"); blink = (b && *b == '1') ? 1 : 0; }
+     if (on && gate_frame != g_ld_frames) {                             /* (tests: only while that file exists - an A/B in one run) */
+         gate_frame = g_ld_frames;
+         if (gate && *gate) { FILE* gf = fopen(gate, "rb"); gate_open = gf != NULL; if (gf) fclose(gf); }
+@@ -6581,6 +6586,7 @@ static int surface_cube_faces(const rsx_dsp_texture* t, u32 target)
+     else if (base == RSX_TEX_FMT_W16Z16Y16X16_FLOAT) fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+     else return -1;
+     const u32 stride = t->pitch * t->height;                           /* a face of one level */
++    if (blink && (g_ld_frames & 1u)) { g_ld_cube_blink_state |= 2; return -1; }   /* (tests, see g_ld_cube_blink_state) */
+     int face[6];
+     u32 gen = 0;
+     int drawing = 0;
+@@ -6683,6 +6689,7 @@ static int surface_cube_faces(const rsx_dsp_texture* t, u32 target)
+         s->swin[k].wgen = gen;
+         g_ld_cube_copies++;
+     }
++    g_ld_cube_blink_state |= 1;
+     return (int)(SRV_SURF_WIN_BASE + (u32)face[0] * LD_SWIN_PER + k);
+ }
+ 
+@@ -16120,18 +16127,20 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         const u32 lu = g_ld_light_units;
+         g_ld_light_units = 0;
+         if (ld_light_diag_gate() && target < g.n_surfaces && g.surfaces[target].w >= 640u) {   /* (the scene itself; the small targets drawn before it used the lines up) */
+-            static u32 frame = 0xFFFFFFFFu, n_frame, n_all, seen_t[8], seen_n[8], n_seen;
+-            if (frame != g_ld_frames) { frame = g_ld_frames; n_frame = 0; n_seen = 0; }
++            /* every such draw of the first frame of each gate opening that has one (a paused race: one frame is the
++             * whole scene), with its PSO key (= LD_HLSL_DUMP's file names) and the textures of units 0 / 1 */
++            static u32 frame = 0xFFFFFFFFu, first_frame = 0xFFFFFFFFu, n_all;
++            if (frame != g_ld_frames) { if (g_ld_frames - frame > 3u) first_frame = g_ld_frames; frame = g_ld_frames; }
+             const u32 toff = target < g.n_surfaces ? g.surfaces[target].offset : 0;
+-            u32 q = 0;
+-            for (; q < n_seen; q++) if (seen_t[q] == toff) break;
+-            if (q == n_seen && n_seen < 8u) { seen_t[n_seen] = toff; seen_n[n_seen] = 0; n_seen++; }
+-            if (q < n_seen && seen_n[q] < 6u && n_frame < 12u && n_all < 480u) {
+-                seen_n[q]++; n_frame++; n_all++;
+-                fprintf(stderr, "[light-diag] frame %u target 0x%X %ux%u units %04X blend %u constants %u:", g_ld_frames, toff,
+-                        target < g.n_surfaces ? g.surfaces[target].w : 0u, target < g.n_surfaces ? g.surfaces[target].h : 0u, lu,
+-                        rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u, g.fp_constants.count);
+-                for (u32 ci = 0; ci < g.fp_constants.count && ci < 24u; ci++)
++            if (g_ld_frames == first_frame && n_all < 900u) {
++                n_all++;
++                rsx_dsp_texture x0, x1; rsx_dsp_get_texture(&g.rsx, 0, &x0); rsx_dsp_get_texture(&g.rsx, 1, &x1);
++                fprintf(stderr, "[light-diag] frame %u target 0x%X %ux%u units %04X blend %u pso %016llx tex0 %u:0x%X/%02X/%ux%u tex1 %u:0x%X/%02X/%ux%u constants %u:",
++                        g_ld_frames, toff, target < g.n_surfaces ? g.surfaces[target].w : 0u, target < g.n_surfaces ? g.surfaces[target].h : 0u, lu,
++                        rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u, (unsigned long long)live_legacy_pso_key(),
++                        x0.location, x0.offset, x0.format & 0xFFu, x0.width, x0.height, x1.location, x1.offset, x1.format & 0xFFu, x1.width, x1.height,
++                        g.fp_constants.count);
++                for (u32 ci = 0; ci < g.fp_constants.count && ci < 40u; ci++)
+                     fprintf(stderr, " c%u=(%g %g %g %g)", ci, ld_c2f(g.fp_constants.values[ci][0]), ld_c2f(g.fp_constants.values[ci][1]),
+                             ld_c2f(g.fp_constants.values[ci][2]), ld_c2f(g.fp_constants.values[ci][3]));
+                 fprintf(stderr, "\n");
+@@ -18601,13 +18610,14 @@ void rsx_live_draw_present(u32 buffer_id)
+         QueryPerformanceCounter(&dump_begin);
+         const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[target]);
+         QueryPerformanceCounter(&dump_end);
+-        fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu qpc_begin_s=%.9f qpc_end_s=%.9f\n", path,
++        fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu qpc_begin_s=%.9f qpc_end_s=%.9f frame=%u cubes=%d\n", path,
+                 g.surfaces[target].w, g.surfaces[target].h,
+                 (unsigned long long)(nb == UINT64_MAX ? 0 : nb),
+                 (double)dump_begin.QuadPart / g_ld_qpc_frequency,
+-                (double)dump_end.QuadPart / g_ld_qpc_frequency);
++                (double)dump_end.QuadPart / g_ld_qpc_frequency, g_ld_frames, g_ld_cube_blink_state);
+         fflush(stderr);
+     }
++    g_ld_cube_blink_state = 0;
+     /* LD_RECORD=<out.mp4> (boot_main's --record): every presented frame, as
+      * PPM, into an ffmpeg pipe -- ffmpeg's image2pipe reads concatenated PPMs
+      * as a stream. Fragmented MP4 so a run that is killed rather than exiting
