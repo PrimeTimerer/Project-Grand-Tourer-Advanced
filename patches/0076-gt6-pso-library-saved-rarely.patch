@@ -1,0 +1,88 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 09bfaf1..2b6d4ce 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2546,7 +2546,7 @@ static void ld_flush(ld_flush_reason reason)
+           memset(g_ld_fp_miss_why, 0, sizeof g_ld_fp_miss_why);
+           memset(g_ld_memo_stats, 0, sizeof g_ld_memo_stats);
+           memset(cnt, 0, sizeof cnt); t0 = now.QuadPart;
+-          ld_pso_library_save(0);   /* new PSOs since the last save, at most every 10 s */
++          ld_pso_library_save(0);   /* new PSOs since the last save, at most every LD_PSO_LIBRARY_SAVE_S (600 s) */
+       } }
+     ld_zq_poll(); ld_zq_before_close(); ld_zq_stats();   /* ZPASS pixel counts [GT6 0056] */
+     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+@@ -8922,7 +8922,8 @@ static u32 vp_txl_unit_mask(const u8* ucode, u32 instrs)
+  * key mixed with its two shader blobs, so a different program or compiler
+  * setting can never load a stale one; any mismatch (driver update, other GPU,
+  * different desc) falls back to a normal build. Saved next to the shader cache
+- * every 10 s while new PSOs arrive and at shutdown. LD_NO_PSO_LIBRARY=1 off. */
++ * at shutdown and, while new PSOs arrive, every LD_PSO_LIBRARY_SAVE_S seconds
++ * (ld_pso_library_save_every). LD_NO_PSO_LIBRARY=1 off. */
+ static ID3D12PipelineLibrary* g_pso_lib = NULL;
+ static void* g_pso_lib_blob = NULL;           /* must outlive the library */
+ static int g_pso_lib_state = 0;               /* 0 untried, 1 ready, -1 unavailable */
+@@ -8935,6 +8936,15 @@ static void ld_pso_library_path(char* out, size_t cap)
+     snprintf(out, cap, "%s\\pso_library_v1.bin", g_ld_shader_disk_dir);
+ }
+ 
++/* [GT6 0147] The save at the process's end. rsx_live_draw_shutdown has no caller in this port, so "at shutdown" never
++ * happened: the periodic save was the only one. A normal end - the window closed or the game's own exit - goes
++ * through the C library's exit() (cellSysutil.c host_quit_thread, sys_process_exit), which runs this. A killed
++ * process does not; the periodic save bounds what the library misses then, and the single pipeline files hold it. */
++static void ld_pso_library_atexit(void)
++{
++    ld_pso_library_save(1);
++}
++
+ static void ld_pso_library_init(void)
+ {
+     if (g_pso_lib_state) return;
+@@ -8968,6 +8978,7 @@ static void ld_pso_library_init(void)
+         return;
+     }
+     g_pso_lib_state = 1;
++    atexit(ld_pso_library_atexit);
+     fprintf(stderr, "[pso-library] %s (%zu bytes) from '%s'\n", size ? "loaded" : "new", size, path);
+ }
+ 
+@@ -9015,6 +9026,28 @@ static DWORD WINAPI ld_pso_library_save_thread(LPVOID arg)
+     return 0;
+ }
+ 
++/* [GT6 0147] How often the library file is written while the game runs. A save writes the WHOLE library, and
++ * Gran Turismo 6's had grown from the 50-60 MB above to 390-408 MB: at "every 10 s while new pipeline states arrive"
++ * one 29-minute session with 348 new states wrote it 28 times - 10.6 GB - and every short session twice (the first
++ * new state at once, the next ten seconds later). Each pipeline state is also kept as a file of its own
++ * (pipelines_v1), which the start's prewarm builds from, so the library only makes the next start faster: it is now
++ * written at shutdown, and while running at most every LD_PSO_LIBRARY_SAVE_S seconds (600 by default; counted from
++ * the first new state, not written at it; 0 = at shutdown only, 10 = as it was). */
++static LONGLONG ld_pso_library_save_every(LONGLONG qpc_frequency)
++{
++    static int secs = -1;
++    if (secs < 0) {
++        const char* e = getenv("LD_PSO_LIBRARY_SAVE_S");
++        secs = (e && *e) ? atoi(e) : 600;
++        if (secs < 0) secs = 0;
++        if (secs != 600)
++            fprintf(stderr, "[pso-library] LD_PSO_LIBRARY_SAVE_S=%d: %s\n", secs,
++                    secs ? "the file is written at most that often while running, and at shutdown"
++                         : "the file is written at shutdown only");
++    }
++    return (LONGLONG)secs * qpc_frequency;
++}
++
+ static void ld_pso_library_save(int force)
+ {
+     if (g_pso_lib_state != 1) return;
+@@ -9031,7 +9064,10 @@ static void ld_pso_library_save(int force)
+     }
+     if (g_pso_lib_gen == g_pso_lib_saved_gen) return;
+     LARGE_INTEGER now, f; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
+-    if (g_pso_lib_saved_qpc && now.QuadPart - g_pso_lib_saved_qpc < 10 * f.QuadPart) return;
++    const LONGLONG every = ld_pso_library_save_every(f.QuadPart);
++    if (!every) return;                                                        /* at shutdown only */
++    if (!g_pso_lib_saved_qpc) { g_pso_lib_saved_qpc = now.QuadPart; return; }  /* the first new state starts the clock */
++    if (now.QuadPart - g_pso_lib_saved_qpc < every) return;
+     if (InterlockedCompareExchange(&g_pso_lib_saving, 1, 0) != 0) return;      /* the last one is still running */
+     g_pso_lib_saved_qpc = now.QuadPart;
+     HANDLE t = sync ? NULL : CreateThread(NULL, 0, ld_pso_library_save_thread, NULL, 0, NULL);
