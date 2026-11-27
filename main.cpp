@@ -522,12 +522,17 @@ static void ab_start(void)
     ab_apply_spu();
     const char* e = getenv("GT6_AB");
     if (!e || !*e) return;
+    /* The older form of GT6_AB, "<s>:<name>=<value>[,...][/<s>:...]" (gt6_ab_tick above: switches set at given seconds),
+     * is the same variable: a value with ':' in it is that form, and this one leaves it alone (and gt6_ab_tick finds
+     * no "<s>:" in a value of this form, so each ignores the other's). */
+    if (strchr(e, ':')) return;
     unsigned mask = 0;
     if (e[0] == '0' && (e[1] == 'x' || e[1] == 'X')) mask = (unsigned)strtoul(e + 2, NULL, 16);
     else {
         static const struct { const char* name; unsigned bit; } names[] = {
             {"ra", PS3_AB_RA_CACHE}, {"hle", PS3_AB_HLE_SLOT}, {"pump", PS3_AB_PUMP_PEEK}, {"lockline", PS3_AB_LOCKLINE},
-            {"lsvec", PS3_AB_SPU_LS_VEC}, {"cg", PS3_AB_SPU_CG}};
+            {"lsvec", PS3_AB_SPU_LS_VEC}, {"cg", PS3_AB_SPU_CG}, {"live", PS3_AB_LIVE_HOLDERS},
+            {"cull", 0x0080u}};   /* [GT6 0168] the native cull of the car vertex job (gt6_native_cull.c, GT6_NATIVE_CULL) */
         char buf[256];
         strncpy(buf, e, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
         for (char* t = strtok(buf, ",; "); t; t = strtok(NULL, ",; ")) {

@@ -157,6 +157,10 @@ if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
         list(LENGTH JOBMOD_LIFTED JOBMOD_COUNT)
         message(STATUS "Lifted SPU jobs: ${JOBMOD_COUNT} module(s)")
         list(APPEND SPU_SOURCES ${JOBMOD_LIFTED} "${CMAKE_CURRENT_SOURCE_DIR}/spu_jobs/jobmods_register.c")
+        # [GT6 0168] the car vertex job's cull + pack (module 9039b3cc346b, 0x13D20) as native code; the lifted
+        # function calls it first (tools/native_cull_hook.py puts that call in). On by default; GT6_NATIVE_CULL=0 off,
+        # GT6_AB=cull for an in-run A/B.
+        list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/gt6_native_cull.c")
     endif()
     # The job manager itself (the WWS job manager policy module all eight PDI workloads run): its body lifted by
     # tools/lift_policy_module.py into spu_policy/ - a directory of its own, so adding or re-lifting it compiles two

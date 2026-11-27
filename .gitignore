@@ -15,6 +15,7 @@
 !/app.rc
 !/app.ico
 !/*.cpp
+!/*.c
 !/*.h
 !/*.inc
 !/build_launcher.bat

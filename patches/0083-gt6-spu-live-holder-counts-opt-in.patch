@@ -1,0 +1,205 @@
+diff --git a/include/ps3emu/ps3_ab.h b/include/ps3emu/ps3_ab.h
+index 55c3791..7e31482 100644
+--- a/include/ps3emu/ps3_ab.h
++++ b/include/ps3emu/ps3_ab.h
+@@ -25,6 +25,7 @@ extern volatile unsigned g_ps3_ab_gen;     /* bumped at every flip */
+ #define PS3_AB_LOCKLINE   0x0008u   /* SPU_LOCKLINE_SLEEP  ([GT6 0163], spu_coherency.c) */
+ #define PS3_AB_SPU_LS_VEC 0x0010u   /* g_spu_ls_vec ([GT6 0161]) - only in a GT6_SPU_LS_VEC=AB build ([GT6 0165]) */
+ #define PS3_AB_SPU_CG     0x0020u   /* g_spu_cg_on  ([GT6 0159]) - only in a GT6_SPU_CG_HELPERS=AB build ([GT6 0165]) */
++#define PS3_AB_LIVE_HOLDERS 0x0040u /* the live-holder skip ([GT6 0166], spu_coherency.c; counting runs in both phases) */
+ 
+ static inline int ps3_ab_on(unsigned bit, int env_on)
+ {
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 7a69ba5..dc07b41 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1127,6 +1127,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+         if (ring_rec) ring_rec->verdict = (uint8_t)ctx->atomic_stat;
+         ctx->resv_valid = 0;                           /* reservation consumed */
++        spu_coh_live_end(ctx);                         /* [GT6 0166] its live-holder count ends here */
+         spu_lockline_unlock();
+         if (ctx->atomic_stat == 0) {
+             spu_taskset_line_committed(ea & ~127u);
+@@ -1147,6 +1148,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+          * has already overwritten. */
+         spu_coh_notify_write(ea);
+         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
++        spu_coh_live_end(ctx);                         /* [GT6 0166] its live-holder count ends here */
+         spu_lockline_unlock();
+         spu_taskset_line_committed(ea & ~127u);
+         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index d9f7e0f..0f5b6ff 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -156,6 +156,89 @@ unsigned long g_spu_lr_raise = 0;
+ 
+ static void spu_coh_mark_added(uint32_t line_addr);   /* "Marks that expire", at the end of this file */
+ 
++/* ===========================================================================
++ * [GT6 0166, 2026-11-27] Live holder counts - upstream ps3recomp ef4c804c (v0.20, MIT), PS3RECOMP_SPU_LIVE_HOLDERS=1
++ * (default off), adapted to this file's list of holders and its marks that expire.
++ *
++ * Once any SPU has reserved a line, every later write to it -- PPU stores and store-conditionals, MFC puts, PUTLLC
++ * commits -- walks every registered context under the lock-line lock to raise lost-reservation events, although
++ * usually no SPU holds that line any more. GT6's sample (pb1on, 2026-11-27): spu_coh_notify_write 0.30 ms a frame on
++ * the render thread alone, ppu_resv_break_line 0.25, and the walk is held under the one lock-line lock every SPU
++ * atomic takes.
++ *
++ * On, each context counts itself in s_coh_live for the line of its GETLLAR, before it reads the line, and stays
++ * counted until its reservation ends on its own thread (PUTLLC either way, PUTLLUC, a GETLLAR of another line,
++ * unregister). A reservation another agent takes away stays counted until then, so a line's count is never below the
++ * number of contexts holding it. A notify that finds the count at zero does everything else as before -- the PPU
++ * reservation break, the watch wakes -- and skips only the holder walk. The lock-line lock is still taken by every
++ * such write.
++ *
++ * Why skipping is safe (upstream's argument). A GETLLAR on the lock-free path (spu_coh_reserve_fast) raises the
++ * count, then issues the seq_cst fence that already separates publishing its reservation from copying the line. A
++ * notify runs after the write and spu_coh_writer_fence(), and only then reads the count. Of the two seq_cst fences one
++ * comes first, so either the notify sees the increment (and walks), or the GETLLAR's copy already holds the write. A
++ * count only drops on the owner's thread after its reservation was consumed, and each decrement follows that
++ * context's own increment in the counter's modification order. The locked GETLLAR (spu_coh_reserve) counts under the
++ * lock-line lock every notifier holds. Lines share counters (a hashed table), which only keeps the walk.
++ *
++ * GT6's in-run A/B (ps3emu/ps3_ab.h, GT6_AB=live): the counting runs in both phases (so the counts stay true across
++ * a flip) and only the skip follows the phase.
++ * ===========================================================================*/
++#define SPU_COH_LIVE_SLOTS 65536u
++static uint32_t s_coh_live[SPU_COH_LIVE_SLOTS];
++static int s_coh_live_env = -1;
++unsigned long g_spu_coh_live_skips;
++
++int spu_coh_live_enabled(void)
++{
++    int on = __atomic_load_n(&s_coh_live_env, __ATOMIC_RELAXED);
++    if (__builtin_expect(on < 0, 0)) {
++        const char* e = getenv("PS3RECOMP_SPU_LIVE_HOLDERS");
++        on = e && e[0] == '1' && !e[1];
++        __atomic_store_n(&s_coh_live_env, on, __ATOMIC_RELAXED);
++        if (on || (g_ps3_ab_mask & PS3_AB_LIVE_HOLDERS)) {
++            fprintf(stderr, "[spu-coh] live reservation holder counts on%s\n",
++                    (g_ps3_ab_mask & PS3_AB_LIVE_HOLDERS) ? " (the skip in the in-run A/B's phase B only)" : "");
++            fflush(stderr);
++        }
++    }
++    return on || (g_ps3_ab_mask & PS3_AB_LIVE_HOLDERS) != 0;
++}
++
++static inline uint32_t* spu_coh_live_slot(uint32_t ea)
++{
++    return &s_coh_live[(ea >> SPU_COH_LINE_SHIFT) & (SPU_COH_LIVE_SLOTS - 1u)];
++}
++
++void spu_coh_live_end(spu_context* c)
++{
++    if (!c || !c->coh_live_counted) return;
++    c->coh_live_counted = 0;
++    __atomic_fetch_sub(spu_coh_live_slot(c->coh_live_line), 1u, __ATOMIC_RELEASE);
++}
++
++/* Owner thread, at a GETLLAR, before the line is read. */
++static void spu_coh_live_begin(spu_context* c, uint32_t ea)
++{
++    if (!c || !spu_coh_live_enabled()) return;
++    const uint32_t line = ea & ~127u;
++    if (c->coh_live_counted && c->coh_live_line == line) return;
++    spu_coh_live_end(c);
++    __atomic_fetch_add(spu_coh_live_slot(line), 1u, __ATOMIC_SEQ_CST);
++    c->coh_live_line = line;
++    c->coh_live_counted = 1;
++}
++
++/* After the writer's fence: may this notify skip the holder walk? */
++static inline int spu_coh_live_idle(uint32_t line)
++{
++    if (!spu_coh_live_enabled()) return 0;
++    if ((g_ps3_ab_mask & PS3_AB_LIVE_HOLDERS) && !g_ps3_ab_phase) return 0;   /* the A/B's phase A: walk as before */
++    if (__atomic_load_n(spu_coh_live_slot(line), __ATOMIC_RELAXED) != 0) return 0;
++    __atomic_fetch_add(&g_spu_coh_live_skips, 1ul, __ATOMIC_RELAXED);
++    return 1;
++}
++
+ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+ {
+     /* Read before writing. The kernel reserves the same few lines over and
+@@ -172,6 +255,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+         g_spu_coh_bits = s_coh_bitmap;
+ 
+     if (!ctx) return;
++    spu_coh_live_begin(ctx, ea);   /* [GT6 0166] counted before the caller reads the line */
+     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
+         if (entry->ctx == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
+     spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
+@@ -242,6 +326,7 @@ void spu_coh_unregister(spu_context* ctx)
+         break;
+     }
+     __atomic_store_n(&ctx->coh_listed, 0, __ATOMIC_RELAXED);
++    spu_coh_live_end(ctx);         /* [GT6 0166] */
+     spu_lockline_unlock();
+ }
+ 
+@@ -356,7 +441,9 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
+         !spu_coh_is_reserved(ea))
+         return 0;
+     /* Retire any older reservation before retargeting it. The fence is what
+-     * the argument above rests on. */
++     * the argument above rests on, and what orders the live count ([GT6 0166],
++     * raised here, before it) against the caller's copy of the line. */
++    spu_coh_live_begin(ctx, ea);
+     __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
+     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
+     __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
+@@ -376,6 +463,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
+     ppu_resv_break_line(ea);
+     spu_coh_writer_fence();
+     spu_coh_wake_watches(line);
++    if (spu_coh_live_idle(line)) return;   /* [GT6 0166] no SPU can hold this line now */
+     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
+         spu_context* c = entry->ctx;
+         if (!c || (const void*)c == self) continue;
+@@ -438,6 +526,7 @@ void spu_coh_notify_write(uint32_t ea)
+     ppu_resv_break_line(ea);
+     spu_coh_writer_fence();
+     spu_coh_wake_watches(line);
++    if (spu_coh_live_idle(line)) return;   /* [GT6 0166] no SPU can hold this line now */
+     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
+         spu_context* c = entry->ctx;
+         if (!c) continue;
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index ea2e835..40ed06d 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -61,6 +61,15 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea);
+  * lookup guarded by a global that is zero until the first GETLLAR. */
+ int spu_coh_is_reserved(uint32_t addr);
+ 
++/* [GT6 0166] live-holder counts (upstream ps3recomp ef4c804c, MIT): PS3RECOMP_SPU_LIVE_HOLDERS=1 (default off) counts,
++ * per line, the contexts that may hold a reservation on it, so a write to a line no SPU holds now skips the walk over
++ * every registered context. spu_coh_reserve and spu_coh_reserve_fast count the caller; the caller ends the count with
++ * spu_coh_live_end on its own thread once its reservation is consumed (PUTLLC either way, PUTLLUC). Off, all three are
++ * no-ops. In GT6's in-run A/B (GT6_AB=live) the counting runs all the time and only the skip follows the phase. */
++int  spu_coh_live_enabled(void);
++void spu_coh_live_end(spu_context* ctx);
++extern unsigned long g_spu_coh_live_skips;   /* notifies that skipped the walk */
++
+ /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
+  * whose live reservation covers it, drop that reservation, and wake the host
+  * thread in case it is parked in `rdch SPU_RdEventStat`.
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 09f8848..e3e6c68 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -438,6 +438,11 @@ typedef struct spu_context {
+      * spu_coh_reserve_fast). Written under that lock, read by the context's
+      * own thread. */
+     int coh_listed;
++
++    /* [GT6 0166] live-holder counts (spu_coherency.c, upstream ps3recomp ef4c804c): the line this context is counted
++     * on, from its GETLLAR until its reservation ends on this thread. Owner thread only. */
++    uint32_t coh_live_line;
++    int coh_live_counted;
+ } spu_context;
+ 
+ /* event_status is written from more than one host thread: the SPU's own
