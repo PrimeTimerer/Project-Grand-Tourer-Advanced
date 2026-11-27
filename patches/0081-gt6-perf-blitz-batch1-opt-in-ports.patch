@@ -1,0 +1,352 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index ae6efea..a744c66 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -883,6 +883,14 @@ void* ppu_gcm_wait_pump(void (**pump)(void))
+ 
+ void ppu_gcm_pump(void)
+ {
++    /* [GT6 0162, 2026-11-27] from upstream ps3recomp cd926aa1 (v0.19, MIT): every HLE call and timer sleep pumps, tens
++     * of thousands of times a second, and almost always nothing is pending. Look before taking the pump and swapping
++     * the pending words out (three atomic operations on lines the ticker thread writes). A notification posted just
++     * after this read is delivered by the next pump, as one posted while another thread holds the pump is.
++     * OFF unless GCM_PUMP_PEEK=1 (no look, as before) - not measurably better in GT6's reference scene. */
++    { static int peek = -1;
++      if (peek < 0) { const char* e = getenv("GCM_PUMP_PEEK"); peek = (e && *e == '1') ? 1 : 0; }
++      if (peek && !s_gcm_pending && !s_user_pending) return; }
+     if (!GCM_PUMP_TRY_ENTER()) return;
+     long p = (long)GCM_PENDING_TAKE();
+     u64 user = GCM_USER_PENDING_TAKE();
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 86d05c5..778305d 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -50,6 +50,38 @@ typedef void (*hle_ctx_fn)(ppu_context*);
+ static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
+ static uint32_t g_ctx_count = 0;
+ 
++/* [GT6 0162, 2026-11-27] NID -> handler, per calling thread - from upstream ps3recomp cd926aa1 (v0.19, MIT). Both
++ * tables are searched linearly on every call that hle_fast() does not take: g_ctx (a hundred-odd entries) and
++ * g_hle_nids (over a thousand; ps3_nid_table_find is a linear scan). Upstream: God of War HD makes ~95k HLE calls a
++ * second, ps3_hle_call 6.5 -> 1.5 % of its main thread. A slot keeps the indexes and the table sizes it was filled
++ * against, so a registration made after the first call is still found; per thread, so no slot is read half-written.
++ * OFF unless PPU_HLE_SLOT=1 (the scans every call, as before): GT6's hot imports go through hle_fast() above, and
++ * ps3_hle_call does not show among the reference scene's costs (see ppu_prof_resolve_host in ppu_loader.cpp). */
++struct HleSlot { uint32_t nid, ctx_n, tab_n; int32_t ctx_i, tab_i; };
++static thread_local HleSlot t_hle_slot[1024];
++static int hle_slot_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PPU_HLE_SLOT"); on = (e && *e == '1') ? 1 : 0; }
++    return on;
++}
++static const HleSlot* hle_slot(uint32_t nid)
++{
++    HleSlot* s = &t_hle_slot[(nid * 2654435761u) >> 22];
++    const uint32_t ctx_n = g_ctx_count, tab_n = g_hle_inited ? g_hle_nids.count : 0;
++    if (s->nid != nid || s->ctx_n != ctx_n || s->tab_n != tab_n || (!s->ctx_n && !s->tab_n)) {
++        s->ctx_i = s->tab_i = -1;
++        for (uint32_t i = 0; i < ctx_n; i++)
++            if (g_ctx[i].nid == nid) { s->ctx_i = (int32_t)i; break; }
++        if (s->ctx_i < 0 && tab_n) {
++            const ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
++            if (e) s->tab_i = (int32_t)(e - g_hle_nids.entries);
++        }
++        s->nid = nid; s->ctx_n = ctx_n; s->tab_n = tab_n;
++    }
++    return s;
++}
++
+ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
+ {
+     if (g_ctx_count < HLE_CTX_CAP) {
+@@ -710,8 +742,13 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+         }
+     }
+ 
+-    for (uint32_t i = 0; i < g_ctx_count; i++)
+-        if (g_ctx[i].nid == nid) {
++    /* [GT6 0162] the per-thread slot instead of the two linear scans with PPU_HLE_SLOT=1 (off: the scans). */
++    const HleSlot* hs = hle_slot_on() ? hle_slot(nid) : nullptr;
++    int32_t hci = -1;
++    if (hs) hci = hs->ctx_i;
++    else for (uint32_t i = 0; i < g_ctx_count; i++) if (g_ctx[i].nid == nid) { hci = (int32_t)i; break; }
++    if (hci >= 0) {
++            const uint32_t i = (uint32_t)hci;
+             /* PS3_HLE_TOP counts these too: the handlers registered with a context are the file, lock and thread
+              * calls - what a thread that spins in the game's own file layer is calling. */
+             { static long s_ht2 = -1;
+@@ -737,7 +774,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+             return;
+         }
+ 
+-    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
++    ps3_nid_entry* e = hs ? (hs->tab_i >= 0 ? &g_hle_nids.entries[hs->tab_i] : nullptr)
++                          : (g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr);
+     if (!e || !e->handler) {
+         /* Recorded before the diagnostic paths below, several of which return
+          * early. An import moving between resolved and unresolved is exactly the
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 61955e1..1bc0de9 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2829,7 +2829,28 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
+  * Built lazily on first use (registration is boot-time-only). */
+ static struct { void* host; uint32_t guest; } g_inv[PPU_HASH_SIZE];
+ static uint32_t g_inv_n = 0;
++static uint32_t ppu_prof_resolve_host_slow(void* ra);
++/* [GT6 0160, 2026-11-27] from upstream ps3recomp 86353eb3 (v0.19, MIT): every HLE call (ppu_hle.cpp) and lv2 syscall
++ * stamps its caller for the sampling profiler through the binary search below, which missed the cache on most of its
++ * steps - a third of lv2_syscall in God of War HD (upstream: lv2_syscall 2.2 -> 1.0 % of its main thread). Call sites
++ * are few, so each thread keeps its last answer per site; the inverse table is built once, so an answer never goes
++ * stale. OFF unless PPU_RA_CACHE=1: in GT6's reference scene (16-car pack, sampled b7 / pb1on / pb1off on
++ * 2026-11-27) neither this nor ps3_hle_call shows up among the threads' costs, and the run with the four ports of
++ * [GT6 0160] .. [GT6 0163] on was not faster (41.4 vs 45.4 fps at the start, within a scene that varies run to run). */
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PPU_RA_CACHE"); on = (e && *e == '1') ? 1 : 0; }
++    if (!on) return ppu_prof_resolve_host_slow(ra);
++    struct RaSlot { void* ra; uint32_t guest; };
++    static PPU_THREAD_LOCAL RaSlot t_ra[256];
++    RaSlot& slot = t_ra[((uintptr_t)ra >> 2) & 255u];
++    if (slot.ra == ra && g_inv_n) return slot.guest;
++    const uint32_t g = ppu_prof_resolve_host_slow(ra);
++    if (g_inv_n) { slot.ra = ra; slot.guest = g; }
++    return g;
++}
++static uint32_t ppu_prof_resolve_host_slow(void* ra)
+ {
+     if (!g_inv_n) {
+         for (uint32_t i = 0; i < PPU_HASH_SIZE; i++)
+diff --git a/runtime/spu/spu_codegen_helpers.h b/runtime/spu/spu_codegen_helpers.h
+new file mode 100644
+index 0000000..ccef21e
+--- /dev/null
++++ b/runtime/spu/spu_codegen_helpers.h
+@@ -0,0 +1,85 @@
++/* spu_codegen_helpers.h - SSE4.1 forms of the SPU integer helpers that spu_helpers.h still does with scalar
++ * code: nand nor andc orc, cbd chd cdd cbx chx cdx (the controls for a byte / halfword / doubleword insertion),
++ * shli shlhi rotmi rotmhi (word / halfword shifts by an immediate) and rotqmbii. Integer only - no floating-point
++ * behaviour changes - and bit-identical to the functions they replace (tests/test_spu_cg_helpers.c compares them for
++ * every position and shift count). The originals stay callable as (spu_name)(...).
++ *
++ * [GT6 0159, 2026-11-27] Taken from Project Tourline 5 (github.com/mathewdouglas/Project-Tourline-5,
++ * runtime/spu/spu_codegen_helpers.h in patches/ps3recomp-5244db9-local.patch, commit 7590da8), which measured
++ * +3.7 % (HSR) / +5.6 % (Eiger) frame rate on Gran Turismo 5 with it; that file was "informed by MormonFTP-hub/gt5-recomp
++ * 1590f03". Kept as it was there, except: cwd / cwx / shlqbii / rotqbii are left to spu_helpers.h, which has SSE forms
++ * of them already, and the switch is GT6's (the SPU sources get SPU_CODEGEN_HELPERS from CMake, GT6_SPU_CG_HELPERS).
++ *
++ * Its licence (MIT):
++ *   Copyright (c) 2026 Ned Heller / sp00nznet
++ *   Copyright (c) 2026 Ryan Bagas (DMA fast paths adapted from Ascension-R)
++ *   Copyright (c) 2026 MormonFTP-hub (SPU code generation experiment references)
++ *
++ *   Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
++ *   documentation files (the "Software"), to deal in the Software without restriction, including without limitation the
++ *   rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit
++ *   persons to whom the Software is furnished to do so, subject to the following conditions:
++ *
++ *   The above copyright notice and this permission notice shall be included in all copies or substantial portions of the
++ *   Software.
++ *
++ *   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
++ *   WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
++ *   COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
++ *   OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Included at the end of spu_helpers.h, after every original. */
++#ifndef SPU_CODEGEN_HELPERS_H
++#define SPU_CODEGEN_HELPERS_H
++#if defined(SPU_CODEGEN_HELPERS) && defined(__SSE4_1__)
++#include <smmintrin.h>
++static inline __m128i spu_cg_load(u128 a) { __m128i r; memcpy(&r, &a, 16); return r; }
++static inline u128 spu_cg_store(__m128i a) { u128 r; memcpy(&r, &a, 16); return r; }
++static inline u128 spu_cg_nand(u128 a, u128 b) { return spu_cg_store(_mm_xor_si128(_mm_and_si128(spu_cg_load(a), spu_cg_load(b)), _mm_set1_epi32(-1))); }
++static inline u128 spu_cg_nor(u128 a, u128 b) { return spu_cg_store(_mm_xor_si128(_mm_or_si128(spu_cg_load(a), spu_cg_load(b)), _mm_set1_epi32(-1))); }
++static inline u128 spu_cg_andc(u128 a, u128 b) { return spu_cg_store(_mm_andnot_si128(spu_cg_load(b), spu_cg_load(a))); }
++static inline u128 spu_cg_orc(u128 a, u128 b) { return spu_cg_store(_mm_or_si128(spu_cg_load(a), _mm_xor_si128(spu_cg_load(b), _mm_set1_epi32(-1)))); }
++static inline __m128i spu_cg_base(void) { return _mm_setr_epi32(0x10111213, 0x14151617, 0x18191A1B, 0x1C1D1E1F); }
++static inline u128 spu_cg_cbd_pos(int p) {
++    __m128i m = _mm_cmpeq_epi8(_mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), _mm_set1_epi8((char)((p & 15) ^ 3)));
++    return spu_cg_store(_mm_blendv_epi8(spu_cg_base(), _mm_set1_epi8(3), m));
++}
++static inline u128 spu_cg_chd_pos(int p) {
++    __m128i m = _mm_cmpeq_epi16(_mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7), _mm_set1_epi16((short)(((p & 15) >> 1) ^ 1)));
++    return spu_cg_store(_mm_blendv_epi8(spu_cg_base(), _mm_set1_epi16(0x0203), m));
++}
++static inline u128 spu_cg_cdd_pos(int p) {
++    __m128i m = _mm_cmpeq_epi64(_mm_set_epi64x(1, 0), _mm_set1_epi64x((p >> 3) & 1));
++    return spu_cg_store(_mm_blendv_epi8(spu_cg_base(), _mm_set1_epi64x(0x0405060700010203LL), m));
++}
++static inline u128 spu_cg_cbd(u128 a, int i) { return spu_cg_cbd_pos((int)(a._u32[0] + (uint32_t)i)); }
++static inline u128 spu_cg_chd(u128 a, int i) { return spu_cg_chd_pos((int)(a._u32[0] + (uint32_t)i)); }
++static inline u128 spu_cg_cdd(u128 a, int i) { return spu_cg_cdd_pos((int)(a._u32[0] + (uint32_t)i)); }
++static inline u128 spu_cg_cbx(u128 a, u128 b) { return spu_cg_cbd_pos((int)(a._u32[0] + b._u32[0])); }
++static inline u128 spu_cg_chx(u128 a, u128 b) { return spu_cg_chd_pos((int)(a._u32[0] + b._u32[0])); }
++static inline u128 spu_cg_cdx(u128 a, u128 b) { return spu_cg_cdd_pos((int)(a._u32[0] + b._u32[0])); }
++static inline u128 spu_cg_shli(u128 a, int s) { return spu_cg_store(_mm_sll_epi32(spu_cg_load(a), _mm_cvtsi32_si128(s & 63))); }
++static inline u128 spu_cg_shlhi(u128 a, int s) { return spu_cg_store(_mm_sll_epi16(spu_cg_load(a), _mm_cvtsi32_si128(s & 31))); }
++static inline u128 spu_cg_rotmi(u128 a, int s) { return spu_cg_store(_mm_srl_epi32(spu_cg_load(a), _mm_cvtsi32_si128((0u - (unsigned)s) & 63))); }
++static inline u128 spu_cg_rotmhi(u128 a, int s) { return spu_cg_store(_mm_srl_epi16(spu_cg_load(a), _mm_cvtsi32_si128((0u - (unsigned)s) & 31))); }
++static inline u128 spu_cg_rotqmbii(u128 a, int s) {
++    __m128i A = spu_cg_load(a); s = (0u - (unsigned)s) & 7;
++    return spu_cg_store(_mm_or_si128(_mm_srl_epi32(A, _mm_cvtsi32_si128(s)), _mm_sll_epi32(_mm_slli_si128(A, 4), _mm_cvtsi32_si128(32 - s))));
++}
++#define spu_nand(...) spu_cg_nand(__VA_ARGS__)
++#define spu_nor(...) spu_cg_nor(__VA_ARGS__)
++#define spu_andc(...) spu_cg_andc(__VA_ARGS__)
++#define spu_orc(...) spu_cg_orc(__VA_ARGS__)
++#define spu_cbd(...) spu_cg_cbd(__VA_ARGS__)
++#define spu_chd(...) spu_cg_chd(__VA_ARGS__)
++#define spu_cdd(...) spu_cg_cdd(__VA_ARGS__)
++#define spu_cbx(...) spu_cg_cbx(__VA_ARGS__)
++#define spu_chx(...) spu_cg_chx(__VA_ARGS__)
++#define spu_cdx(...) spu_cg_cdx(__VA_ARGS__)
++#define spu_shli(...) spu_cg_shli(__VA_ARGS__)
++#define spu_shlhi(...) spu_cg_shlhi(__VA_ARGS__)
++#define spu_rotmi(...) spu_cg_rotmi(__VA_ARGS__)
++#define spu_rotmhi(...) spu_cg_rotmhi(__VA_ARGS__)
++#define spu_rotqmbii(...) spu_cg_rotqmbii(__VA_ARGS__)
++#endif
++#endif /* SPU_CODEGEN_HELPERS_H */
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 294a77a..86e69eb 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -40,13 +40,25 @@ static volatile long g_lockline = 0;
+  * pause, and yield after a long wait. The bare exchange loop let GH3's four
+  * idle job-policy pollers saturate the line and delay every other SPU atomic
+  * -- FMOD's mixer task among them, 25-40 ms at a time. */
++/* [GT6 0163, 2026-11-27] from upstream ps3recomp 61186bef (v0.19, MIT): after ~1 ms of spinning (six rounds of 4096
++ * pauses) the waiter sleeps instead. SwitchToThread only hands the core to a thread queued on this same processor,
++ * and Sleep(0) only to one of equal or higher priority -- neither reaches a lower-priority holder that is waiting for
++ * a core. With every core busy, waiters above the holder's priority could keep it off the CPU for tens of
++ * milliseconds. A normal wait is far under a microsecond and never gets here. OFF unless SPU_LOCKLINE_SLEEP=1 (the
++ * plain spin, as before): a Sleep(1) in the middle of a frame costs a whole timer tick, and GT6's reference scene
++ * was not faster with it. */
+ void spu_lockline_lock(void)
+ {
+-    unsigned spins = 0;
++    static int s_sleep = -1;
++    unsigned spins = 0, rounds = 0;
+     while (_InterlockedExchange(&g_lockline, 1)) {
++        if (s_sleep < 0) { const char* e = getenv("SPU_LOCKLINE_SLEEP"); s_sleep = (e && e[0] == '1'); }
+         do {
+             _mm_pause();
+-            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
++            if (++spins >= 4096) {
++                spins = 0;
++                if (rounds++ < 6 || !s_sleep) SwitchToThread(); else Sleep(1);
++            }
+         } while (g_lockline);
+     }
+ }
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 06bdc6b..d8e13a4 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -561,6 +561,21 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
+ #if defined(__ARM_NEON)
+ #include <arm_neon.h>     /* the quadword swap is one rev32 */
+ #endif
++/* [GT6 0161, 2026-11-27] SPU_LS_VEC, from upstream ps3recomp 69310015 (v0.19, MIT): the quadword as one 16-byte load or
++ * store and one pshufb that byte-swaps each word. The four 32-bit stores of SPU_LS_FAST, read back by the next 16-byte
++ * load of the register, cannot be store-forwarded: a stall on every lqd / lqx / stqd of lifted code. Opt-in here
++ * (upstream has it on with SSSE3): GT6's CMake option GT6_SPU_LS_VEC passes SPU_LS_VEC=1 to the lifted SPU sources and
++ * the runtime; without it the old form stays. */
++#if defined(SPU_LS_VEC) && SPU_LS_VEC && (defined(__ARM_NEON) || !defined(__SSSE3__) || !(defined(__x86_64__) || defined(_M_X64)))
++#undef SPU_LS_VEC
++#define SPU_LS_VEC 0
++#endif
++#if defined(SPU_LS_VEC) && SPU_LS_VEC
++#include <tmmintrin.h>
++static inline __m128i spu_ls_bswap_words(__m128i x) {
++    return _mm_shuffle_epi8(x, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
++}
++#endif
+ 
+ /* Debug probes of spu_ls_read128/write128, out of line: inlined they kept
+  * every LS load a real call (~10% of GH3's FMOD mixer task).
+@@ -656,6 +671,8 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+     const uint8_t* p = &ctx->ls[lsa];
+ #if defined(__ARM_NEON)
+     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
++#elif defined(SPU_LS_VEC) && SPU_LS_VEC
++    _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)p)));
+ #elif SPU_LS_FAST
+     uint32_t w0, w1, w2, w3;
+     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
+@@ -753,6 +770,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+     uint8_t* p = &ctx->ls[lsa];
+ #if defined(__ARM_NEON)
+     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
++#elif defined(SPU_LS_VEC) && SPU_LS_VEC
++    _mm_storeu_si128((__m128i*)p, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8)));
+ #elif SPU_LS_FAST
+     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index b03d6f4..8d343d5 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -2503,4 +2503,8 @@ static inline u128 spu_fsmh(u128 a) { return spu_fsmh_ref(a); }
+ static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
+ #endif
+ 
++/* [GT6 0159] SSE4.1 forms of the integer helpers above that are still scalar (Project Tourline 5, MIT), only with
++ * SPU_CODEGEN_HELPERS (CMake GT6_SPU_CG_HELPERS) - after every original, so (spu_name)(...) is still the original. */
++#include "spu_codegen_helpers.h"
++
+ #endif /* SPU_HELPERS_H */
+diff --git a/tests/test_spu_cg_helpers.c b/tests/test_spu_cg_helpers.c
+new file mode 100644
+index 0000000..69539f9
+--- /dev/null
++++ b/tests/test_spu_cg_helpers.c
+@@ -0,0 +1,45 @@
++/* test_spu_cg_helpers.c - [GT6 0159] the SSE4.1 helpers of runtime/spu/spu_codegen_helpers.h against the functions of
++ * spu_helpers.h they stand in for: every position / shift count, random operands. Prints "ok" and returns 0 when
++ * every result is bit-identical.
++ *   clang-cl /O2 /DSPU_CODEGEN_HELPERS /clang:-msse4.1 /I runtime\spu tests\test_spu_cg_helpers.c */
++#include "spu_helpers.h"
++#include <stdio.h>
++
++static uint64_t rs = 0x9E3779B97F4A7C15ull;
++static uint32_t rnd(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (uint32_t)(rs >> 16); }
++static u128 rv(void) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = rnd(); return r; }
++static int bad = 0;
++static void chk(const char* op, int k, u128 a, u128 b) {
++    if (memcmp(&a, &b, 16) && bad++ < 20)
++        printf("%s (%d): %08X %08X %08X %08X vs %08X %08X %08X %08X\n", op, k, a._u32[0], a._u32[1], a._u32[2], a._u32[3],
++               b._u32[0], b._u32[1], b._u32[2], b._u32[3]);
++}
++int main(void) {
++#if !defined(SPU_CODEGEN_HELPERS) || !defined(__SSE4_1__)
++    printf("built without SPU_CODEGEN_HELPERS / SSE4.1 - nothing to compare\n"); return 2;
++#else
++    long n = 0;
++    for (int it = 0; it < 200000; it++) {
++        u128 a = rv(), b = rv();
++        chk("nand", it, (spu_nand)(a, b), spu_cg_nand(a, b)); chk("nor", it, (spu_nor)(a, b), spu_cg_nor(a, b));
++        chk("andc", it, (spu_andc)(a, b), spu_cg_andc(a, b)); chk("orc", it, (spu_orc)(a, b), spu_cg_orc(a, b));
++        chk("cbx", it, (spu_cbx)(a, b), spu_cg_cbx(a, b)); chk("chx", it, (spu_chx)(a, b), spu_cg_chx(a, b));
++        chk("cdx", it, (spu_cdx)(a, b), spu_cg_cdx(a, b));
++        n += 7;
++    }
++    for (int it = 0; it < 2000; it++) {
++        u128 a = rv();
++        for (int i = -128; i < 128; i++) {
++            chk("shli", i, (spu_shli)(a, i), spu_cg_shli(a, i)); chk("shlhi", i, (spu_shlhi)(a, i), spu_cg_shlhi(a, i));
++            chk("rotmi", i, (spu_rotmi)(a, i), spu_cg_rotmi(a, i)); chk("rotmhi", i, (spu_rotmhi)(a, i), spu_cg_rotmhi(a, i));
++            chk("rotqmbii", i, (spu_rotqmbii)(a, i), spu_cg_rotqmbii(a, i));
++            u128 p = a; p._u32[0] = (uint32_t)(it * 7 + i);
++            chk("cbd", i, (spu_cbd)(p, i), spu_cg_cbd(p, i)); chk("chd", i, (spu_chd)(p, i), spu_cg_chd(p, i));
++            chk("cdd", i, (spu_cdd)(p, i), spu_cg_cdd(p, i));
++            n += 8;
++        }
++    }
++    printf("%s: %ld comparisons, %d different\n", bad ? "FAIL" : "ok", n, bad);
++    return bad ? 1 : 0;
++#endif
++}

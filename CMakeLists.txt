@@ -276,10 +276,35 @@ add_executable(${PROJECT_NAME}
 #                          SPU sources are small and decode-hot, so they get
 #                          full optimization. The last -O on the line wins.
 if(SPU_SOURCES)
+    # GT6_SPU_CG_HELPERS ([GT6 0159], 2026-11-27): SSE4.1 forms of the SPU integer helpers spu_helpers.h still does
+    # with scalar code (nand nor andc orc, cbd chd cdd cbx chx cdx, shli shlhi rotmi rotmhi, rotqmbii), from Project
+    # Tourline 5 (MIT; runtime/spu/spu_codegen_helpers.h). Bit-identical (ps3recomp tests/test_spu_cg_helpers.c). A
+    # compile-time choice: an A/B is two builds, each with a PGO profile of its own (a changed helper changes the
+    # lifted functions, and a profile taken without it no longer fits them).
+    option(GT6_SPU_CG_HELPERS "SSE4.1 forms of the scalar SPU integer helpers (Project Tourline 5)" OFF)
+    # GT6_SPU_LS_VEC ([GT6 0161], upstream ps3recomp 69310015): an SPU local-store quadword as one 16-byte access and
+    # one pshufb instead of four 32-bit bswapped ones (a store-forwarding stall on every lqd / stqd); the lifted SPU
+    # sources and the runtime (its interpreter) both. Compile-time, as GT6_SPU_CG_HELPERS.
+    option(GT6_SPU_LS_VEC "SPU local-store quadword access as one load / store + pshufb (upstream SPU_LS_VEC)" OFF)
+    # Either option may also be AB ([GT6 0165]): both forms compiled, picked at run time (SPU_CG_ON=1 / SPU_LS_VEC_ON=1,
+    # or the in-run A/B GT6_AB=cg,lsvec) - a measuring build; a release takes the winner as ON or OFF.
+    set(_gt6_spu_defs "SPU_USE_DISPATCH_MT;SPU_CALL_FAST_PATH")
+    if(GT6_SPU_CG_HELPERS STREQUAL "AB")
+        list(APPEND _gt6_spu_defs SPU_CODEGEN_HELPERS=2)
+    elseif(GT6_SPU_CG_HELPERS)
+        list(APPEND _gt6_spu_defs SPU_CODEGEN_HELPERS)
+    endif()
+    if(GT6_SPU_LS_VEC STREQUAL "AB")
+        list(APPEND _gt6_spu_defs SPU_LS_VEC=2)
+        target_compile_definitions(ps3recomp_runtime PRIVATE SPU_LS_VEC=2)
+    elseif(GT6_SPU_LS_VEC)
+        list(APPEND _gt6_spu_defs SPU_LS_VEC=1)
+        target_compile_definitions(ps3recomp_runtime PRIVATE SPU_LS_VEC=1)
+    endif()
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         # SPU_CALL_FAST_PATH (2026-11-18): the call bracket's ordinary outcome inline (spu_context.h, [GT6 0053]).
-        COMPILE_DEFINITIONS "SPU_USE_DISPATCH_MT;SPU_CALL_FAST_PATH")
+        COMPILE_DEFINITIONS "${_gt6_spu_defs}")
     # GT6_SPU_SIMD (AVX2 | SSE41 | OFF): the instruction set the lifted SPU code is compiled for.
     # runtime/spu/spu_helpers.h has SSE4.1 forms of the hot SPU ops (shufb, rotqby, selb, ...) and AVX2 forms of
     # the per-lane variable shifts, each chosen by __SSE4_1__ / __AVX2__ at compile time and bit-identical to the

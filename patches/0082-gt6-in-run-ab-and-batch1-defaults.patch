@@ -1,0 +1,307 @@
+diff --git a/include/ps3emu/ps3_ab.h b/include/ps3emu/ps3_ab.h
+new file mode 100644
+index 0000000..55c3791
+--- /dev/null
++++ b/include/ps3emu/ps3_ab.h
+@@ -0,0 +1,37 @@
++/* ps3_ab.h - [GT6 0164, 2026-11-27] the in-run A/B.
++ *
++ * A set of switches alternates between OFF (phase A) and ON (phase B) every few seconds inside ONE run, so two ways are
++ * measured over the same race: GT6's 16-car reference scene varies from run to run more than the few per cent being
++ * measured (pack_run pb1on / pb1off, 2026-11-27: +15 .. +45 s 40.9 vs 57.7 fps with the same exe).
++ *
++ * The host sets the mask and flips the phase (GT6: main.cpp, GT6_AB=<names or hex mask>, GT6_AB_PERIOD=<s>); a switch
++ * site asks ps3_ab_on(bit, its own value from the environment): a bit in the mask follows the phase, any other switch
++ * keeps its own value. A cache that must not carry state from one phase into the other compares g_ps3_ab_gen, which
++ * every flip bumps. The frame trace (GT6_FRAME_TRACE) writes the phase on every row (column "ab": 0 A, 1 B, -1 none).
++ * tools\abprof.py splits a run's frames by phase. */
++#ifndef PS3_AB_H
++#define PS3_AB_H
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++extern volatile unsigned g_ps3_ab_mask;    /* the switches in the A/B (bits below); 0 = no A/B */
++extern volatile int      g_ps3_ab_phase;   /* 0 = A (the switches in the mask OFF), 1 = B (ON) */
++extern volatile unsigned g_ps3_ab_gen;     /* bumped at every flip */
++
++#define PS3_AB_RA_CACHE   0x0001u   /* PPU_RA_CACHE        ([GT6 0160], ppu_loader.cpp) */
++#define PS3_AB_HLE_SLOT   0x0002u   /* PPU_HLE_SLOT        ([GT6 0162], ppu_hle.cpp) */
++#define PS3_AB_PUMP_PEEK  0x0004u   /* GCM_PUMP_PEEK       ([GT6 0162], cellGcmSys.c) */
++#define PS3_AB_LOCKLINE   0x0008u   /* SPU_LOCKLINE_SLEEP  ([GT6 0163], spu_coherency.c) */
++#define PS3_AB_SPU_LS_VEC 0x0010u   /* g_spu_ls_vec ([GT6 0161]) - only in a GT6_SPU_LS_VEC=AB build ([GT6 0165]) */
++#define PS3_AB_SPU_CG     0x0020u   /* g_spu_cg_on  ([GT6 0159]) - only in a GT6_SPU_CG_HELPERS=AB build ([GT6 0165]) */
++
++static inline int ps3_ab_on(unsigned bit, int env_on)
++{
++    return (g_ps3_ab_mask & bit) ? (g_ps3_ab_phase != 0) : env_on;
++}
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* PS3_AB_H */
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index a744c66..a7ce9ff 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -12,6 +12,7 @@
+ #include "rsx_draw_engine.h"
+ #include "cellGcmSys.h"
+ #include "../../runtime/platform/win32_compat.h"
++#include "ps3emu/ps3_ab.h"   /* [GT6 0164] the in-run A/B */
+ #include "../../runtime/ps3_log.h"           /* ps3_log_verbose */
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
+ #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+@@ -887,10 +888,11 @@ void ppu_gcm_pump(void)
+      * of thousands of times a second, and almost always nothing is pending. Look before taking the pump and swapping
+      * the pending words out (three atomic operations on lines the ticker thread writes). A notification posted just
+      * after this read is delivered by the next pump, as one posted while another thread holds the pump is.
+-     * OFF unless GCM_PUMP_PEEK=1 (no look, as before) - not measurably better in GT6's reference scene. */
++     * ON by default since [GT6 0164]'s in-run A/B (with PPU_RA_CACHE and PPU_HLE_SLOT: -5 % frame time, ab1; the
++     * render thread no longer waits in the pump's cond wait when nothing is pending). GCM_PUMP_PEEK=0: no look. */
+     { static int peek = -1;
+-      if (peek < 0) { const char* e = getenv("GCM_PUMP_PEEK"); peek = (e && *e == '1') ? 1 : 0; }
+-      if (peek && !s_gcm_pending && !s_user_pending) return; }
++      if (peek < 0) { const char* e = getenv("GCM_PUMP_PEEK"); peek = (e && *e == '0') ? 0 : 1; }
++      if (ps3_ab_on(PS3_AB_PUMP_PEEK, peek) && !s_gcm_pending && !s_user_pending) return; }
+     if (!GCM_PUMP_TRY_ENTER()) return;
+     long p = (long)GCM_PENDING_TAKE();
+     u64 user = GCM_USER_PENDING_TAKE();
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index cc476f0..e953c33 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -23,6 +23,7 @@
+ #include "ps3emu/yz_runtime_config.h"
+ #include "ps3emu/yz_frontier_trace.h"
+ #include "ps3emu/log_first.h"
++#include "ps3emu/ps3_ab.h"   /* [GT6 0164] the in-run A/B: its phase on every frame-trace row */
+ 
+ #if !defined(_WIN32)
+ 
+@@ -1016,7 +1017,8 @@ static void ld_present_measure_init(void)
+                 g_ld_trace_born -= (LONGLONG)((double)age * g_ld_qpc_frequency / 1e7);
+             }
+             g_ld_trace_previous = 0;
+-            fprintf(g_ld_frame_trace, "elapsed_s,present,guest_frame,interval_ms,tex_count,vs_compiles,ps_compiles,pso_calls,tex_ms,vs_ms,ps_ms,pso_ms,fence_wait_us,qpc_s\n");
++            /* [GT6 0164] "ab": the in-run A/B's phase at this present (0 A, 1 B, -1 no A/B; ps3emu/ps3_ab.h). */
++            fprintf(g_ld_frame_trace, "elapsed_s,present,guest_frame,interval_ms,tex_count,vs_compiles,ps_compiles,pso_calls,tex_ms,vs_ms,ps_ms,pso_ms,fence_wait_us,qpc_s,ab\n");
+         } else fprintf(stderr, "[frame-trace] cannot open '%s'\n", trace);
+     }
+ }
+@@ -1071,13 +1073,14 @@ static void ld_present_measure_record(u32 guest_frame)
+     g_ld_present_total = present_id;
+     if (g_ld_frame_trace) {
+         fprintf(g_ld_frame_trace,
+-                "%.6f,%llu,%u,%.6f,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%llu,%.9f\n",
++                "%.6f,%llu,%u,%.6f,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%llu,%.9f,%d\n",
+                 (double)(now.QuadPart - g_ld_trace_born) / g_ld_qpc_frequency,
+                 (unsigned long long)present_id, guest_frame,
+                 g_ld_trace_previous ? (double)(now.QuadPart - g_ld_trace_previous) * 1000.0 / g_ld_qpc_frequency : 0.0,
+                 g_ld_setup_count[0], g_ld_setup_count[1], g_ld_setup_count[2], g_ld_setup_count[3],
+                 g_ld_setup_ms[0], g_ld_setup_ms[1], g_ld_setup_ms[2], g_ld_setup_ms[3],
+-                g_ld_fence_wait_us, (double)now.QuadPart / g_ld_qpc_frequency);
++                g_ld_fence_wait_us, (double)now.QuadPart / g_ld_qpc_frequency,
++                g_ps3_ab_mask ? (g_ps3_ab_phase != 0) : -1);
+         g_ld_trace_previous = now.QuadPart;
+         if ((present_id & 63u) == 0u) fflush(g_ld_frame_trace);
+     }
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 778305d..ed06ea4 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -22,6 +22,7 @@
+ #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
+ #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+ #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: spans of HLE import calls */
++#include "ps3emu/ps3_ab.h"       /* [GT6 0164] the in-run A/B */
+ #include <stdlib.h>       /* getenv */
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -55,15 +56,15 @@ static uint32_t g_ctx_count = 0;
+  * g_hle_nids (over a thousand; ps3_nid_table_find is a linear scan). Upstream: God of War HD makes ~95k HLE calls a
+  * second, ps3_hle_call 6.5 -> 1.5 % of its main thread. A slot keeps the indexes and the table sizes it was filled
+  * against, so a registration made after the first call is still found; per thread, so no slot is read half-written.
+- * OFF unless PPU_HLE_SLOT=1 (the scans every call, as before): GT6's hot imports go through hle_fast() above, and
+- * ps3_hle_call does not show among the reference scene's costs (see ppu_prof_resolve_host in ppu_loader.cpp). */
++ * ON by default since [GT6 0164]'s in-run A/B measured it with PPU_RA_CACHE and GCM_PUMP_PEEK: -5 % frame time
++ * (see ppu_prof_resolve_host in ppu_loader.cpp). PPU_HLE_SLOT=0: the two scans every call, as before. */
+ struct HleSlot { uint32_t nid, ctx_n, tab_n; int32_t ctx_i, tab_i; };
+ static thread_local HleSlot t_hle_slot[1024];
+ static int hle_slot_on(void)
+ {
+     static int on = -1;
+-    if (on < 0) { const char* e = getenv("PPU_HLE_SLOT"); on = (e && *e == '1') ? 1 : 0; }
+-    return on;
++    if (on < 0) { const char* e = getenv("PPU_HLE_SLOT"); on = (e && *e == '0') ? 0 : 1; }
++    return ps3_ab_on(PS3_AB_HLE_SLOT, on);
+ }
+ static const HleSlot* hle_slot(uint32_t nid)
+ {
+@@ -742,7 +743,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+         }
+     }
+ 
+-    /* [GT6 0162] the per-thread slot instead of the two linear scans with PPU_HLE_SLOT=1 (off: the scans). */
++    /* [GT6 0162] the per-thread slot instead of the two linear scans (PPU_HLE_SLOT=0: the scans). */
+     const HleSlot* hs = hle_slot_on() ? hle_slot(nid) : nullptr;
+     int32_t hci = -1;
+     if (hs) hci = hs->ctx_i;
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 1bc0de9..09c7133 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -39,6 +39,7 @@
+ #include "ppu_recomp.h"
+ #include "../spu/spu_coh_bitmap.h"   /* spu_coh_line_reserved, for the stores */
+ #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
++#include "ps3emu/ps3_ab.h"       /* [GT6 0164] the in-run A/B */
+ #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
+ #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
+ #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
+@@ -2834,14 +2835,21 @@ static uint32_t ppu_prof_resolve_host_slow(void* ra);
+  * stamps its caller for the sampling profiler through the binary search below, which missed the cache on most of its
+  * steps - a third of lv2_syscall in God of War HD (upstream: lv2_syscall 2.2 -> 1.0 % of its main thread). Call sites
+  * are few, so each thread keeps its last answer per site; the inverse table is built once, so an answer never goes
+- * stale. OFF unless PPU_RA_CACHE=1: in GT6's reference scene (16-car pack, sampled b7 / pb1on / pb1off on
+- * 2026-11-27) neither this nor ps3_hle_call shows up among the threads' costs, and the run with the four ports of
+- * [GT6 0160] .. [GT6 0163] on was not faster (41.4 vs 45.4 fps at the start, within a scene that varies run to run). */
++ * stale. ON by default since [GT6 0164]'s in-run A/B (2026-11-27, 16-car reference scene, 8 s phases): with
++ * PPU_HLE_SLOT and GCM_PUMP_PEEK it took -1.14 ms a frame (+- 0.41, 19 phase triples; -5 % frame time, ab1) - two
++ * separate runs had said the opposite (41.4 vs 45.4 fps), the scene varying more from run to run than the effect.
++ * PPU_RA_CACHE=0: the search every time, as before. */
++/* [GT6 0164] the in-run A/B's state (ps3emu/ps3_ab.h): the host sets the mask and flips the phase. */
++extern "C" {
++volatile unsigned g_ps3_ab_mask = 0;
++volatile int      g_ps3_ab_phase = 0;
++volatile unsigned g_ps3_ab_gen = 0;
++}
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
+ {
+     static int on = -1;
+-    if (on < 0) { const char* e = getenv("PPU_RA_CACHE"); on = (e && *e == '1') ? 1 : 0; }
+-    if (!on) return ppu_prof_resolve_host_slow(ra);
++    if (on < 0) { const char* e = getenv("PPU_RA_CACHE"); on = (e && *e == '0') ? 0 : 1; }
++    if (!ps3_ab_on(PS3_AB_RA_CACHE, on)) return ppu_prof_resolve_host_slow(ra);
+     struct RaSlot { void* ra; uint32_t guest; };
+     static PPU_THREAD_LOCAL RaSlot t_ra[256];
+     RaSlot& slot = t_ra[((uintptr_t)ra >> 2) & 255u];
+diff --git a/runtime/spu/spu_codegen_helpers.h b/runtime/spu/spu_codegen_helpers.h
+index ccef21e..390c3aa 100644
+--- a/runtime/spu/spu_codegen_helpers.h
++++ b/runtime/spu/spu_codegen_helpers.h
+@@ -66,6 +66,25 @@ static inline u128 spu_cg_rotqmbii(u128 a, int s) {
+     __m128i A = spu_cg_load(a); s = (0u - (unsigned)s) & 7;
+     return spu_cg_store(_mm_or_si128(_mm_srl_epi32(A, _mm_cvtsi32_si128(s)), _mm_sll_epi32(_mm_slli_si128(A, 4), _mm_cvtsi32_si128(32 - s))));
+ }
++#if SPU_CODEGEN_HELPERS == 2
++/* [GT6 0165] the A/B build (CMake GT6_SPU_CG_HELPERS=AB): both forms, g_spu_cg_on (spu_context.h) picks one. */
++#define SPU_CG_PICK(N, ...) (g_spu_cg_on ? spu_cg_##N(__VA_ARGS__) : (spu_##N)(__VA_ARGS__))
++#define spu_nand(...) SPU_CG_PICK(nand, __VA_ARGS__)
++#define spu_nor(...) SPU_CG_PICK(nor, __VA_ARGS__)
++#define spu_andc(...) SPU_CG_PICK(andc, __VA_ARGS__)
++#define spu_orc(...) SPU_CG_PICK(orc, __VA_ARGS__)
++#define spu_cbd(...) SPU_CG_PICK(cbd, __VA_ARGS__)
++#define spu_chd(...) SPU_CG_PICK(chd, __VA_ARGS__)
++#define spu_cdd(...) SPU_CG_PICK(cdd, __VA_ARGS__)
++#define spu_cbx(...) SPU_CG_PICK(cbx, __VA_ARGS__)
++#define spu_chx(...) SPU_CG_PICK(chx, __VA_ARGS__)
++#define spu_cdx(...) SPU_CG_PICK(cdx, __VA_ARGS__)
++#define spu_shli(...) SPU_CG_PICK(shli, __VA_ARGS__)
++#define spu_shlhi(...) SPU_CG_PICK(shlhi, __VA_ARGS__)
++#define spu_rotmi(...) SPU_CG_PICK(rotmi, __VA_ARGS__)
++#define spu_rotmhi(...) SPU_CG_PICK(rotmhi, __VA_ARGS__)
++#define spu_rotqmbii(...) SPU_CG_PICK(rotqmbii, __VA_ARGS__)
++#else
+ #define spu_nand(...) spu_cg_nand(__VA_ARGS__)
+ #define spu_nor(...) spu_cg_nor(__VA_ARGS__)
+ #define spu_andc(...) spu_cg_andc(__VA_ARGS__)
+@@ -82,4 +101,5 @@ static inline u128 spu_cg_rotqmbii(u128 a, int s) {
+ #define spu_rotmhi(...) spu_cg_rotmhi(__VA_ARGS__)
+ #define spu_rotqmbii(...) spu_cg_rotqmbii(__VA_ARGS__)
+ #endif
++#endif
+ #endif /* SPU_CODEGEN_HELPERS_H */
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 86e69eb..d9f7e0f 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -18,6 +18,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include "ps3emu/log_first.h"
++#include "ps3emu/ps3_ab.h"   /* [GT6 0164] the in-run A/B */
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -45,8 +46,8 @@ static volatile long g_lockline = 0;
+  * and Sleep(0) only to one of equal or higher priority -- neither reaches a lower-priority holder that is waiting for
+  * a core. With every core busy, waiters above the holder's priority could keep it off the CPU for tens of
+  * milliseconds. A normal wait is far under a microsecond and never gets here. OFF unless SPU_LOCKLINE_SLEEP=1 (the
+- * plain spin, as before): a Sleep(1) in the middle of a frame costs a whole timer tick, and GT6's reference scene
+- * was not faster with it. */
++ * plain spin, as before): a Sleep(1) in the middle of a frame costs a whole timer tick, and [GT6 0164]'s in-run A/B
++ * of this alone (ab2, 2026-11-27) gave +0.83 ms a frame (+- 0.49, 19 phase triples; +4 % frame time) - slower. */
+ void spu_lockline_lock(void)
+ {
+     static int s_sleep = -1;
+@@ -57,7 +58,7 @@ void spu_lockline_lock(void)
+             _mm_pause();
+             if (++spins >= 4096) {
+                 spins = 0;
+-                if (rounds++ < 6 || !s_sleep) SwitchToThread(); else Sleep(1);
++                if (rounds++ < 6 || !ps3_ab_on(PS3_AB_LOCKLINE, s_sleep)) SwitchToThread(); else Sleep(1);
+             }
+         } while (g_lockline);
+     }
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index d8e13a4..09f8848 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -607,6 +607,12 @@ SPU_GATE int g_wws_read_probe = 0;
+ SPU_GATE int g_spu_ls_rdiag   = -1;  /* any read diagnostic armed (see above)   */
+ SPU_GATE int g_spu_ls_wdiag   = -1;  /* any write diagnostic armed              */
+ SPU_GATE int g_spu_wws_probe  = -1;  /* SPU_WWS_PROBE: the WWS buffer/code logs */
++/* [GT6 0165, 2026-11-27] the A/B build of SPU_LS_VEC / SPU_CODEGEN_HELPERS (both =2, CMake GT6_SPU_LS_VEC=AB /
++ * GT6_SPU_CG_HELPERS=AB): both forms are compiled and these pick one at run time - GT6's main.cpp sets them from
++ * SPU_LS_VEC_ON=1 / SPU_CG_ON=1 or the in-run A/B (GT6_AB=lsvec,cg). Plain ints (one load a use; a flip every few
++ * seconds needs no ordering). Unused in a build with the options OFF or ON. */
++SPU_GATE int g_spu_ls_vec     = 0;
++SPU_GATE int g_spu_cg_on      = 0;
+ static inline int spu_ls_wws_probe_on(void)
+ {
+     if (g_spu_wws_probe < 0) g_spu_wws_probe = getenv("SPU_WWS_PROBE") ? 1 : 0;
+@@ -671,6 +677,16 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+     const uint8_t* p = &ctx->ls[lsa];
+ #if defined(__ARM_NEON)
+     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
++#elif defined(SPU_LS_VEC) && SPU_LS_VEC == 2      /* [GT6 0165] the A/B build: both forms */
++    if (g_spu_ls_vec) {
++        _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)p)));
++    } else {
++        uint32_t w0, w1, w2, w3;
++        memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
++        memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
++        v._u32[0] = SPU_BSWAP32(w0); v._u32[1] = SPU_BSWAP32(w1);
++        v._u32[2] = SPU_BSWAP32(w2); v._u32[3] = SPU_BSWAP32(w3);
++    }
+ #elif defined(SPU_LS_VEC) && SPU_LS_VEC
+     _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)p)));
+ #elif SPU_LS_FAST
+@@ -770,6 +786,15 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+     uint8_t* p = &ctx->ls[lsa];
+ #if defined(__ARM_NEON)
+     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
++#elif defined(SPU_LS_VEC) && SPU_LS_VEC == 2      /* [GT6 0165] the A/B build: both forms */
++    if (g_spu_ls_vec) {
++        _mm_storeu_si128((__m128i*)p, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8)));
++    } else {
++        uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
++        uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
++        memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
++        memcpy(p + 8,  &w2, 4); memcpy(p + 12, &w3, 4);
++    }
+ #elif defined(SPU_LS_VEC) && SPU_LS_VEC
+     _mm_storeu_si128((__m128i*)p, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8)));
+ #elif SPU_LS_FAST

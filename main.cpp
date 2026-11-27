@@ -23,6 +23,7 @@ extern "C" void gt6_menu_install(void);
 
 #include "win32_compat.h"
 #include "ps3recomp/include/ps3emu/ps3_ftrace.h"
+#include "ps3recomp/include/ps3emu/ps3_ab.h"   /* [GT6 0164] the in-run A/B */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -486,6 +487,66 @@ static DWORD WINAPI threads_at(LPVOID p)
         Sleep((DWORD)(every * 1000.0));
     }
     return 0;
+}
+
+/* [GT6 0164, 2026-11-27] The in-run A/B (ps3recomp/include/ps3emu/ps3_ab.h): GT6_AB=<names or a hex mask> puts those
+ * switches in it - names ra (PPU_RA_CACHE), hle (PPU_HLE_SLOT), pump (GCM_PUMP_PEEK), lockline (SPU_LOCKLINE_SLEEP),
+ * comma-separated - and they go OFF (phase A) / ON (phase B) every GT6_AB_PERIOD seconds (default 10), starting with A,
+ * for the whole run. Each flip is logged ("[ab] ..."); the frame trace writes the phase on every row (column "ab");
+ * tools\abprof.py compares the phases, each one against the two around it (a slow drift of the scene cancels out). */
+/* [GT6 0165] the SPU forms of an AB build (spu_context.h): SPU_LS_VEC_ON=1 / SPU_CG_ON=1, or the A/B's lsvec / cg. */
+extern "C" int g_spu_ls_vec;
+extern "C" int g_spu_cg_on;
+static int s_spu_ls_vec_env = 0, s_spu_cg_env = 0;
+static void ab_apply_spu(void)
+{
+    g_spu_ls_vec = ps3_ab_on(PS3_AB_SPU_LS_VEC, s_spu_ls_vec_env);
+    g_spu_cg_on = ps3_ab_on(PS3_AB_SPU_CG, s_spu_cg_env);
+}
+static DWORD WINAPI ab_toggle(LPVOID p)
+{
+    const DWORD period_ms = (DWORD)(uintptr_t)p;
+    for (;;) {
+        Sleep(period_ms);
+        g_ps3_ab_phase = g_ps3_ab_phase ? 0 : 1;
+        g_ps3_ab_gen = g_ps3_ab_gen + 1u;
+        ab_apply_spu();
+        fprintf(stderr, "[ab] phase %c (switches 0x%X %s) at t=%.3f\n", g_ps3_ab_phase ? 'B' : 'A', g_ps3_ab_mask,
+                g_ps3_ab_phase ? "on" : "off", ps3_qpc_us() / 1e6);
+    }
+}
+static void ab_start(void)
+{
+    s_spu_ls_vec_env = getenv("SPU_LS_VEC_ON") && *getenv("SPU_LS_VEC_ON") == '1';
+    s_spu_cg_env = getenv("SPU_CG_ON") && *getenv("SPU_CG_ON") == '1';
+    ab_apply_spu();
+    const char* e = getenv("GT6_AB");
+    if (!e || !*e) return;
+    unsigned mask = 0;
+    if (e[0] == '0' && (e[1] == 'x' || e[1] == 'X')) mask = (unsigned)strtoul(e + 2, NULL, 16);
+    else {
+        static const struct { const char* name; unsigned bit; } names[] = {
+            {"ra", PS3_AB_RA_CACHE}, {"hle", PS3_AB_HLE_SLOT}, {"pump", PS3_AB_PUMP_PEEK}, {"lockline", PS3_AB_LOCKLINE},
+            {"lsvec", PS3_AB_SPU_LS_VEC}, {"cg", PS3_AB_SPU_CG}};
+        char buf[256];
+        strncpy(buf, e, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+        for (char* t = strtok(buf, ",; "); t; t = strtok(NULL, ",; ")) {
+            unsigned bit = 0;
+            for (const auto& n : names) if (!_stricmp(t, n.name)) bit = n.bit;
+            if (!bit) fprintf(stderr, "[ab] unknown switch name '%s' - ignored\n", t);
+            mask |= bit;
+        }
+    }
+    if (!mask) return;
+    double period = 10.0;
+    if (const char* pe = getenv("GT6_AB_PERIOD")) { const double v = atof(pe); if (v >= 1.0 && v <= 600.0) period = v; }
+    g_ps3_ab_phase = 0;
+    g_ps3_ab_mask = mask;
+    ab_apply_spu();
+    fprintf(stderr, "[ab] in-run A/B: switches 0x%X OFF (A) / ON (B) every %.1f s, A first, at t=%.3f\n", mask, period,
+            ps3_qpc_us() / 1e6);
+    HANDLE h = CreateThread(NULL, 0, ab_toggle, (LPVOID)(uintptr_t)(DWORD)(period * 1000.0), 0, NULL);
+    if (h) { SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL); CloseHandle(h); }
 }
 
 /* vblank on its own timer thread (a busy drain must not delay the 60 Hz beat). */
@@ -1210,6 +1271,7 @@ int main(int argc, char** argv)
         if (atoi(bw) > 0) CreateThread(NULL, 0, boot_watch, (LPVOID)(uintptr_t)atoi(bw), 0, NULL);
     if (const char* ta = getenv("GT6_THREADS_AT"))
         if (atof(ta) > 0.0) CreateThread(NULL, 0, threads_at, (LPVOID)ta, 0, NULL);
+    ab_start();   /* [GT6 0164] GT6_AB: the in-run A/B */
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
 
