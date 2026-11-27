@@ -777,6 +777,8 @@ namespace GT6Launcher
                 return Make(L.T("메모리가 부족했습니다"), L.T("게임이 메모리를 더 받지 못했습니다."), L.T("다른 프로그램을 닫고 다시 실행해 보세요."));
             if (status == 0xC0000135u || status == 0xC0000139u || status == 0xC000007Bu)
                 return Make(L.T("필요한 DLL이 없습니다"), L.T("게임 폴더의 DLL(SDL2.dll, vcruntime140.dll 등)을 찾지 못했습니다 (0x") + status.ToString("X8") + ").", L.T("패키지의 파일을 모두 같은 폴더에 두었는지 확인해 주세요."));
+            if (status == 0xC000001Du)   // ([GT6 0167]) STATUS_ILLEGAL_INSTRUCTION: a CPU without what the exe is built for
+                return Make(L.T("이 PC의 CPU로는 게임을 실행할 수 없습니다"), L.T("게임이 이 PC의 CPU에 없는 명령에서 멈췄습니다 (0xC000001D).") + Cpu.MissingText(), L.T("이 포트는 AVX2가 있는 CPU가 필요합니다 - 인텔 코어 4세대(2013년, Haswell) 이후 또는 AMD 라이젠 이후입니다. 펜티엄 · 셀러론 · 아톰에는 없는 모델이 많습니다."));
             if (own != null && status < 0xC0000000u)
                 return Make(L.T("게임이 스스로 멈췄습니다"), own + L.T(" (종료 코드 ") + code + ")", L.T("로그 페이지에서 그 줄의 앞뒤를 확인해 주세요. 계속되면 로그를 함께 알려 주세요."));
             if (status == 0xFFFFFFFFu || code == 1)   // also what the task manager's "작업 끝내기" leaves
@@ -790,6 +792,125 @@ namespace GT6Launcher
         {
             string line = text.Split('\n').Select(l => l.Trim()).LastOrDefault(l => Regex.IsMatch(l, "error|fatal|fail", RegexOptions.IgnoreCase) && !l.StartsWith("#"));
             return line ?? fallback;
+        }
+    }
+
+    // ([GT6 0167], public issue: the game closed with 0xC000001D while merging its data, after the whole download)
+    // What the game's code needs from the CPU. GT6Recomp.exe is built for x86-64-v3 (AVX2, FMA, BMI1/2, LZCNT, MOVBE,
+    // F16C, POPCNT - every CPU that has AVX2: Intel Core 4th generation (Haswell, 2013) and later, AMD Excavator / Ryzen
+    // and later); on a CPU without them it stops at the first such instruction. Asked of the CPU itself (CPUID / XGETBV
+    // through a few bytes of x64 code): .NET Framework has no intrinsics, and IsProcessorFeaturePresent knows AVX2 only
+    // on newer Windows. When the question cannot be asked (32-bit process, no memory), the answer is "nothing missing":
+    // the setup is never blocked on a guess.
+    public static class Cpu
+    {
+        [DllImport("kernel32.dll")]
+        static extern IntPtr VirtualAlloc(IntPtr address, UIntPtr size, uint type, uint protect);
+        [DllImport("kernel32.dll")]
+        static extern bool VirtualFree(IntPtr address, UIntPtr size, uint type);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]   // x64 has one calling convention: rcx, rdx, r8
+        delegate void CpuidFn(uint leaf, uint subleaf, IntPtr out4);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        delegate uint XgetbvFn();
+
+        static readonly byte[] CpuidCode =
+        {
+            0x53,                       // push rbx
+            0x89, 0xC8,                 // mov eax, ecx
+            0x89, 0xD1,                 // mov ecx, edx
+            0x0F, 0xA2,                 // cpuid
+            0x41, 0x89, 0x00,           // mov [r8], eax
+            0x41, 0x89, 0x58, 0x04,     // mov [r8+4], ebx
+            0x41, 0x89, 0x48, 0x08,     // mov [r8+8], ecx
+            0x41, 0x89, 0x50, 0x0C,     // mov [r8+12], edx
+            0x5B,                       // pop rbx
+            0xC3                        // ret
+        };
+        static readonly byte[] XgetbvCode = { 0x31, 0xC9, 0x0F, 0x01, 0xD0, 0xC3 };   // xor ecx, ecx; xgetbv; ret
+
+        static bool asked;
+        static string missing, name;
+
+        // null = the CPU has all of it (or it could not be asked); else the names of what it lacks, e.g. "AVX2, FMA, BMI2"
+        public static string Missing()
+        {
+            if (asked)
+                return missing;
+            asked = true;
+            try
+            {
+                if (IntPtr.Size != 8)
+                    return null;
+                IntPtr code = VirtualAlloc(IntPtr.Zero, (UIntPtr)4096u, 0x3000u, 0x40u);   // commit + reserve, execute-read-write
+                if (code == IntPtr.Zero)
+                    return null;
+                IntPtr buffer = Marshal.AllocHGlobal(16);
+                try
+                {
+                    Marshal.Copy(CpuidCode, 0, code, CpuidCode.Length);
+                    Marshal.Copy(XgetbvCode, 0, code + 64, XgetbvCode.Length);
+                    var cpuid = (CpuidFn)Marshal.GetDelegateForFunctionPointer(code, typeof(CpuidFn));
+                    Func<uint, uint[]> ask = leaf =>
+                    {
+                        cpuid(leaf, 0, buffer);
+                        var words = new int[4];
+                        Marshal.Copy(buffer, words, 0, 4);
+                        return new[] { (uint)words[0], (uint)words[1], (uint)words[2], (uint)words[3] };
+                    };
+                    uint top = ask(0)[0], topExt = ask(0x80000000u)[0];
+                    uint[] l1 = ask(1), l7 = top >= 7 ? ask(7) : new uint[4], e1 = topExt >= 0x80000001u ? ask(0x80000001u) : new uint[4];
+                    bool osAvx = false;
+                    if ((l1[2] & (1u << 27)) != 0)   // OSXSAVE: XGETBV may be used
+                        osAvx = (((XgetbvFn)Marshal.GetDelegateForFunctionPointer(code + 64, typeof(XgetbvFn)))() & 6u) == 6u;   // the OS keeps XMM + YMM
+                    var lack = new List<string>();
+                    if ((l1[2] & (1u << 28)) == 0 || !osAvx) lack.Add("AVX");
+                    if ((l7[1] & (1u << 5)) == 0) lack.Add("AVX2");
+                    if ((l1[2] & (1u << 12)) == 0) lack.Add("FMA");
+                    if ((l7[1] & (1u << 3)) == 0) lack.Add("BMI1");
+                    if ((l7[1] & (1u << 8)) == 0) lack.Add("BMI2");
+                    if ((e1[2] & (1u << 5)) == 0) lack.Add("LZCNT");
+                    if ((l1[2] & (1u << 22)) == 0) lack.Add("MOVBE");
+                    if ((l1[2] & (1u << 29)) == 0) lack.Add("F16C");
+                    if ((l1[2] & (1u << 23)) == 0) lack.Add("POPCNT");
+                    missing = lack.Count > 0 ? string.Join(", ", lack) : null;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buffer);
+                    VirtualFree(code, UIntPtr.Zero, 0x8000u);   // release
+                }
+            }
+            catch (Exception)
+            {
+                missing = null;
+            }
+            return missing;
+        }
+
+        // the CPU's own name (for the setup log), from the registry
+        public static string Name()
+        {
+            if (name == null)
+            {
+                try
+                {
+                    using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0"))
+                        name = key != null ? ((key.GetValue("ProcessorNameString") as string) ?? "").Trim() : "";
+                }
+                catch (Exception)
+                {
+                    name = "";
+                }
+            }
+            return name;
+        }
+
+        // " Missing: AVX2, FMA." or "" - after a sentence
+        public static string MissingText()
+        {
+            string lack = Missing();
+            return lack == null ? "" : L.T(" 없는 명령: ") + lack + ".";
         }
     }
 

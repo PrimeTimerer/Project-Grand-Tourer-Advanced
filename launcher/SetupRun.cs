@@ -1074,6 +1074,11 @@ namespace GT6Launcher
                 throw new SetupFailed(L.T("게임 디스크(ISO 또는 폴더)를 먼저 골라 주세요."));
             if (SpaceFree < SpaceNeeded)
                 throw new SetupFailed(L.T("디스크 공간이 부족합니다. 필요: ") + Gb(SpaceNeeded) + L.T(", 남은 공간: ") + Gb(SpaceFree));
+            // ([GT6 0167]) before 12.5 GB of downloads: the game itself would stop at its first start on this CPU
+            string cpuLacks = Cpu.Missing();
+            Note("cpu: " + Cpu.Name() + (cpuLacks != null ? " - lacks " + cpuLacks : " - has what the game needs"));
+            if (cpuLacks != null)
+                throw new SetupFailed(L.T("이 PC의 CPU에는 게임에 필요한 명령이 없습니다: ") + cpuLacks + L.T(". 이 포트는 AVX2가 있는 CPU가 필요합니다 - 인텔 코어 4세대(2013년, Haswell) 이후 또는 AMD 라이젠 이후입니다. 펜티엄 · 셀러론 · 아톰에는 없는 모델이 많습니다."));
             // the shares of the whole (they add up to 1 whatever is skipped)
             double total = (needDisc ? 14 : 0) + (needTool ? 3 : 0) + (needUpdates ? 40 : 0) + (needExe ? 1 : 0) + (needModule ? 1 : 0) + (needTool ? 1 : 0) + (gameInstall ? 40 : 0);
             if (total <= 0)
@@ -1752,6 +1757,8 @@ namespace GT6Launcher
                             else if (watch.ElapsedMilliseconds - finishedAt > 3000)
                                 break;
                         }
+                        else if (exited && unchecked((uint)game.ExitCode) == 0xC000001Du)   // ([GT6 0167])
+                            throw new SetupFailed(L.T("게임이 이 PC의 CPU에 없는 명령에서 멈췄습니다 (0xC000001D).") + Cpu.MissingText() + L.T(" 이 포트는 AVX2가 있는 CPU가 필요합니다 - 인텔 코어 4세대(2013년, Haswell) 이후 또는 AMD 라이젠 이후입니다."));
                         else if (exited)
                             throw new SetupFailed(L.T("게임이 데이터를 합치다가 꺼졌습니다 (코드 ") + game.ExitCode + L.T("). logs\\launcher\\setup_game_err.txt를 봐 주세요."));
                         else if (watch.ElapsedMilliseconds - lastChange > 900000)

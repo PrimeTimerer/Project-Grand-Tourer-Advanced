@@ -14,6 +14,7 @@ A native Windows PC port of **Gran Turismo 6** (PlayStation 3, Polyphony Digital
 ## Supported
 
 - **Windows 10 / 11, 64-bit PCs only.** Steam Deck, Android, macOS, iOS and Linux are not supported, and support for them is not planned.
+- **A CPU with AVX2:** Intel Core 4th generation (2013, Haswell) or newer, or AMD Ryzen or newer. On an older CPU (and many Pentium, Celeron and Atom models) the game stops with error 0xC000001D; the launcher checks this before the setup starts.
 - **One region only: the European disc BCES01893** with its official update 1.22 (the launcher downloads it). Other regions are not supported, and support for them is not planned.
 - **Frame rate:** it will keep being improved, but that is a long road.
 
@@ -95,6 +96,7 @@ The launcher checks this repository's releases once a day. A newer release is do
 ### 지원 범위
 
 - **Windows 10 / 11 64비트 PC 전용입니다.** Steam Deck, 안드로이드, macOS, iOS, 리눅스는 지원하지 않으며 지원할 예정도 없습니다.
+- **AVX2가 있는 CPU가 필요합니다:** 인텔 코어 4세대(2013년, Haswell) 이후 또는 AMD 라이젠 이후. 그보다 오래된 CPU(그리고 펜티엄 · 셀러론 · 아톰의 많은 모델)에서는 게임이 0xC000001D 오류로 멈춥니다. 런처가 설치를 시작하기 전에 확인합니다.
 - **한 지역판만 지원합니다: 유럽판 디스크 BCES01893**과 공식 업데이트 1.22(런처가 받아 줍니다). 다른 지역판은 지원하지 않으며 지원할 예정도 없습니다.
 - **프레임:** 앞으로도 계속 개선해 나가겠지만, 긴 여정이 될 것입니다.
 
