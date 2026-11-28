@@ -161,6 +161,12 @@ if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
         # function calls it first (tools/native_cull_hook.py puts that call in). On by default; GT6_NATIVE_CULL=0 off,
         # GT6_AB=cull for an in-run A/B.
         list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/gt6_native_cull.c")
+        # [GT6 0171] the job CRT's local-store fill (0x4124 of every module) as one memset; tools/native_fill_hook.py
+        # puts the call in. GT6_NATIVE_FILL=1 / GT6_AB=fill.
+        list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/gt6_native_fill.c")
+        # [GT6 0174] module a8dec1's vertex loop (0x6750) fused into one function by tools/native_a8dec1_hook.py (generated
+        # into the lifted module from its own code); gt6_native_a8dec1.c decides when it may run. GT6_NATIVE_A8DEC1=1 / GT6_AB=a8dec1.
+        list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/gt6_native_a8dec1.c")
     endif()
     # The job manager itself (the WWS job manager policy module all eight PDI workloads run): its body lifted by
     # tools/lift_policy_module.py into spu_policy/ - a directory of its own, so adding or re-lifting it compiles two
@@ -292,7 +298,17 @@ if(SPU_SOURCES)
     option(GT6_SPU_LS_VEC "SPU local-store quadword access as one load / store + pshufb (upstream SPU_LS_VEC)" OFF)
     # Either option may also be AB ([GT6 0165]): both forms compiled, picked at run time (SPU_CG_ON=1 / SPU_LS_VEC_ON=1,
     # or the in-run A/B GT6_AB=cg,lsvec) - a measuring build; a release takes the winner as ON or OFF.
+    # GT6_SPU_WRCH_INLINE ([GT6 0173]): the lifted code stores the DMA argument channels (MFC_LSA .. MFC_TagID) and
+    # MFC_WrTagMask into the context inline instead of calling spu_wrch (runtime/spu/spu_helpers.h). ON = always,
+    # AB = a measuring build (the in-run A/B "wrch", GT6_SPU_WRCH_INLINE=0 off), OFF = every write calls spu_wrch.
+    # Default ON since 2026-11-28 (two in-run A/B: -0.83 +- 1.08 and -1.11 +- 0.61 ms a frame, NOTES [GT6 0173]).
+    set(GT6_SPU_WRCH_INLINE "ON" CACHE STRING "Inline stores of the lifted SPU code's DMA argument channels: ON, AB or OFF")
     set(_gt6_spu_defs "SPU_USE_DISPATCH_MT;SPU_CALL_FAST_PATH")
+    if(GT6_SPU_WRCH_INLINE STREQUAL "AB")
+        list(APPEND _gt6_spu_defs SPU_WRCH_INLINE=2)
+    elseif(GT6_SPU_WRCH_INLINE)
+        list(APPEND _gt6_spu_defs SPU_WRCH_INLINE=1)
+    endif()
     if(GT6_SPU_CG_HELPERS STREQUAL "AB")
         list(APPEND _gt6_spu_defs SPU_CODEGEN_HELPERS=2)
     elseif(GT6_SPU_CG_HELPERS)

@@ -1,0 +1,39 @@
+diff --git a/include/ps3emu/ps3_ab.h b/include/ps3emu/ps3_ab.h
+index 7e31482..71cfbcb 100644
+--- a/include/ps3emu/ps3_ab.h
++++ b/include/ps3emu/ps3_ab.h
+@@ -26,6 +26,9 @@ extern volatile unsigned g_ps3_ab_gen;     /* bumped at every flip */
+ #define PS3_AB_SPU_LS_VEC 0x0010u   /* g_spu_ls_vec ([GT6 0161]) - only in a GT6_SPU_LS_VEC=AB build ([GT6 0165]) */
+ #define PS3_AB_SPU_CG     0x0020u   /* g_spu_cg_on  ([GT6 0159]) - only in a GT6_SPU_CG_HELPERS=AB build ([GT6 0165]) */
+ #define PS3_AB_LIVE_HOLDERS 0x0040u /* the live-holder skip ([GT6 0166], spu_coherency.c; counting runs in both phases) */
++/* 0x0080: the port's native cull (GT6 gt6_native_cull.c, GT6_AB "cull") */
++#define PS3_AB_GCM_BWW    0x0100u   /* GCM_BLOCKED_WRITE_KICK ([GT6 0169], cellGcmSys.c): an SPU PUT over the parked word
++                                     * wakes the walker at once instead of its 1 ms timed wait */
+ 
+ static inline int ps3_ab_on(unsigned bit, int env_on)
+ {
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 06a4163..d742d6f 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2211,7 +2211,10 @@ static _Atomic(uint64_t) s_bww_arms[3], s_bww_writes[3], s_bww_rechecks[3];
+ static _Atomic(uint64_t) s_bww_wait_event, s_bww_wait_timeout;
+ 
+ /* Initially experimental: explicit 1 only. The log is independent so an
+- * off/on comparison can measure wait outcomes with identical diagnostics. */
++ * off/on comparison can measure wait outcomes with identical diagnostics.
++ * [GT6 0169] Bit 1 also follows the in-run A/B (GT6_AB "bww", PS3_AB_GCM_BWW): a phase that turns it off leaves an
++ * armed watch unclaimed (the walker's timed wait ends that wait as before), one that turns it on arms at the next
++ * park or acquire. */
+ static unsigned gcm_blocked_write_flags(void)
+ {
+     static atomic_int cached = -1;
+@@ -2222,7 +2225,7 @@ static unsigned gcm_blocked_write_flags(void)
+         flags = ((enable && *enable == '1') ? 1 : 0) | ((log && *log == '1') ? 2 : 0);
+         atomic_store_explicit(&cached, flags, memory_order_relaxed);
+     }
+-    return (unsigned)flags;
++    return ((unsigned)flags & ~1u) | (ps3_ab_on(PS3_AB_GCM_BWW, flags & 1) ? 1u : 0u);
+ }
+ 
+ static void gcm_blocked_write_clear(void)

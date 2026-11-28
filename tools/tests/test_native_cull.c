@@ -26,6 +26,7 @@ void spu_direct_init(void) {}
 volatile unsigned g_ps3_ab_mask = 0;
 volatile int g_ps3_ab_phase = 0;
 volatile unsigned g_ps3_ab_gen = 0;
+volatile unsigned g_ps3_ab_on_bits = 0;
 
 #include "native_cull_cases.inc"
 int gt6_native_cull_13d20(spu_context* ctx);

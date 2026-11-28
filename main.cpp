@@ -95,6 +95,8 @@ extern "C" int      rsx_live_draw_init(void* hwnd, uint32_t w, uint32_t h,
 extern "C" void     rsx_live_draw_present(uint32_t buffer_id);
 extern "C" uint32_t rsx_live_draw_get_last_draws(void);
 extern "C" unsigned long long rsx_live_draw_fence_wait_us(unsigned* waits);
+extern "C" int g_spu_fix_count;                     /* [GT6 0175] spu_helpers.h (selectany), SPU_FIX_COUNT */
+extern "C" volatile long long g_spu_fix_lanes[9];
 extern "C" int      rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" int      rsx_null_backend_pump_messages(void);
 extern "C" void*    rsx_null_backend_get_hwnd(void);
@@ -497,28 +499,51 @@ static DWORD WINAPI threads_at(LPVOID p)
 /* [GT6 0165] the SPU forms of an AB build (spu_context.h): SPU_LS_VEC_ON=1 / SPU_CG_ON=1, or the A/B's lsvec / cg. */
 extern "C" int g_spu_ls_vec;
 extern "C" int g_spu_cg_on;
-static int s_spu_ls_vec_env = 0, s_spu_cg_env = 0;
+extern "C" int g_spu_fix_vec;      /* [GT6 0176] spu_helpers.h: GT6_SPU_FIX_VEC=1 / the A/B's fixvec */
+static int s_spu_ls_vec_env = 0, s_spu_cg_env = 0, s_spu_fix_vec_env = 0;
 static void ab_apply_spu(void)
 {
     g_spu_ls_vec = ps3_ab_on(PS3_AB_SPU_LS_VEC, s_spu_ls_vec_env);
     g_spu_cg_on = ps3_ab_on(PS3_AB_SPU_CG, s_spu_cg_env);
+    g_spu_fix_vec = ps3_ab_on(PS3_AB_SPU_FIX_VEC, s_spu_fix_vec_env);
 }
+/* [GT6 0172] GT6_AB_EACH=1: the switches of the list one at a time - A (all OFF), B1 (the first alone ON), A, B2 (the
+ * second alone), ..., A, Bn, A, B1, ... - so one run measures each against the A phases around it (tools\abprof.py
+ * prints one paired estimate per switch). The frame trace's "ab" column is then 0 for A and k for the k-th switch. */
+static unsigned s_ab_each_bits[16];
+static int s_ab_each_n = 0, s_ab_each_next = 0;
 static DWORD WINAPI ab_toggle(LPVOID p)
 {
     const DWORD period_ms = (DWORD)(uintptr_t)p;
     for (;;) {
         Sleep(period_ms);
-        g_ps3_ab_phase = g_ps3_ab_phase ? 0 : 1;
+        if (s_ab_each_n) {
+            if (g_ps3_ab_phase) { g_ps3_ab_phase = 0; g_ps3_ab_on_bits = 0; }
+            else {
+                const int k = s_ab_each_next;
+                s_ab_each_next = (k + 1) % s_ab_each_n;
+                g_ps3_ab_on_bits = s_ab_each_bits[k];
+                g_ps3_ab_phase = k + 1;
+            }
+        } else {
+            g_ps3_ab_phase = g_ps3_ab_phase ? 0 : 1;
+            g_ps3_ab_on_bits = g_ps3_ab_phase ? g_ps3_ab_mask : 0u;
+        }
         g_ps3_ab_gen = g_ps3_ab_gen + 1u;
         ab_apply_spu();
-        fprintf(stderr, "[ab] phase %c (switches 0x%X %s) at t=%.3f\n", g_ps3_ab_phase ? 'B' : 'A', g_ps3_ab_mask,
-                g_ps3_ab_phase ? "on" : "off", ps3_qpc_us() / 1e6);
+        if (s_ab_each_n && g_ps3_ab_phase)
+            fprintf(stderr, "[ab] phase B%d (switch 0x%X on alone) at t=%.3f\n", g_ps3_ab_phase, g_ps3_ab_on_bits,
+                    ps3_qpc_us() / 1e6);
+        else
+            fprintf(stderr, "[ab] phase %c (switches 0x%X %s) at t=%.3f\n", g_ps3_ab_phase ? 'B' : 'A', g_ps3_ab_mask,
+                    g_ps3_ab_phase ? "on" : "off", ps3_qpc_us() / 1e6);
     }
 }
 static void ab_start(void)
 {
     s_spu_ls_vec_env = getenv("SPU_LS_VEC_ON") && *getenv("SPU_LS_VEC_ON") == '1';
     s_spu_cg_env = getenv("SPU_CG_ON") && *getenv("SPU_CG_ON") == '1';
+    s_spu_fix_vec_env = getenv("GT6_SPU_FIX_VEC") && *getenv("GT6_SPU_FIX_VEC") == '1';
     ab_apply_spu();
     const char* e = getenv("GT6_AB");
     if (!e || !*e) return;
@@ -532,22 +557,39 @@ static void ab_start(void)
         static const struct { const char* name; unsigned bit; } names[] = {
             {"ra", PS3_AB_RA_CACHE}, {"hle", PS3_AB_HLE_SLOT}, {"pump", PS3_AB_PUMP_PEEK}, {"lockline", PS3_AB_LOCKLINE},
             {"lsvec", PS3_AB_SPU_LS_VEC}, {"cg", PS3_AB_SPU_CG}, {"live", PS3_AB_LIVE_HOLDERS},
-            {"cull", 0x0080u}};   /* [GT6 0168] the native cull of the car vertex job (gt6_native_cull.c, GT6_NATIVE_CULL) */
+            {"cull", PS3_AB_NATIVE_CULL},   /* [GT6 0168] the native cull of the car vertex job (gt6_native_cull.c) */
+            {"bww", PS3_AB_GCM_BWW},        /* [GT6 0169] an SPU PUT over the parked word wakes the walker */
+            {"fpmemo", PS3_AB_FP_SEEDLESS}, /* [GT6 0170] the fragment program memo by program alone */
+            {"fill", PS3_AB_NATIVE_FILL},   /* [GT6 0171] the job CRT's local-store fill as one memset */
+            {"wrch", PS3_AB_SPU_WRCH},      /* [GT6 0173] inline channel stores (a GT6_SPU_WRCH_INLINE=AB build) */
+            {"a8dec1", PS3_AB_NATIVE_A8DEC1}, /* [GT6 0174] the native a8dec1 vertex loop */
+            {"fixvec", PS3_AB_SPU_FIX_VEC}};  /* [GT6 0176] the SPU float fix-up four lanes at once */
         char buf[256];
         strncpy(buf, e, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
         for (char* t = strtok(buf, ",; "); t; t = strtok(NULL, ",; ")) {
             unsigned bit = 0;
             for (const auto& n : names) if (!_stricmp(t, n.name)) bit = n.bit;
             if (!bit) fprintf(stderr, "[ab] unknown switch name '%s' - ignored\n", t);
+            else if (!(mask & bit) && s_ab_each_n < 16) s_ab_each_bits[s_ab_each_n++] = bit;   /* in the list's order */
             mask |= bit;
         }
     }
+    const char* each = getenv("GT6_AB_EACH");
+    if (!(each && each[0] == '1') || s_ab_each_n < 2) s_ab_each_n = 0;   /* one switch, or a hex mask: the plain A/B */
     if (!mask) return;
     double period = 10.0;
     if (const char* pe = getenv("GT6_AB_PERIOD")) { const double v = atof(pe); if (v >= 1.0 && v <= 600.0) period = v; }
     g_ps3_ab_phase = 0;
+    g_ps3_ab_on_bits = 0;
     g_ps3_ab_mask = mask;
     ab_apply_spu();
+    if (s_ab_each_n) {
+        char list[160] = ""; int at = 0;
+        for (int k = 0; k < s_ab_each_n && at < (int)sizeof(list) - 16; ++k)
+            at += snprintf(list + at, sizeof(list) - (size_t)at, "%sB%d=0x%X", k ? " " : "", k + 1, s_ab_each_bits[k]);
+        fprintf(stderr, "[ab] in-run A/B, one switch at a time: A (0x%X OFF) / %s, every %.1f s, A first, at t=%.3f\n",
+                mask, list, period, ps3_qpc_us() / 1e6);
+    } else
     fprintf(stderr, "[ab] in-run A/B: switches 0x%X OFF (A) / ON (B) every %.1f s, A first, at t=%.3f\n", mask, period,
             ps3_qpc_us() / 1e6);
     HANDLE h = CreateThread(NULL, 0, ab_toggle, (LPVOID)(uintptr_t)(DWORD)(period * 1000.0), 0, NULL);
@@ -744,7 +786,17 @@ static DWORD WINAPI frame_clock(LPVOID)
                     ++secs;
                     gt6_ab_tick(secs);
                     { static unsigned long long n0 = 0;          /* every 5th report: how often the nudge was given */
-                      if (secs % 5 == 0) { fprintf(stderr, "[gt6] gcm nudges in the last 5 s: %llu\n", g_gcm_nudges - n0); n0 = g_gcm_nudges; } } }
+                      if (secs % 5 == 0) { fprintf(stderr, "[gt6] gcm nudges in the last 5 s: %llu\n", g_gcm_nudges - n0); n0 = g_gcm_nudges; } }
+                    /* [GT6 0175] SPU_FIX_COUNT=1: the SPU float lanes the exact per-lane forms redid (spu_helpers.h) */
+                    { static int fc = -1;
+                      if (fc < 0) { fc = getenv("SPU_FIX_COUNT") ? 1 : 0; g_spu_fix_count = fc; }
+                      if (fc && secs % 5 == 0) {
+                          long long v[9];
+                          for (int i = 0; i < 9; i++) { v[i] = g_spu_fix_lanes[i]; g_spu_fix_lanes[i] = 0; }
+                          fprintf(stderr, "[fix] lanes redone in 5 s (exponent 255 / exponent 0 + fraction / other): "
+                                  "fa %lld %lld %lld  fm %lld %lld %lld  fma %lld %lld %lld\n",
+                                  v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
+                      } } }
                   vbt_t0 = vbt_n;
                   g_present_n = 0; g_present_sum_us = 0; g_present_max_us = 0;
                   fw0 = fw; fn0 = fn; g_kick_wait_us = 0;

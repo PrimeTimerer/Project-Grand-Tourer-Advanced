@@ -1,0 +1,342 @@
+diff --git a/include/ps3emu/ps3_ab.h b/include/ps3emu/ps3_ab.h
+index 71cfbcb..87c64e8 100644
+--- a/include/ps3emu/ps3_ab.h
++++ b/include/ps3emu/ps3_ab.h
+@@ -16,8 +16,10 @@ extern "C" {
+ #endif
+ 
+ extern volatile unsigned g_ps3_ab_mask;    /* the switches in the A/B (bits below); 0 = no A/B */
+-extern volatile int      g_ps3_ab_phase;   /* 0 = A (the switches in the mask OFF), 1 = B (ON) */
++extern volatile int      g_ps3_ab_phase;   /* 0 = A (the switches in the mask OFF), 1 = B (ON); [GT6 0172] in the per-switch
++                                            * form (GT6_AB_EACH=1) k = the k-th switch of the list ON alone */
+ extern volatile unsigned g_ps3_ab_gen;     /* bumped at every flip */
++extern volatile unsigned g_ps3_ab_on_bits; /* [GT6 0172] the switches of the mask ON in this phase */
+ 
+ #define PS3_AB_RA_CACHE   0x0001u   /* PPU_RA_CACHE        ([GT6 0160], ppu_loader.cpp) */
+ #define PS3_AB_HLE_SLOT   0x0002u   /* PPU_HLE_SLOT        ([GT6 0162], ppu_hle.cpp) */
+@@ -26,13 +28,20 @@ extern volatile unsigned g_ps3_ab_gen;     /* bumped at every flip */
+ #define PS3_AB_SPU_LS_VEC 0x0010u   /* g_spu_ls_vec ([GT6 0161]) - only in a GT6_SPU_LS_VEC=AB build ([GT6 0165]) */
+ #define PS3_AB_SPU_CG     0x0020u   /* g_spu_cg_on  ([GT6 0159]) - only in a GT6_SPU_CG_HELPERS=AB build ([GT6 0165]) */
+ #define PS3_AB_LIVE_HOLDERS 0x0040u /* the live-holder skip ([GT6 0166], spu_coherency.c; counting runs in both phases) */
+-/* 0x0080: the port's native cull (GT6 gt6_native_cull.c, GT6_AB "cull") */
++#define PS3_AB_NATIVE_CULL 0x0080u  /* the port's native cull (GT6 gt6_native_cull.c, GT6_AB "cull") */
+ #define PS3_AB_GCM_BWW    0x0100u   /* GCM_BLOCKED_WRITE_KICK ([GT6 0169], cellGcmSys.c): an SPU PUT over the parked word
+                                      * wakes the walker at once instead of its 1 ms timed wait */
++#define PS3_AB_FP_SEEDLESS 0x0200u  /* LD_FP_MEMO_SEEDLESS ([GT6 0170], rsx_live_draw.c): the fragment memo by program alone */
++#define PS3_AB_NATIVE_FILL 0x0400u  /* GT6_NATIVE_FILL ([GT6 0171], the port's gt6_native_fill.c): the job CRT's LS fill */
++#define PS3_AB_SPU_WRCH   0x0800u   /* [GT6 0173] the lifted code's inline stores of the DMA argument channels and the tag
++                                     * mask - only in a GT6_SPU_WRCH_INLINE=AB build (spu_helpers.h) */
++#define PS3_AB_NATIVE_A8DEC1 0x1000u /* GT6_NATIVE_A8DEC1 ([GT6 0174], the port's gt6_native_a8dec1.c) */
++#define PS3_AB_SPU_FIX_VEC 0x2000u  /* GT6_SPU_FIX_VEC ([GT6 0176], spu_helpers.h g_spu_fix_vec): the SPU float fix-up four lanes
++                                     * at once (main.cpp ab_apply_spu) */
+ 
+ static inline int ps3_ab_on(unsigned bit, int env_on)
+ {
+-    return (g_ps3_ab_mask & bit) ? (g_ps3_ab_phase != 0) : env_on;
++    return (g_ps3_ab_mask & bit) ? ((g_ps3_ab_on_bits & bit) != 0) : env_on;
+ }
+ 
+ #ifdef __cplusplus
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index e953c33..0781b38 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1080,7 +1080,7 @@ static void ld_present_measure_record(u32 guest_frame)
+                 g_ld_setup_count[0], g_ld_setup_count[1], g_ld_setup_count[2], g_ld_setup_count[3],
+                 g_ld_setup_ms[0], g_ld_setup_ms[1], g_ld_setup_ms[2], g_ld_setup_ms[3],
+                 g_ld_fence_wait_us, (double)now.QuadPart / g_ld_qpc_frequency,
+-                g_ps3_ab_mask ? (g_ps3_ab_phase != 0) : -1);
++                g_ps3_ab_mask ? (int)g_ps3_ab_phase : -1);   /* [GT6 0172] 0 = A; 1 = B, or the k-th switch alone */
+         g_ld_trace_previous = now.QuadPart;
+         if ((present_id & 63u) == 0u) fflush(g_ld_frame_trace);
+     }
+@@ -9994,12 +9994,94 @@ static int ld_fp_memo_same(const ld_fp_memo* m, const u8* uc)
+     return pos >= m->size || !memcmp(m->bytes + pos, uc + pos, m->size - pos);
+ }
+ 
++/* [GT6 0170] The fragment program memo without the vertex program in its key (an outside review's "bug A", checked
++ * against this code). Every value get_pso takes from an entry - the size, the sampled units, the colour and shadow
++ * masks, the constant places - depends on the program's bytes alone; only the PSO key folds in `seed` (the vertex
++ * program's hash). With the seed in the memo's key, each vertex program a fragment program was paired with took an
++ * entry of its own and the 2-way sets thrashed: about 9,000 misses in 5 s at a 16-car race start ("not kept" in
++ * [ld-flush], ft1), each one measuring, walking and copying the program again. Here an entry is one program
++ * (location, offset, buffered, bytes) and keeps the keys of the last LD_FP_SEEDS seeds it was asked with; a seed it
++ * does not have costs only the key's hash. The key is the same computation as before (rsx_fp_structural_hash or
++ * fnv1a over the program with that seed), so every PSO and the shader and PSO disk caches keep their keys.
++ * LD_FP_MEMO_SEEDLESS=1 turns it on (default off until measured); GT6_AB "fpmemo" (PS3_AB_FP_SEEDLESS) for an in-run
++ * A/B. The two memos are separate arrays, so a phase change never sees the other's entries. */
++#define LD_FP_SEEDS 8u
++#define LD_FP_MEMO2_WAYS 2u
++#define LD_FP_MEMO2_N 1024u                /* LD_FP_MEMO2_N / LD_FP_MEMO2_WAYS sets, a power of two; 17 MB */
++typedef struct {
++    ld_fp_memo m;                          /* the program and what get_pso reads (m.seed / m.key: the first asker) */
++    u64 seeds[LD_FP_SEEDS], keys[LD_FP_SEEDS];
++    u8 n_seeds, next_seed;
++} ld_fp_memo2;
++static ld_fp_memo2 g_fp_memo2[LD_FP_MEMO2_N];
++static u8 g_fp2_way_next[LD_FP_MEMO2_N / LD_FP_MEMO2_WAYS];
++static unsigned long long g_ld_fp_seed_new;   /* a kept program asked with a seed it did not have: only the key hashed */
++static int ld_fp_seedless_on(void)
++{
++    static int env = -1;
++    if (env < 0) { const char* e = getenv("LD_FP_MEMO_SEEDLESS"); env = (e && e[0] == '1') ? 1 : 0; }
++    return ps3_ab_on(PS3_AB_FP_SEEDLESS, env);
++}
++static u32 ld_fp_facts_seedless(u32 loc, u32 off, const u8* fp_uc, u64 seed, u64* key_out, int buffered)
++{
++    g_fp_last = NULL;
++    ld_fp_memo2* e = NULL;
++    int changed = 0;
++    const u32 h = off * 0x9E3779B1u ^ loc * 0x85EBCA6Bu ^ (u32)buffered;
++    const u32 set = (h ^ (h >> 15)) & (LD_FP_MEMO2_N / LD_FP_MEMO2_WAYS - 1u);
++    ld_fp_memo2* free_way = NULL;
++    for (u32 way = 0; way < LD_FP_MEMO2_WAYS; way++) {
++        ld_fp_memo2* c = &g_fp_memo2[set * LD_FP_MEMO2_WAYS + way];
++        if (!c->m.size) { if (!free_way) free_way = c; continue; }
++        if (c->m.loc != loc || c->m.off != off || c->m.buffered != buffered) continue;
++        if (ld_fp_memo_same(&c->m, fp_uc)) {
++            g_ld_memo_stats[2]++;
++            g_fp_last = &c->m;
++            for (u32 s = 0; s < c->n_seeds; s++)
++                if (c->seeds[s] == seed) { *key_out = c->keys[s]; return c->m.size; }
++            /* the bytes the key covers are the kept ones (the comparison above skipped exactly the constant slots the
++             * structural hash skips), so the key of the current bytes is the key a fresh miss would compute */
++            const u64 key = buffered ? rsx_fp_structural_hash(fp_uc, c->m.size, seed) : fnv1a(fp_uc, c->m.size, seed);
++            const u32 slot = c->n_seeds < LD_FP_SEEDS ? c->n_seeds++ : (c->next_seed++ % LD_FP_SEEDS);
++            c->seeds[slot] = seed; c->keys[slot] = key;
++            g_ld_fp_seed_new++;
++            *key_out = key;
++            return c->m.size;
++        }
++        e = c; changed = 1;        /* an older state of this program: its entry is the one to replace */
++    }
++    if (!e) e = free_way ? free_way : &g_fp_memo2[set * LD_FP_MEMO2_WAYS + (g_fp2_way_next[set]++ % LD_FP_MEMO2_WAYS)];
++    g_ld_memo_stats[3]++;
++    const u32 size = rsx_fp_program_size(fp_uc, 0x10000);
++    if (!size) return 0;
++    const u64 key = buffered ? rsx_fp_structural_hash(fp_uc, size, seed) : fnv1a(fp_uc, size, seed);
++    g_ld_fp_miss_why[size > sizeof e->m.bytes ? 2 : changed ? 1 : 0]++;
++    if (size <= sizeof e->m.bytes) {
++        ld_fp_memo* m = &e->m;
++        m->size = 0;
++        m->loc = loc; m->off = off; m->seed = seed; m->buffered = buffered; m->key = key;
++        m->units = rsx_fp_texture_units(fp_uc, size);
++        rsx_live_texture_program_masks(fp_uc, size, &m->gamma_units, &m->expand_units);
++        m->shadow_units = rsx_fp_shadow_texture_units(fp_uc, size);
++        const int places = rsx_fp_constant_places(fp_uc, size, m->const_at, LD_FP_MEMO_CONSTS);
++        m->n_const = places < 0 ? UINT32_MAX : (u32)places;
++        memcpy(m->bytes, fp_uc, size);
++        e->seeds[0] = seed; e->keys[0] = key; e->n_seeds = 1; e->next_seed = 1;
++        m->size = size;
++        g_fp_last = m;
++    }
++    *key_out = key;
++    return size;
++}
++
+ /* Fragment program size and the PSO key folded from `seed` (the vertex
+  * program's hash), exactly as get_pso computed them. 0 = no END bit. */
+ static u32 ld_fp_facts(u32 loc, u32 off, const u8* fp_uc, u64 seed, u64* key_out)
+ {
+     const int buffered = ld_fp_constants_buffered();
+     const int memo = ld_program_memo_enabled();
++    if (memo && ld_fp_seedless_on())
++        return ld_fp_facts_seedless(loc, off, fp_uc, seed, key_out, buffered);
+     ld_fp_memo* m = NULL;
+     g_fp_last = NULL;
+     int changed = 0;
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 09c7133..3dfca55 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2844,6 +2844,7 @@ extern "C" {
+ volatile unsigned g_ps3_ab_mask = 0;
+ volatile int      g_ps3_ab_phase = 0;
+ volatile unsigned g_ps3_ab_gen = 0;
++volatile unsigned g_ps3_ab_on_bits = 0;   /* [GT6 0172] the switches of the mask ON in this phase */
+ }
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
+ {
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index dc07b41..cfc7d8c 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1176,13 +1176,19 @@ static int channel_is_mfc(uint32_t ch)
+ /* ===========================================================================
+  * Channel write
+  * ===========================================================================*/
++/* [GT6 0173] the lifted code's inline channel stores in a SPU_WRCH_INLINE=2 build (spu_helpers.h): bit 0 = allowed
++ * (SPU_CHHIST off, which counts every write here), bit 1 = GT6_SPU_WRCH_INLINE not "0"; set by the first call below. */
++volatile int g_spu_wrch_inline = 0;
++
+ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+ {
+     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
+      * worker that never issues an MFC command is either not being handed its
+      * work descriptor or is waiting on a channel we never satisfy; the channel
+      * mix distinguishes those. */
+-    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
++    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0;
++          const char* w = getenv("GT6_SPU_WRCH_INLINE");
++          g_spu_wrch_inline = s_c ? 0 : (1 | ((w && w[0] == '0') ? 0 : 2)); }
+       if (s_c) { static unsigned long long w[128]; static unsigned long long n;
+           w[channel & 127]++;
+           if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 0e97e50..3a9af97 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -233,7 +233,7 @@ static void spu_coh_live_begin(spu_context* c, uint32_t ea)
+ static inline int spu_coh_live_idle(uint32_t line)
+ {
+     if (!spu_coh_live_enabled()) return 0;
+-    if ((g_ps3_ab_mask & PS3_AB_LIVE_HOLDERS) && !g_ps3_ab_phase) return 0;   /* the A/B's phase A: walk as before */
++    if ((g_ps3_ab_mask & PS3_AB_LIVE_HOLDERS) && !(g_ps3_ab_on_bits & PS3_AB_LIVE_HOLDERS)) return 0;   /* the A/B's phase A: walk as before */
+     if (__atomic_load_n(spu_coh_live_slot(line), __ATOMIC_RELAXED) != 0) return 0;
+     __atomic_fetch_add(&g_spu_coh_live_skips, 1ul, __ATOMIC_RELAXED);
+     return 1;
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 8d343d5..d5b1dfa 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1148,18 +1148,95 @@ SPU__X8_INLINE __m128i spu__x8_trunc0(__m256d d, __m128i* ok, __m128i* zm, const
+ SPU__X8_INLINE int spu__x8_all4(__m128i m) { return _mm_movemask_ps(_mm_castsi128_ps(m)) == 0xF; }
+ SPU__X8_INLINE __m128i spu__x8_ld(u128 a) { return _mm_loadu_si128((const __m128i*)a._u32); }
+ SPU__X8_INLINE u128 spu__x8_st(__m128i v) { u128 r; _mm_storeu_si128((__m128i*)r._u32, v); return r; }
++/* [GT6 0175] SPU_FIX_COUNT=1 (main.cpp sets g_spu_fix_count, prints "[fix]" every 5 s): the lanes the per-lane forms
++ * below redo, by op (fa, fm, fma) and by why - an operand of biased exponent 255 (the SPU's extended range, Inf or NaN
++ * to the host), an operand of exponent 0 with a fraction (an SPU zero the host reads as a denormal), or neither (a
++ * result outside the normal range, an exponent gap, an fma that rounds onto a boundary). Counted only here, on the
++ * slow path; plain increments - a diagnostic, approximate under contention. */
++SPU_GATE int g_spu_fix_count = 0;
++SPU_GATE volatile long long g_spu_fix_lanes[9] = {0};
++static inline void spu__fix_note(int op, uint32_t x, uint32_t y, uint32_t z) {
++    const uint32_t ex = (x >> 23) & 0xFFu, ey = (y >> 23) & 0xFFu, ez = (z >> 23) & 0xFFu;
++    const int why = (ex == 255u || ey == 255u || ez == 255u) ? 0
++                  : ((!ex && (x << 9)) || (!ey && (y << 9)) || (!ez && (z << 9))) ? 1 : 2;
++    g_spu_fix_lanes[op * 3 + why]++;
++}
++/* [GT6 0176] GT6_SPU_FIX_VEC=1 (main.cpp sets g_spu_fix_vec; A/B "fixvec"): on a thread in the SPU float mode the
++ * per-lane forms below are four lanes at once and exact for every operand. The race sample of [GT6 0175] had 15 to 20
++ * million lanes a second redone one by one, 98 % of them for an operand of biased exponent 255 - the SPU's own large
++ * numbers (2^128 range), which the host reads as Inf or NaN: mostly the unused lanes of scalar SPU code.
++ *  - Each SPU single becomes a double with its biased exponent taken as a number like any other (1..255) and exponent
++ *    0 as zero - exact.
++ *  - A product of two is exact in double (48 bits, magnitudes 2^-252 .. 2^258: never denormal, never infinite).
++ *  - The mode's MXCSR rounds toward zero, so the one rounding of a double sum (or of a product plus an addend) is a
++ *    truncation to 53 bits, and truncating that to 24 bits is truncating the exact value to 24 bits: the 24-bit
++ *    numbers are 53-bit numbers, and truncation toward zero composes. x + (-x) is +0 in this mode.
++ *  - Packing takes the top 24 bits, saturates at biased exponent 255 (sign | 0x7FFFFFFF) and flushes below 1 to +0 -
++ *    the SPU's range, as spu__sf_pack does.
++ * A thread not in the mode (spu__xv_rz) keeps the per-lane forms. Bit-identical with them: tools/tests/test_spu_fix_vec.c. */
++SPU_GATE int g_spu_fix_vec = 0;
++#if defined(__FMA__) && !defined(SPU_FLOAT_RZ_BY_TLS)
++SPU__X8_INLINE int spu__xv_rz(void) { unsigned short cw; __asm__("fnstcw %0" : "=m"(cw)); return (cw & SPU_X87_RZ_MARK) != 0; }
++#elif defined(__FMA__)
++SPU__X8_INLINE int spu__xv_rz(void) { return t_spu_float_rz; }
++#else
++SPU__X8_INLINE int spu__xv_rz(void) { return 0; }
++#endif
++SPU__X8_INLINE __m256d spu__xv_wide(__m128i x) {
++    const __m256i q = _mm256_cvtepu32_epi64(x);
++    const __m256i be = _mm256_and_si256(_mm256_srli_epi64(q, 23), _mm256_set1_epi64x(0xFF));
++    const __m256i d = _mm256_or_si256(_mm256_slli_epi64(_mm256_srli_epi64(q, 31), 63),
++                      _mm256_or_si256(_mm256_slli_epi64(_mm256_add_epi64(be, _mm256_set1_epi64x(1023 - 127)), 52),
++                                      _mm256_slli_epi64(_mm256_and_si256(q, _mm256_set1_epi64x(0x7FFFFF)), 29)));
++    return _mm256_castsi256_pd(_mm256_and_si256(d, _mm256_cmpgt_epi64(be, _mm256_setzero_si256())));
++}
++SPU__X8_INLINE __m128i spu__xv_pack(__m256d v) {
++    const __m256i u = _mm256_castpd_si256(v);
++    const __m256i b = _mm256_sub_epi64(_mm256_and_si256(_mm256_srli_epi64(u, 52), _mm256_set1_epi64x(0x7FF)),
++                                       _mm256_set1_epi64x(1023 - 127));                  /* the SPU's biased exponent */
++    const __m256i s = _mm256_and_si256(_mm256_srli_epi64(u, 32), _mm256_set1_epi64x(0x80000000));
++    __m256i r = _mm256_or_si256(s, _mm256_or_si256(_mm256_slli_epi64(b, 23),
++                                                   _mm256_and_si256(_mm256_srli_epi64(u, 29), _mm256_set1_epi64x(0x7FFFFF))));
++    r = _mm256_blendv_epi8(r, _mm256_or_si256(s, _mm256_set1_epi64x(0x7FFFFFFF)), _mm256_cmpgt_epi64(b, _mm256_set1_epi64x(255)));
++    r = _mm256_andnot_si256(_mm256_cmpgt_epi64(_mm256_set1_epi64x(1), b), r);         /* below the range, and zero */
++    return spu__x8_narrow(r);
++}
++SPU__X8_INLINE u128 spu__xv_fa(u128 a, u128 b, uint32_t negb) {
++    return spu__x8_st(spu__xv_pack(_mm256_add_pd(spu__xv_wide(spu__x8_ld(a)),
++                                                 spu__xv_wide(_mm_xor_si128(spu__x8_ld(b), _mm_set1_epi32((int)negb))))));
++}
++SPU__X8_INLINE u128 spu__xv_fm(u128 a, u128 b) {
++    return spu__x8_st(spu__xv_pack(_mm256_mul_pd(spu__xv_wide(spu__x8_ld(a)), spu__xv_wide(spu__x8_ld(b)))));
++}
++SPU__X8_INLINE u128 spu__xv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
++    const __m256d p = _mm256_mul_pd(spu__xv_wide(_mm_xor_si128(spu__x8_ld(a), _mm_set1_epi32((int)negp))),
++                                    spu__xv_wide(spu__x8_ld(b)));                       /* exact */
++    return spu__x8_st(spu__xv_pack(_mm256_add_pd(p, spu__xv_wide(_mm_xor_si128(spu__x8_ld(c), _mm_set1_epi32((int)negc))))));
++}
+ SPU__X8_SLOW u128 spu__x8_fa_fix(u128 r, __m128i ok, u128 a, u128 b, uint32_t negb) {
+     const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
++    if (g_spu_fix_count)
++        for (int i = 0; i < 4; i++) if (!(m >> i & 1)) spu__fix_note(0, a._u32[i], b._u32[i], 0);
++    if (g_spu_fix_vec && spu__xv_rz())
++        return spu__xv_fa(a, b, negb);
+     for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fa_any(a._u32[i], b._u32[i] ^ negb);
+     return r;
+ }
+ SPU__X8_SLOW u128 spu__x8_fm_fix(u128 r, __m128i ok, u128 a, u128 b) {
+     const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
++    if (g_spu_fix_count)
++        for (int i = 0; i < 4; i++) if (!(m >> i & 1)) spu__fix_note(1, a._u32[i], b._u32[i], 0);
++    if (g_spu_fix_vec && spu__xv_rz())
++        return spu__xv_fm(a, b);
+     for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fm_any(a._u32[i], b._u32[i]);
+     return r;
+ }
+ SPU__X8_SLOW u128 spu__x8_fma_fix(u128 r, __m128i ok, u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+     const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
++    if (g_spu_fix_count)
++        for (int i = 0; i < 4; i++) if (!(m >> i & 1)) spu__fix_note(2, a._u32[i], b._u32[i], c._u32[i]);
++    if (g_spu_fix_vec && spu__xv_rz())
++        return spu__xv_fma(a, b, c, negp, negc);
+     for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);
+     return r;
+ }
+@@ -2507,4 +2584,44 @@ static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
+  * SPU_CODEGEN_HELPERS (CMake GT6_SPU_CG_HELPERS) - after every original, so (spu_name)(...) is still the original. */
+ #include "spu_codegen_helpers.h"
+ 
++/* [GT6 0173] SPU_WRCH_INLINE (CMake GT6_SPU_WRCH_INLINE, only for the lifted SPU sources): the channel writes that only
++ * store a field of the context - the five DMA argument channels MFC_LSA .. MFC_TagID (spu_wrch hands them to
++ * mfc_channel_write(NULL, ...)) and MFC_WrTagMask (its engine lookup feeds nothing: mfc_channel_write only stores the
++ * mask) - are stored inline instead of a call to spu_wrch, 6 of the 8 writes a lifted DMA issues. Every other channel,
++ * and these when the fast path is off, still goes to the real spu_wrch.
++ *   SPU_WRCH_INLINE=1: always (no runtime test, so a lifted function's control flow - and its PGO profile - stays as
++ *                      it was); SPU_CHHIST then counts only the channels that still reach spu_wrch.
++ *   SPU_WRCH_INLINE=2: the measuring form - only while g_spu_wrch_inline (spu_channels.c, set by the first real
++ *                      spu_wrch: bit 0 = SPU_CHHIST off, bit 1 = GT6_SPU_WRCH_INLINE not "0") allows it and the in-run
++ *                      A/B "wrch" (PS3_AB_SPU_WRCH) has it ON. */
++#if defined(SPU_WRCH_INLINE) && SPU_WRCH_INLINE
++void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
++#if SPU_WRCH_INLINE == 2
++#include "ps3emu/ps3_ab.h"
++extern volatile int g_spu_wrch_inline;
++static inline int spu_wrch_inline_on(void)
++{
++    const int f = g_spu_wrch_inline;
++    return (f & 1) && ps3_ab_on(PS3_AB_SPU_WRCH, (f & 2) != 0);
++}
++#else
++#define spu_wrch_inline_on() 1
++#endif
++static inline void spu_wrch_inl(spu_context* ctx, uint32_t channel, u128 value)
++{
++    const uint32_t v = value._u32[0];         /* the preferred slot, as spu_wrch */
++    switch (channel) {
++    case MFC_LSA:       if (spu_wrch_inline_on()) { ctx->mfc_lsa = v; return; } break;
++    case MFC_EAH:       if (spu_wrch_inline_on()) { ctx->mfc_eah = v; return; } break;
++    case MFC_EAL:       if (spu_wrch_inline_on()) { ctx->mfc_eal = v; return; } break;
++    case MFC_Size:      if (spu_wrch_inline_on()) { ctx->mfc_size = v; return; } break;
++    case MFC_TagID:     if (spu_wrch_inline_on()) { ctx->mfc_tag = v & 0x1Fu; return; } break;
++    case MFC_WrTagMask: if (spu_wrch_inline_on()) { ctx->mfc_tag_mask = v; return; } break;
++    default: break;
++    }
++    (spu_wrch)(ctx, channel, value);
++}
++#define spu_wrch(c, ch, v) spu_wrch_inl((c), (ch), (v))
++#endif
++
+ #endif /* SPU_HELPERS_H */
