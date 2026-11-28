@@ -34,8 +34,34 @@ END = "/* GT6_NATIVE_A8DEC1 end */\n"
 GUARD = "#if defined(SPU_CALL_FAST_PATH) && defined(SPU_DIRECT_TAILCALLS)\n"
 HOOK = (GUARD +
         "        if (gt6_native_a8dec1_gate(ctx, a8dec1_fused_pcs, A8DEC1_FUSED_NPCS)) {"
-        " a8dec1_fused_6750(ctx); SPU_DIRECT(ctx, 0x%X, @_spu_func_%08X); }   /* GT6_NATIVE_A8DEC1 */\n"
+        " if (spu__x8_rz() && a8dec1_consts_ok(ctx)) gt6_native_a8dec1_lv(ctx, a8dec1_fused_6750_lv); else a8dec1_fused_6750(ctx);"
+        " SPU_DIRECT(ctx, 0x%X, @_spu_func_%08X); }   /* GT6_NATIVE_A8DEC1 */\n"
         "#endif\n") % (EXIT, EXIT)
+# the hook lines of earlier versions, taken out like the current one ([GT6 0179]: the live-lane loop called directly)
+OLD_HOOKS = [(GUARD +
+              "        if (gt6_native_a8dec1_gate(ctx, a8dec1_fused_pcs, A8DEC1_FUSED_NPCS)) {"
+              " if (spu__x8_rz() && a8dec1_consts_ok(ctx)) a8dec1_fused_6750_lv(ctx); else a8dec1_fused_6750(ctx);"
+              " SPU_DIRECT(ctx, 0x%X, @_spu_func_%08X); }   /* GT6_NATIVE_A8DEC1 */\n"
+              "#endif\n") % (EXIT, EXIT)]
+NF_HELPERS = (
+    "static inline u128 a8nf_out(__m128i s) { s = _mm_andnot_si128(_mm_cmpeq_epi32(s, _mm_set1_epi32((int)0x80000000u)), s);"
+    " u128 r; memcpy(&r, &s, 16); return r; }\n"
+    "static inline __m128 a8nf_in(u128 a, uint32_t neg) { __m128i r; memcpy(&r, &a, 16);"
+    " return _mm_castsi128_ps(_mm_xor_si128(r, _mm_set1_epi32((int)neg))); }\n"
+    # [GT6 0179] the live-lane forms (tools/spu_lanes.py): the host's op of the SPU float mode; the exact helper only
+    # when a LIVE word (bit k of live = word k) is out of the normal range; the other words are never read.
+    "static inline int a8lv_bad(__m128i s, int live) {"
+    " return _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(_mm_and_si128(s, _mm_set1_epi32(0x7FFFFFFF)),"
+    " _mm_set1_epi32(0x7F7FFFFE)))) & live; }\n"
+    "static inline u128 a8lv_fm(u128 a, u128 b, int live) {"
+    " const __m128i s = _mm_castps_si128(_mm_mul_ps(a8nf_in(a, 0u), a8nf_in(b, 0u)));"
+    " return __builtin_expect(a8lv_bad(s, live), 0) ? spu__xr_fm(a, b) : a8nf_out(s); }\n"
+    "static inline u128 a8lv_fa(u128 a, u128 b, uint32_t nb, int live) {"
+    " const __m128i s = _mm_castps_si128(_mm_add_ps(a8nf_in(a, 0u), a8nf_in(b, nb)));"
+    " return __builtin_expect(a8lv_bad(s, live), 0) ? spu__xr_fa(a, b, nb) : a8nf_out(s); }\n"
+    "static inline u128 a8lv_fma(u128 a, u128 b, u128 c, uint32_t np, uint32_t nc, int live) {"
+    " const __m128i s = _mm_castps_si128(_mm_fmadd_ps(a8nf_in(a, np), a8nf_in(b, 0u), a8nf_in(c, nc)));"
+    " return __builtin_expect(a8lv_bad(s, live), 0) ? spu__xr_fma(a, b, c, np, nc) : a8nf_out(s); }\n")
 
 FUNC_RE = re.compile(r"^void (\w+)_spu_func_([0-9A-F]{8})\(spu_context\* ctx\) \{\n", re.M)
 DIRECT_RE = re.compile(r"^\{ SPU_DIRECT\(ctx, 0x([0-9A-Fa-f]+), \w+\); \}$")
@@ -84,8 +110,9 @@ def closure(funcs: dict, entry: int, stop: set[int]) -> set[int]:
 
 
 class Gen:
-    def __init__(self, funcs: dict, mod: str):
+    def __init__(self, funcs: dict, mod: str, site_prefix: str = "C"):
         self.funcs, self.mod = funcs, mod
+        self.site_prefix = site_prefix
         self.sites = 0
         self.regs: set[int] = set()
         self.pcs: set[int] = set()
@@ -144,7 +171,7 @@ class Gen:
             if m.group(2) != self.mod:
                 raise SystemExit("a call into another module: " + s)
             self.sites += 1
-            site = "C%d" % self.sites
+            site = "%s%d" % (self.site_prefix, self.sites)
             self.regs.add(0)
             self.lines.append("r0 = spu_link(0x%s);" % m.group(1))
             self.lines.append("goto %s_%05X;" % (site, int(m.group(3), 16)))
@@ -190,24 +217,89 @@ def generate(funcs: dict, mod: str) -> str:
     regs = sorted(g.regs)
     out = [BEGIN, GUARD,
            "int gt6_native_a8dec1_gate(spu_context* ctx, const uint32_t* pcs, unsigned npcs);   /* gt6_native_a8dec1.c */\n",
+           "/* [GT6 0185] gt6_native_a8dec1.c: eight vertices at once (AVX2), the live-lane loop for the rest */\n",
+           "void gt6_native_a8dec1_lv(spu_context* ctx, void (*lv)(spu_context*));\n",
            "#define A8DEC1_FUSED_NPCS %du\n" % len(pcs),
            "static const uint32_t a8dec1_fused_pcs[A8DEC1_FUSED_NPCS] = {\n"]
     for i in range(0, len(pcs), 10):
         out.append("    " + ", ".join("0x%X" % p for p in pcs[i:i + 10]) + ",\n")
     out.append("};\n")
-    out.append("/* the lifted loop at 0x%X up to its exit to 0x%X, the SPU registers as locals (see the tool) */\n" % (LOOP, EXIT))
-    out.append("static void a8dec1_fused_6750(spu_context* ctx)\n{\n")
-    for i in range(0, len(regs), 8):
-        out.append("    u128 " + ", ".join("r%d = ctx->gpr[%d]" % (r, r) for r in regs[i:i + 8]) + ";\n")
+    out.append(NF_HELPERS)
+    for name in ("a8dec1_fused_6750",):
+        out.append("/* the lifted loop at 0x%X up to its exit to 0x%X, the SPU registers as locals (see the tool) */\n" % (
+            LOOP, EXIT))
+        out.append("static void %s(spu_context* ctx)\n{\n" % name)
+        for i in range(0, len(regs), 8):
+            out.append("    u128 " + ", ".join("r%d = ctx->gpr[%d]" % (r, r) for r in regs[i:i + 8]) + ";\n")
+        out.append("    goto L_%05X;\n" % LOOP)
+        for line in g.lines:
+            out.append(("%s\n" if line.endswith(":;") else "    %s\n") % line)
+        out.append("L_exit:\n")
+        for i in range(0, len(regs), 6):
+            out.append("    " + " ".join("ctx->gpr[%d] = r%d;" % (r, r) for r in regs[i:i + 6]) + "\n")
+        out.append("    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : ctx->image_id;   /* as spu_img_restore after each call */\n")
+        out.append("}\n")
+    # [GT6 0179] the live-lane form: every pass but the last with the float ops by lane liveness (tools/spu_lanes.py),
+    # the last pass (vertices left = 1 at its start) through an exact copy "E" of the same blocks, so every register
+    # leaves as the lifted loop leaves it; the module constants the liveness used are checked first (a8dec1_consts_ok)
+    import spu_lanes
+    ge = Gen(funcs, mod, site_prefix="EC")
+    ge.proc(LOOP, "E", None, {EXIT})
+    first = g.lines.index("L_%05X:;" % LOOP)
+    lines = (g.lines[:first + 1] + ["if ((r90._u32[0] - r84._u32[0]) == 1u) goto E_%05X;" % LOOP] + g.lines[first + 1:]
+             + ge.lines)
+    prog = spu_lanes.Program(lines, module_bytes(mod), 0x4000, aligned_regs=(1,))
+    lv_lines, counts = prog.rewrite("E")
+    out.append("/* the module constants the lane liveness took as known (LS address, 16 bytes) */\n")
+    out.append("static const struct { uint32_t addr; uint8_t b[16]; } a8dec1_lsconst[] = {\n")
+    for addr in sorted(prog.lsconst):
+        out.append("    { 0x%X, { %s } },\n" % (addr, ", ".join("0x%02X" % x for x in prog.lsconst[addr])))
+    if not prog.lsconst:
+        out.append("    { 0, { 0 } },\n")
+    out.append("};\n")
+    out.append("static int a8dec1_consts_ok(const spu_context* ctx)\n{\n"
+               "    for (unsigned i = 0; i < sizeof a8dec1_lsconst / sizeof a8dec1_lsconst[0]; ++i)\n"
+               "        if (a8dec1_lsconst[i].addr && memcmp(ctx->ls + a8dec1_lsconst[i].addr, a8dec1_lsconst[i].b, 16))\n"
+               "            return 0;\n    return 1;\n}\n")
+    out.append("/* the live-lane form: float ops by liveness - %d dropped (result never read), %d on the live words only, "
+               "%d exact; the last pass exact */\n" % (counts["dead"], counts["partial"], counts["full"]))
+    out.append("static void a8dec1_fused_6750_lv(spu_context* ctx)\n{\n")
+    allregs = sorted(set(regs) | ge.regs)
+    for i in range(0, len(allregs), 8):
+        out.append("    u128 " + ", ".join("r%d = ctx->gpr[%d]" % (r, r) for r in allregs[i:i + 8]) + ";\n")
     out.append("    goto L_%05X;\n" % LOOP)
-    for line in g.lines:
+    for line in lv_lines:
         out.append(("%s\n" if line.endswith(":;") else "    %s\n") % line)
     out.append("L_exit:\n")
-    for i in range(0, len(regs), 6):
-        out.append("    " + " ".join("ctx->gpr[%d] = r%d;" % (r, r) for r in regs[i:i + 6]) + "\n")
-    out.append("    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : ctx->image_id;   /* as spu_img_restore after each call */\n")
-    out.append("}\n#endif\n" + END)
+    for i in range(0, len(allregs), 6):
+        out.append("    " + " ".join("ctx->gpr[%d] = r%d;" % (r, r) for r in allregs[i:i + 6]) + "\n")
+    out.append("    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : ctx->image_id;\n")
+    out.append("}\n")
+    out.append("#endif\n" + END)
     return "".join(out)
+
+
+_MODULE_CACHE: dict = {}
+
+
+def module_bytes(mod: str) -> bytes | None:
+    """the job module's own bytes (streamed to LS 0x4000) from the game's EMAIN.ELF, or None without the game"""
+    if mod in _MODULE_CACHE:
+        return _MODULE_CACHE[mod]
+    raw = None
+    try:
+        import hashlib
+        sys.path.insert(0, str(ROOT / "ps3recomp" / "tools"))
+        sys.path.insert(0, str(ROOT / "tools"))
+        from lift_jobmods import find_engine_modules
+        from game_paths import GAME
+        elf = (GAME / "EMAIN.ELF").read_bytes()
+        want = mod.split("_")[1]
+        raw = next((r for _, r in find_engine_modules(elf, True) if hashlib.sha1(r).hexdigest()[:12] == want), None)
+    except Exception as e:                        # no game files: the liveness treats LS loads as unknown
+        print("module bytes unavailable (%s): LS constants stay unknown" % e)
+    _MODULE_CACHE[mod] = raw
+    return raw
 
 
 def main() -> int:
@@ -225,6 +317,8 @@ def main() -> int:
         a, b = text.index(BEGIN), text.index(END) + len(END)
         text = text[:a] + text[b:]
         text = text.replace(hook, "", 1)
+        for old in OLD_HOOKS:
+            text = text.replace(old.replace("@", MOD), "", 1)
     funcs = functions(text, MOD)
     if LOOP not in funcs or body_hash(funcs, MOD, hook) != BODY_SHA256:
         print("module %s: not the reviewed lifted loop (sha256 %s)%s" % (

@@ -14,6 +14,7 @@
 #include <string.h>
 #include "spu_context.h"
 #include "spu_helpers.h"
+#include "ps3emu/ps3_ab.h"
 
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
 int g_spu_ls_watch_n;
@@ -37,11 +38,17 @@ static unsigned continued;
 void orig_00006840(spu_context* ctx) { (void)ctx; continued++; }
 #include "native_a8dec1_case.inc"          /* orig_<pc>: the lifted functions; a8dec1_fused_6750 + a8dec1_fused_pcs */
 int gt6_native_a8dec1_gate(spu_context* ctx, const uint32_t* pcs, unsigned npcs);
-static void native_6750(spu_context* ctx)
+static unsigned long long lv_runs;
+void gt6_native_a8dec1_lv(spu_context* ctx, void (*lv)(spu_context*));   /* [GT6 0185] eight at once, the rest live-lane */
+extern volatile long long g_a8x_batches_total;
+static void native_6750(spu_context* ctx)       /* as the hook: the live-lane form (and the AVX2 batches) where it may run */
 {
-    a8dec1_fused_6750(ctx);
+    if (spu__x8_rz() && a8dec1_consts_ok(ctx)) { lv_runs++; gt6_native_a8dec1_lv(ctx, a8dec1_fused_6750_lv); }
+    else a8dec1_fused_6750(ctx);
     SPU_DIRECT(ctx, 0x6840, orig_00006840);
 }
+static uint8_t module[0x10000];
+static size_t module_size;
 
 static unsigned long long checks, cases, refusals;
 #define CHECK(x) do { checks++; if (!(x)) { fprintf(stderr, "FAIL case %llu line %d: %s\n", cases, __LINE__, #x); exit(1); } } while (0)
@@ -65,6 +72,15 @@ static uint32_t word(void)
     return (rnd() & 0x80000000u) | ((uint32_t)(127 + e) << 23) | (rnd() & 0x7FFFFFu);
 }
 static void be32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+static uint32_t clean(void)                     /* an ordinary float: 2^-6 .. 2^6 either sign, sometimes 0 or a clamp value */
+{
+    const uint32_t k = rnd() % 100u;
+    if (k < 3) return 0;
+    if (k < 8) return fbits((float)((int)(rnd() % 4096u) - 2048) / 1024.0f);
+    const int e = (int)(rnd() % 13u) - 6;
+    return (rnd() & 0x80000000u) | ((uint32_t)(127 + e) << 23) | (rnd() & 0x7FFFFFu);
+}
+static unsigned long long r7879_only;           /* pairs whose registers differ in r78 / r79 alone (see gt6_native_a8dec1.c) */
 static void copy_ctx(spu_context* to, const spu_context* from) { memcpy(to, from, sizeof *to); to->ls = to->ls_store; }
 static void configure(int rz)
 {
@@ -89,11 +105,14 @@ static void make_case(void)
     for (unsigned i = 0; i < SPU_LS_SIZE; i += 4) be32(base.ls + i, word());
     for (unsigned r = 0; r < 128; r++)
         for (unsigned k = 0; k < 4; k++) base.gpr[r]._u32[k] = word();
+    if (rnd() % 8u)                                   /* the module's own bytes (its constants) - most cases */
+        memcpy(base.ls + 0x4000, module, module_size);
     /* the loop's state as 0x6708 sets it up: r1 the stack pointer, r89 / r88 = sp + 48 / + 96 (the matrices, in the
      * caller's frame), r83 the outputs, r82 the inputs, r81 the outcode bytes, r84 the counter, r90 its end, r80 the
      * transform's path, r86 a vector argument */
     const uint32_t sp = 0x30000u + 16u * (rnd() % 0xF00u);
-    const uint32_t n = 1 + rnd() % 9u;
+    /* [GT6 0185] up to 40 vertices: the eight-at-once batches of gt6_native_a8dec1_lv and the exact tail */
+    const uint32_t n = (rnd() & 1u) ? 1 + rnd() % 9u : 1 + rnd() % 40u;
     const uint32_t i0 = rnd() % 0x10000u;
     base.gpr[1]._u32[0] = sp;
     base.gpr[89]._u32[0] = sp + 48u;
@@ -104,6 +123,14 @@ static void make_case(void)
     base.gpr[84]._u32[0] = i0;
     base.gpr[90]._u32[0] = i0 + n;
     base.gpr[80]._u32[0] = (rnd() & 1u);
+    /* [GT6 0185] half the cases with ordinary inputs (no Inf, NaN, denormal or extended-range word): records, both
+     * matrices, the offset, the scale - so the batches are made eight at once, not all made again exactly */
+    if (rnd() & 1u) {
+        const uint32_t r82 = base.gpr[82]._u32[0] & ~15u;
+        for (uint32_t i = 0; i < 48u * n + 48u; i += 4) be32(base.ls + ((r82 + i) & (SPU_LS_SIZE - 1u)), clean());
+        for (uint32_t i = 32; i < 160; i += 4) be32(base.ls + sp + i, clean());   /* offset, model, view-projection */
+        base.gpr[86]._u32[0] = clean();
+    }
 }
 
 static void compare_pair(void)
@@ -113,10 +140,24 @@ static void compare_pair(void)
     orig_00006750(&a);
     CHECK(continued == 1);
     copy_ctx(&b, &base); continued = 0;
+    const long long batches0 = g_a8x_batches_total;
     native_6750(&b);
     CHECK(continued == 1);
     CHECK(!memcmp(a.ls, b.ls, SPU_LS_SIZE));
-    CHECK(!memcmp(a.gpr, b.gpr, sizeof a.gpr));
+    /* every register equal - but r78 / r79 only where batches were made eight at once (gt6_native_a8dec1.c says why) */
+    if (memcmp(a.gpr, b.gpr, sizeof a.gpr)) {
+        for (unsigned r = 0; r < 128; r++)
+            if (r != 78 && r != 79 && memcmp(&a.gpr[r], &b.gpr[r], sizeof a.gpr[r]))
+                fprintf(stderr, "  r%u: lifted %08X %08X %08X %08X, here %08X %08X %08X %08X (n %u, rot %u, batches %lld)\n", r,
+                        a.gpr[r]._u32[0], a.gpr[r]._u32[1], a.gpr[r]._u32[2], a.gpr[r]._u32[3],
+                        b.gpr[r]._u32[0], b.gpr[r]._u32[1], b.gpr[r]._u32[2], b.gpr[r]._u32[3],
+                        base.gpr[90]._u32[0] - base.gpr[84]._u32[0], base.gpr[80]._u32[0], g_a8x_batches_total - batches0);
+        CHECK(g_a8x_batches_total != batches0);
+        for (unsigned r = 0; r < 128; r++)
+            if (r != 78 && r != 79) CHECK(!memcmp(&a.gpr[r], &b.gpr[r], sizeof a.gpr[r]));
+        r7879_only++;
+        a.gpr[78] = b.gpr[78]; a.gpr[79] = b.gpr[79];
+    }
     a.ls = b.ls = NULL;
     CHECK(!memcmp(&a, &b, sizeof a));
 }
@@ -130,7 +171,14 @@ static void refuse(void)
 
 int main(int argc, char** argv)
 {
+    if (argc < 2) { fprintf(stderr, "usage: test_native_a8dec1 <mod_a8dec1.bin> [--bench]\n"); return 2; }
+    FILE* m = fopen(argv[1], "rb");
+    if (!m) { perror(argv[1]); return 2; }
+    module_size = fread(module, 1, sizeof module, m);
+    fclose(m);
+    argc--; argv++;
     _putenv_s("GT6_NATIVE_A8DEC1", "1");
+    _putenv_s("GT6_A8DEC1_AVX2", "1");                 /* [GT6 0185] off by default in the game */
     for (int rz = 1; rz >= 0; rz--) {
         configure(rz);
         for (unsigned i = 0; i < 2000; i++) {
@@ -163,8 +211,9 @@ int main(int argc, char** argv)
     make_case(); { const uint32_t pg = (base.gpr[1]._u32[0] - 0x100u) >> SPU_CODE_PAGE_SHIFT;
                    base.resident_code_pages[pg >> 6] |= UINT64_C(1) << (pg & 63); } refuse();
     _putenv_s("GT6_NATIVE_A8DEC1", "0");
-    printf("PASS: %llu pairs equal (local store, 128 registers, context, exit) in both float modes, %llu refusals, %llu checks\n",
-           cases, refusals, checks);
+    printf("PASS: %llu pairs equal (local store, 128 registers, context, exit) in both float modes, %llu of them through the "
+           "live-lane form, %llu refusals, %llu checks; %lld batches made eight at once (AVX2), %llu pairs with r78 / r79 "
+           "alone different\n", cases, lv_runs, refusals, checks, g_a8x_batches_total, r7879_only);
     if (argc > 1 && !strcmp(argv[1], "--bench")) {
         configure(1);
         make_case(); base.gpr[90]._u32[0] = base.gpr[84]._u32[0] + 9u;
@@ -179,6 +228,31 @@ int main(int argc, char** argv)
         const double us_l = 1e6 * (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart / reps;
         const double us_n = 1e6 * (double)(t2.QuadPart - t1.QuadPart) / (double)f.QuadPart / reps;
         printf("bench (9 vertices, registers copied each time): lifted %.3f us, fused %.3f us (%.2fx)\n", us_l, us_n, us_l / us_n);
+        /* [GT6 0185] 40 vertices of ordinary inputs, both transform paths: the live-lane loop alone and with the batches */
+        for (int rot = 0; rot < 2; rot++) {
+            do { make_case(); base.gpr[90]._u32[0] = base.gpr[84]._u32[0] + 40u; base.gpr[80]._u32[0] = (uint32_t)rot;
+                 memcpy(base.ls + 0x4000, module, module_size);
+                 const uint32_t sp = base.gpr[1]._u32[0], r82 = base.gpr[82]._u32[0] & ~15u;
+                 for (uint32_t i = 0; i < 48u * 40u + 48u; i += 4) be32(base.ls + ((r82 + i) & (SPU_LS_SIZE - 1u)), clean());
+                 for (uint32_t i = 32; i < 160; i += 4) be32(base.ls + sp + i, clean());
+                 base.gpr[86]._u32[0] = clean();
+                 copy_ctx(&b, &base); } while (!gt6_native_a8dec1_gate(&b, a8dec1_fused_pcs, A8DEC1_FUSED_NPCS));
+            copy_ctx(&a, &base);
+            g_ps3_ab_mask = PS3_AB_A8DEC1_AVX2;
+            double us[2];
+            for (int on = 0; on < 2; on++) {
+                g_ps3_ab_on_bits = on ? PS3_AB_A8DEC1_AVX2 : 0u;
+                const long long b0 = g_a8x_batches_total;
+                QueryPerformanceCounter(&t0);
+                for (int i = 0; i < reps; i++) { memcpy(a.gpr, base.gpr, sizeof a.gpr); a.pc = base.pc; native_6750(&a); }
+                QueryPerformanceCounter(&t1);
+                us[on] = 1e6 * (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart / reps;
+                if (on && g_a8x_batches_total == b0) printf("  (no batch was made eight at once)\n");
+            }
+            g_ps3_ab_mask = 0; g_ps3_ab_on_bits = 0;
+            printf("bench (40 vertices, ordinary inputs, rotation %s): live-lane %.3f us, eight at once %.3f us (%.2fx; %.1f ns a vertex)\n",
+                   rot ? "on" : "off", us[0], us[1], us[0] / us[1], 1000.0 * us[1] / 40.0);
+        }
     }
     return 0;
 }

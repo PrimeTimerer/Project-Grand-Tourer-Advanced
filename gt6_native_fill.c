@@ -16,7 +16,8 @@
  * armed, a range that wraps the 32-bit address or the local store, more than 16,384 stores, or a page of resident
  * code inside it (the lifted store notes those one by one).
  *
- * Switch: GT6_NATIVE_FILL=1 (default off until measured), GT6_AB name "fill" (PS3_AB_NATIVE_FILL, ps3_ab.h).
+ * Switch: on by default since [GT6 0188] (ab189 with fixvec: start -1.50 +- 0.56 ms, whole race -0.79 +- 0.27);
+ * GT6_NATIVE_FILL=0 off; GT6_AB name "fill" (PS3_AB_NATIVE_FILL, ps3_ab.h).
  */
 #include <stdint.h>
 #include <stdlib.h>
@@ -31,7 +32,7 @@ static int gt6_fill_on(void)
     int e = s_fill_env;
     if (__builtin_expect(e < 0, 0)) {
         const char* v = getenv("GT6_NATIVE_FILL");
-        e = v && v[0] == '1' && v[1] == '\0';
+        e = !(v && v[0] == '0' && v[1] == '\0');      /* [GT6 0188] on unless GT6_NATIVE_FILL=0 */
         s_fill_env = e;
     }
     return ps3_ab_on(PS3_AB_NATIVE_FILL, e);

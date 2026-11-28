@@ -1,0 +1,13 @@
+diff --git a/include/ps3emu/ps3_ab.h b/include/ps3emu/ps3_ab.h
+index 1e9da0b..0f661ef 100644
+--- a/include/ps3emu/ps3_ab.h
++++ b/include/ps3emu/ps3_ab.h
+@@ -40,6 +40,8 @@ extern volatile unsigned g_ps3_ab_on_bits; /* [GT6 0172] the switches of the mas
+                                      * at once (main.cpp ab_apply_spu) */
+ #define PS3_AB_LD_REC     0x4000u   /* LD_REC_THREAD ([GT6 0183], rsx_live_draw.c): the drawing thread's D3D12 calls made by a
+                                      * thread of their own (switched at a present) */
++#define PS3_AB_A8DEC1_AVX2 0x8000u  /* GT6_A8DEC1_AVX2 ([GT6 0185], the port's gt6_native_a8dec1.c): the a8dec1 loop eight
++                                     * vertices at once */
+ 
+ static inline int ps3_ab_on(unsigned bit, int env_on)
+ {

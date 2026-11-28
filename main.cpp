@@ -17,6 +17,7 @@
  *   RSX_LIVE_DRAW=1  live NV4097 -> D3D12 renderer (the working path)
  */
 
+#include <algorithm>
 #include "ppu_recomp.h"
 #include "gt6_trainer.h"
 extern "C" void gt6_menu_install(void);
@@ -97,6 +98,10 @@ extern "C" uint32_t rsx_live_draw_get_last_draws(void);
 extern "C" unsigned long long rsx_live_draw_fence_wait_us(unsigned* waits);
 extern "C" int g_spu_fix_count;                     /* [GT6 0175] spu_helpers.h (selectany), SPU_FIX_COUNT */
 extern "C" volatile long long g_spu_fix_lanes[9];
+extern "C" volatile uintptr_t g_spu_fix_ring[4096];   /* [GT6 0180] SPU_FIX_COUNT=2 */
+extern "C" int g_spu_ib_count;                        /* [GT6 0186] spu_channels.c, SPU_IB_COUNT=1 */
+extern "C" volatile uintptr_t g_spu_ib_ring[4096 * 2];
+extern "C" volatile unsigned g_spu_ib_ring_n;
 extern "C" int      rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" int      rsx_null_backend_pump_messages(void);
 extern "C" void*    rsx_null_backend_get_hwnd(void);
@@ -499,13 +504,17 @@ static DWORD WINAPI threads_at(LPVOID p)
 /* [GT6 0165] the SPU forms of an AB build (spu_context.h): SPU_LS_VEC_ON=1 / SPU_CG_ON=1, or the A/B's lsvec / cg. */
 extern "C" int g_spu_ls_vec;
 extern "C" int g_spu_cg_on;
-extern "C" int g_spu_fix_vec;      /* [GT6 0176] spu_helpers.h: GT6_SPU_FIX_VEC=1 / the A/B's fixvec */
-static int s_spu_ls_vec_env = 0, s_spu_cg_env = 0, s_spu_fix_vec_env = 0;
+extern "C" int g_spu_fix_vec;      /* [GT6 0176] spu_helpers.h: on unless GT6_SPU_FIX_VEC=0 ([GT6 0188]) / the A/B's fixvec */
+extern "C" int g_spu_intsw;        /* [GT6 0186] spu_helpers.h: on unless SPU_INTSW=0 / the A/B's intsw */
+extern "C" int g_spu_fast_irq;     /* [GT6 0187] spu_channels.c: SPU_FAST_IRQ=1 / the A/B's fastirq */
+static int s_spu_ls_vec_env = 0, s_spu_cg_env = 0, s_spu_fix_vec_env = 0, s_spu_intsw_env = 0, s_spu_fast_irq_env = 0;
 static void ab_apply_spu(void)
 {
     g_spu_ls_vec = ps3_ab_on(PS3_AB_SPU_LS_VEC, s_spu_ls_vec_env);
     g_spu_cg_on = ps3_ab_on(PS3_AB_SPU_CG, s_spu_cg_env);
     g_spu_fix_vec = ps3_ab_on(PS3_AB_SPU_FIX_VEC, s_spu_fix_vec_env);
+    g_spu_intsw = ps3_ab_on(PS3_AB_SPU_INTSW, s_spu_intsw_env);
+    g_spu_fast_irq = ps3_ab_on(PS3_AB_SPU_FAST_IRQ, s_spu_fast_irq_env);
 }
 /* [GT6 0172] GT6_AB_EACH=1: the switches of the list one at a time - A (all OFF), B1 (the first alone ON), A, B2 (the
  * second alone), ..., A, Bn, A, B1, ... - so one run measures each against the A phases around it (tools\abprof.py
@@ -543,7 +552,11 @@ static void ab_start(void)
 {
     s_spu_ls_vec_env = getenv("SPU_LS_VEC_ON") && *getenv("SPU_LS_VEC_ON") == '1';
     s_spu_cg_env = getenv("SPU_CG_ON") && *getenv("SPU_CG_ON") == '1';
-    s_spu_fix_vec_env = getenv("GT6_SPU_FIX_VEC") && *getenv("GT6_SPU_FIX_VEC") == '1';
+    /* [GT6 0188] on by default (ab189 with the native fill: start -1.50 +- 0.56 ms); GT6_SPU_FIX_VEC=0 = off */
+    s_spu_fix_vec_env = !(getenv("GT6_SPU_FIX_VEC") && *getenv("GT6_SPU_FIX_VEC") == '0');
+    /* [GT6 0186] on by default (ab186: start -1.90 +- 0.56 ms, whole race -0.82 +- 0.32); SPU_INTSW=0 = off */
+    s_spu_intsw_env = !(getenv("SPU_INTSW") && *getenv("SPU_INTSW") == '0');
+    s_spu_fast_irq_env = getenv("SPU_FAST_IRQ") && *getenv("SPU_FAST_IRQ") == '1';
     ab_apply_spu();
     const char* e = getenv("GT6_AB");
     if (!e || !*e) return;
@@ -563,7 +576,11 @@ static void ab_start(void)
             {"fill", PS3_AB_NATIVE_FILL},   /* [GT6 0171] the job CRT's local-store fill as one memset */
             {"wrch", PS3_AB_SPU_WRCH},      /* [GT6 0173] inline channel stores (a GT6_SPU_WRCH_INLINE=AB build) */
             {"a8dec1", PS3_AB_NATIVE_A8DEC1}, /* [GT6 0174] the native a8dec1 vertex loop */
-            {"fixvec", PS3_AB_SPU_FIX_VEC}};  /* [GT6 0176] the SPU float fix-up four lanes at once */
+            {"fixvec", PS3_AB_SPU_FIX_VEC},   /* [GT6 0176] the SPU float fix-up four lanes at once */
+            {"rec", PS3_AB_LD_REC},           /* [GT6 0183] the drawing thread's D3D12 calls on a thread of their own */
+            {"a8avx", PS3_AB_A8DEC1_AVX2},    /* [GT6 0185] the a8dec1 loop eight vertices at once (AVX2) */
+            {"intsw", PS3_AB_SPU_INTSW},      /* [GT6 0186] the SPU interrupt-switch idiom branches on directly */
+            {"fastirq", PS3_AB_SPU_FAST_IRQ}}; /* [GT6 0187] the fast dispatch inside an SPU interrupt handler too */
         char buf[256];
         strncpy(buf, e, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
         for (char* t = strtok(buf, ",; "); t; t = strtok(NULL, ",; ")) {
@@ -789,13 +806,66 @@ static DWORD WINAPI frame_clock(LPVOID)
                       if (secs % 5 == 0) { fprintf(stderr, "[gt6] gcm nudges in the last 5 s: %llu\n", g_gcm_nudges - n0); n0 = g_gcm_nudges; } }
                     /* [GT6 0175] SPU_FIX_COUNT=1: the SPU float lanes the exact per-lane forms redid (spu_helpers.h) */
                     { static int fc = -1;
-                      if (fc < 0) { fc = getenv("SPU_FIX_COUNT") ? 1 : 0; g_spu_fix_count = fc; }
+                      if (fc < 0) { const char* e = getenv("SPU_FIX_COUNT"); fc = e ? (atoi(e) >= 2 ? 2 : 1) : 0; g_spu_fix_count = fc; }
                       if (fc && secs % 5 == 0) {
                           long long v[9];
                           for (int i = 0; i < 9; i++) { v[i] = g_spu_fix_lanes[i]; g_spu_fix_lanes[i] = 0; }
                           fprintf(stderr, "[fix] lanes redone in 5 s (exponent 255 / exponent 0 + fraction / other): "
                                   "fa %lld %lld %lld  fm %lld %lld %lld  fma %lld %lld %lld\n",
                                   v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
+                          /* [GT6 0180] SPU_FIX_COUNT=2: the busiest call sites among the last 4096 fix-up calls, as exe offsets */
+                          if (fc >= 2) {
+                              static uintptr_t snap[4096];
+                              for (int i = 0; i < 4096; i++) snap[i] = g_spu_fix_ring[i];
+                              std::sort(snap, snap + 4096);
+                              uintptr_t top_a[12] = {0}; int top_n[12] = {0};
+                              for (int i = 0; i < 4096;) {
+                                  int j = i; while (j < 4096 && snap[j] == snap[i]) ++j;
+                                  const int n = j - i;
+                                  if (snap[i]) {
+                                      int k = 11; if (n > top_n[11]) { while (k > 0 && n > top_n[k - 1]) { top_n[k] = top_n[k - 1]; top_a[k] = top_a[k - 1]; --k; }
+                                                                       top_n[k] = n; top_a[k] = snap[i]; }
+                                  }
+                                  i = j;
+                              }
+                              const uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
+                              fprintf(stderr, "[fixsite]");
+                              for (int k = 0; k < 12 && top_n[k]; ++k) fprintf(stderr, " %llx:%d", (unsigned long long)(top_a[k] - base), top_n[k]);
+                              fprintf(stderr, "\n");
+                          }
+                      } }
+                    /* [GT6 0186] SPU_IB_COUNT=1: the indirect branches of the SPU code - about how many in 5 s, and among
+                     * the last 4096 the functions they land in ("to") and where they are made ("from"), as exe offsets;
+                     * "s<image>:<pc>" = one that did not go through the fast path */
+                    { static int ic = -1;
+                      if (ic < 0) { const char* e = getenv("SPU_IB_COUNT"); ic = (e && *e && strcmp(e, "0") != 0) ? 1 : 0; g_spu_ib_count = ic; }
+                      if (ic && secs % 5 == 0) {
+                          static unsigned n0 = 0; const unsigned n1 = g_spu_ib_ring_n;
+                          static uintptr_t ib_v[2][4096];
+                          for (int i = 0; i < 4096; i++) { ib_v[0][i] = g_spu_ib_ring[2 * i]; ib_v[1][i] = g_spu_ib_ring[2 * i + 1]; }
+                          fprintf(stderr, "[ib] indirect branches in the last 5 s: about %u\n", n1 - n0); n0 = n1;
+                          const uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
+                          for (int w = 0; w < 2; w++) {
+                              uintptr_t* v = ib_v[w];
+                              std::sort(v, v + 4096);
+                              uintptr_t top_a[16] = {0}; int top_n[16] = {0};
+                              for (int i = 0; i < 4096;) {
+                                  int j = i; while (j < 4096 && v[j] == v[i]) ++j;
+                                  const int n = j - i;
+                                  if (v[i] && n > top_n[15]) {
+                                      int k = 15; while (k > 0 && n > top_n[k - 1]) { top_n[k] = top_n[k - 1]; top_a[k] = top_a[k - 1]; --k; }
+                                      top_n[k] = n; top_a[k] = v[i];
+                                  }
+                                  i = j;
+                              }
+                              fprintf(stderr, w ? "[ibsite] from" : "[ibsite] to");
+                              for (int k = 0; k < 16 && top_n[k]; ++k) {
+                                  const unsigned long long a = (unsigned long long)top_a[k];
+                                  if (a >> 62) fprintf(stderr, " s%u:%05llx:%d", (unsigned)((a >> 32) & 0xFFFFu), a & 0xFFFFFFFFull, top_n[k]);
+                                  else fprintf(stderr, " %llx:%d", (unsigned long long)(top_a[k] - base), top_n[k]);
+                              }
+                              fprintf(stderr, "\n");
+                          }
                       } } }
                   vbt_t0 = vbt_n;
                   g_present_n = 0; g_present_sum_us = 0; g_present_max_us = 0;

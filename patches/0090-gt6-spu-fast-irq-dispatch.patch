@@ -1,0 +1,41 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index fe22b47..e605ec8 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2934,6 +2934,12 @@ static int spu_taskset_resident_image(const spu_context* ctx)
+  * SPU_FAST_DISPATCH=0: off. =shadow: every hit is compared with the full lookup; disagreements are counted, said
+  * (16 times) and answered by the full resolver. */
+ static unsigned long long s_fast_shadow_hits, s_fast_shadow_bad;
++/* [GT6 0187] SPU_FAST_IRQ=1 (main.cpp sets g_spu_fast_irq; A/B "fastirq"): with an interrupt's registers saved, only
++ * the dispatch that IS the irete - interrupts enabled, at the saved srr0, where spu_irq_regs_maybe_restore puts the
++ * registers back - needs the full resolver; the handler's other branches (interrupts stay disabled in it) are plain
++ * branches. The census of [GT6 0186] had a quarter of all remaining indirect branches in the 16-car start there (the
++ * job manager's interrupt handler, LS 0x1788 .. 0x2338, 0x7984), every one through the full resolver. */
++int g_spu_fast_irq = 0;
+ spu_fn spu_indirect_fast(spu_context* ctx, uint32_t pc)
+ {
+     static int s_mode = -1;   /* 0 off, 1 on, 2 shadow */
+@@ -2949,7 +2955,9 @@ spu_fn spu_indirect_fast(spu_context* ctx, uint32_t pc)
+     if (!mode) return NULL;
+     if ((ctx->policy_mode && (pc == SPURS_PM_EXIT_TO_KERNEL_LS || pc == SPURS_PM_SELECT_WORKLOAD_LS)) ||
+         pc == SPURS_TASKSET_PM_SYSCALL_LS || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID) return NULL;
+-    if (ctx->irq_saved || ctx->resident_task || s_task_elf_count || s_task_entry_count) return NULL;
++    if (ctx->irq_saved &&
++        (!g_spu_fast_irq || (ctx->int_enable && pc == (ctx->irq_resume_pc & SPU_LS_MASK)))) return NULL;   /* [GT6 0187] */
++    if (ctx->resident_task || s_task_elf_count || s_task_entry_count) return NULL;
+     switch (pc) {
+     case 0xA2C: case 0xA30: case 0xA34: case 0xA84: case 0xA90: case 0x3FEC0:   /* spu_gt6_irq_lookup's */
+     case SPU_JOB_RETURN_LS:
+diff --git a/include/ps3emu/ps3_ab.h b/include/ps3emu/ps3_ab.h
+index 24775c8..23ebf5d 100644
+--- a/include/ps3emu/ps3_ab.h
++++ b/include/ps3emu/ps3_ab.h
+@@ -44,6 +44,8 @@ extern volatile unsigned g_ps3_ab_on_bits; /* [GT6 0172] the switches of the mas
+                                      * vertices at once */
+ #define PS3_AB_SPU_INTSW  0x10000u  /* SPU_INTSW ([GT6 0186], spu_helpers.h g_spu_intsw): the lifted interrupt-switch idiom
+                                      * branches on directly (main.cpp ab_apply_spu) */
++#define PS3_AB_SPU_FAST_IRQ 0x20000u /* SPU_FAST_IRQ ([GT6 0187], spu_channels.c g_spu_fast_irq): the fast dispatch also
++                                     * inside an interrupt handler (all but the irete) */
+ 
+ static inline int ps3_ab_on(unsigned bit, int env_on)
+ {

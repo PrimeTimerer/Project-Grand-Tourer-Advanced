@@ -4,7 +4,8 @@
     the loop's exit orig_00006840 is the test's own);
   - the fused function and its block list exactly as tools/native_a8dec1_hook.py generates them.
 
-  python tools/tests/prepare_native_a8dec1_fixture.py <dir>   -> <dir>/native_a8dec1_case.inc (never put it in git)
+  python tools/tests/prepare_native_a8dec1_fixture.py <dir>   -> <dir>/native_a8dec1_case.inc and <dir>/mod_a8dec1.bin
+  (the module's own bytes from the game's EMAIN.ELF, for the live-lane form's constants; never put either in git)
 """
 import sys
 from pathlib import Path
@@ -32,6 +33,9 @@ def main() -> int:
     body = "".join(parts)
     assert "jobmod_" not in body
     (out / "native_a8dec1_case.inc").write_text(body)
+    raw = hook.module_bytes(hook.MOD)
+    assert raw, "the module's bytes (EMAIN.ELF of game.path) are needed for the live-lane form's constants"
+    (out / "mod_a8dec1.bin").write_bytes(raw)
     print("%d lifted functions, %d lines" % (len(pcs), body.count("\n")))
     return 0
 

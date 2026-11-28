@@ -1,0 +1,155 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index cfc7d8c..fe22b47 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -3595,6 +3595,26 @@ static int spu_smc_microstep(spu_context* ctx)
+     return 0;
+ }
+ 
++/* [GT6 0186] SPU_IB_COUNT=1 (main.cpp sets g_spu_ib_count and prints "[ib]" / "[ibsite]" every 5 s): the census of the
++ * indirect branches. A ring of the last 4096 calls of spu_indirect_branch, two words a call: the lifted function the
++ * branch lands in through the fast path (or, when it does not, 1 << 62 | image << 32 | pc), and where it was called
++ * from - the drain loop for a queued branch (a return at host depth 0, a computed bi), the lifted function itself for
++ * its bisl. Racy on purpose (a census, not a count); g_spu_ib_ring_n also gives the rate. Off: one load, one branch. */
++int g_spu_ib_count = 0;
++volatile uintptr_t g_spu_ib_ring[4096 * 2];
++volatile unsigned g_spu_ib_ring_n = 0;
++#if defined(_MSC_VER) && !defined(__clang__)
++static __declspec(noinline) void spu_ib_note(const spu_context* ctx, spu_fn fn, void* from)
++#else
++static __attribute__((noinline)) void spu_ib_note(const spu_context* ctx, spu_fn fn, void* from)
++#endif
++{
++    const unsigned i = (g_spu_ib_ring_n++ & 4095u) * 2u;
++    g_spu_ib_ring[i] = fn ? (uintptr_t)fn
++                          : (uintptr_t)((1ull << 62) | ((uint64_t)(uint16_t)ctx->image_id << 32) | (ctx->pc & SPU_LS_MASK));
++    g_spu_ib_ring[i + 1] = (uintptr_t)from;
++}
++
+ void spu_indirect_branch(spu_context* ctx)
+ {
+     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
+@@ -3606,6 +3626,7 @@ void spu_indirect_branch(spu_context* ctx)
+     /* [GT6 0146] The plain case first (see spu_indirect_fast): a return at host depth 0 comes here through the
+      * trampoline (SPU_RET), not through spu_indirect_branch_mt. */
+     { const spu_fn fast = spu_indirect_fast(ctx, ctx->pc);
++      if (__builtin_expect(g_spu_ib_count != 0, 0)) spu_ib_note(ctx, fast, __builtin_return_address(0));   /* [GT6 0186] */
+       if (fast) {
+ #if defined(__clang__)
+           __attribute__((musttail)) return fast(ctx);
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index 6b1e471..00d3c1f 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1182,6 +1182,11 @@ SPU_GATE volatile unsigned g_spu_fix_ring_n = 0;
+  *    the SPU's range, as spu__sf_pack does.
+  * A thread not in the mode (spu__xv_rz) keeps the per-lane forms. Bit-identical with them: tools/tests/test_spu_fix_vec.c. */
+ SPU_GATE int g_spu_fix_vec = 0;
++/* [GT6 0186] g_spu_intsw (GT6: main.cpp sets it at start - on unless SPU_INTSW=0; A/B "intsw"): the lifted
++ * interrupt-switch idiom (`brsl $rT, .+4; ai $rT, $rT, 8; bid/bie $rT` - turn interrupts off or on, go on at the next
++ * instruction) branches there directly when $rT holds that address, instead of through spu_indirect_branch
++ * (tools/spu_lifter.py compute_intsw_sites). 0 here, so a program that never sets it keeps the generic dispatch. */
++SPU_GATE int g_spu_intsw = 0;
+ #if defined(__FMA__) && !defined(SPU_FLOAT_RZ_BY_TLS)
+ SPU__X8_INLINE int spu__xv_rz(void) { unsigned short cw; __asm__("fnstcw %0" : "=m"(cw)); return (cw & SPU_X87_RZ_MARK) != 0; }
+ #elif defined(__FMA__)
+diff --git a/include/ps3emu/ps3_ab.h b/include/ps3emu/ps3_ab.h
+index 0f661ef..24775c8 100644
+--- a/include/ps3emu/ps3_ab.h
++++ b/include/ps3emu/ps3_ab.h
+@@ -42,6 +42,8 @@ extern volatile unsigned g_ps3_ab_on_bits; /* [GT6 0172] the switches of the mas
+                                      * thread of their own (switched at a present) */
+ #define PS3_AB_A8DEC1_AVX2 0x8000u  /* GT6_A8DEC1_AVX2 ([GT6 0185], the port's gt6_native_a8dec1.c): the a8dec1 loop eight
+                                      * vertices at once */
++#define PS3_AB_SPU_INTSW  0x10000u  /* SPU_INTSW ([GT6 0186], spu_helpers.h g_spu_intsw): the lifted interrupt-switch idiom
++                                     * branches on directly (main.cpp ab_apply_spu) */
+ 
+ static inline int ps3_ab_on(unsigned bit, int env_on)
+ {
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index 35d8d42..c80a13e 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -375,6 +375,36 @@ def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
+     return groups
+ 
+ 
++def compute_intsw_sites(insns) -> dict:
++    """[GT6 0186] The interrupt-switch idiom: `brsl $rT, .+4; ai $rT, $rT, imm; bid/bie/bi $rT` - the SPU has no
++    instruction that only turns interrupts off or on, so the compiler branches to the next instruction (imm = 8) with
++    the D or E bit. Lifted as a computed branch, every pass went through spu_indirect_branch: in Gran Turismo 6's
++    16-car start about three quarters of all indirect branches (census [GT6 0186], ~9 million a second).
++    Returns {bi address: the address rT then holds}. The lifted branch compares rT with it at run time and goes there
++    directly when equal (g_spu_intsw, spu_helpers.h) - any other value takes the generic dispatch as before."""
++    by_addr = {i.addr: i for i in insns}
++    out = {}
++    for i in insns:
++        if i.mnemonic != "bi":
++            continue
++        t = (i.raw >> 7) & 0x7F                      # RR: RA = the register branched to
++        a, b = by_addr.get(i.addr - 4), by_addr.get(i.addr - 8)
++        if a is None or b is None or a.mnemonic != "ai" or b.mnemonic != "brsl" or t == 0:
++            continue
++        if (a.raw & 0x7F) != t or ((a.raw >> 7) & 0x7F) != t or (b.raw & 0x7F) != t:
++            continue
++        if SPULifter._branch_target(b) != a.addr:   # `brsl $rT, .+4`: rT = the ai's own address
++            continue
++        imm = (a.raw >> 14) & 0x3FF
++        if imm & 0x200:
++            imm -= 0x400
++        nxt = (a.addr + imm) & 0x3FFFF
++        if nxt & 3:
++            continue
++        out[i.addr] = nxt
++    return out
++
++
+ def compute_link_returns(insns, bounds) -> set:
+     """A `bi $rN` / conditional `bi{z,nz,hz,hnz} $rC,$rN` with N != 0 is emitted
+     as a generic indirect branch, but Sony's SPU compiler also uses a NON-r0
+@@ -529,6 +559,9 @@ class SPULifter:
+         # compute_link_returns(). Emitted as `return;` so they compose with the
+         # brsl->C-call nesting instead of branching to an unregistered PC.
+         self.link_return: set = set()
++        # [GT6 0186] `bi` address -> the address it goes on at, for the interrupt-switch idiom
++        # (compute_intsw_sites()). Empty => every computed `bi` dispatches as before.
++        self.intsw_next: dict = {}
+ 
+     # ------------------------------------------------------------------ #
+     def lift_function(self, insns: list[SPUInstruction],
+@@ -543,6 +576,9 @@ class SPULifter:
+             tgt = self._branch_target(insn)
+             if tgt is not None and start <= tgt < end:
+                 internal.add(tgt)
++            nxt = self.intsw_next.get(insn.addr) if insn.mnemonic == "bi" else None   # [GT6 0186]
++            if nxt is not None and start <= nxt < end:
++                internal.add(nxt)
+ 
+         # Chunks merged into this function (--merge-chunks) are otherwise entered
+         # through the drain loop, which delivers a pending SPU interrupt before
+@@ -971,6 +1007,15 @@ class SPULifter:
+                 if tgt_reg != "0":
+                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
+                 return f"{_ied}SPU_RET(ctx);"
++            # [GT6 0186] The interrupt-switch idiom (compute_intsw_sites): straight on to the address rT holds when
++            # it is the one the idiom gives - a direct branch like any other, which takes a pending interrupt at the
++            # same point (SPU_DIRECT / the drain loop). While an interrupt's registers are saved the generic dispatch
++            # stays (its return check, spu_irq_regs_maybe_restore); so does every other value of rT.
++            nxt = self.intsw_next.get(addr)
++            if nxt is not None:
++                return (f"{_ied}if (g_spu_intsw && {g(tgt_reg)}._u32[0] == 0x{nxt:X}u && !ctx->irq_saved) "
++                        f"{self._uncond_branch(nxt, func)} "
++                        f"ctx->pc = {g(tgt_reg)}._u32[0]; g_spu_trampoline_fn = spu_indirect_branch; return;")
+             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
+             return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
+@@ -1317,6 +1362,9 @@ def main() -> None:
+               f"(r0 set by lqa/lqr/il/ila, not a link): "
+               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
+     lifter.link_return = compute_link_returns(insns, bounds)
++    lifter.intsw_next = compute_intsw_sites(insns)
++    if lifter.intsw_next:
++        print(f"  {len(lifter.intsw_next)} interrupt-switch idiom site(s) ([GT6 0186])")
+     if args.force_indirect:
+         forced = {int(x, 0) for x in args.force_indirect.split(",") if x.strip()}
+         dropped = lifter.link_return & forced

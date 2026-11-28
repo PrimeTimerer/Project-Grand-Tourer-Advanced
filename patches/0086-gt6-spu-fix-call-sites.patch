@@ -1,0 +1,54 @@
+diff --git a/runtime/spu/spu_helpers.h b/runtime/spu/spu_helpers.h
+index d5b1dfa..6b1e471 100644
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -1161,6 +1161,13 @@ static inline void spu__fix_note(int op, uint32_t x, uint32_t y, uint32_t z) {
+                   : ((!ex && (x << 9)) || (!ey && (y << 9)) || (!ez && (z << 9))) ? 1 : 2;
+     g_spu_fix_lanes[op * 3 + why]++;
+ }
++/* [GT6 0180] SPU_FIX_COUNT=2: also where - the return address of every fix-up call (in the lifted function that made
++ * the op) into a ring of the last 4096; main.cpp prints the busiest ones with the "[fix]" line, as offsets in the exe
++ * (the build's .map names the lifted functions). */
++SPU_GATE volatile uintptr_t g_spu_fix_ring[4096] = {0};
++SPU_GATE volatile unsigned g_spu_fix_ring_n = 0;
++#define SPU__FIX_SITE() do { if (g_spu_fix_count >= 2) \
++    g_spu_fix_ring[g_spu_fix_ring_n++ & 4095u] = (uintptr_t)__builtin_return_address(0); } while (0)
+ /* [GT6 0176] GT6_SPU_FIX_VEC=1 (main.cpp sets g_spu_fix_vec; A/B "fixvec"): on a thread in the SPU float mode the
+  * per-lane forms below are four lanes at once and exact for every operand. The race sample of [GT6 0175] had 15 to 20
+  * million lanes a second redone one by one, 98 % of them for an operand of biased exponent 255 - the SPU's own large
+@@ -1215,8 +1222,10 @@ SPU__X8_INLINE u128 spu__xv_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t
+ }
+ SPU__X8_SLOW u128 spu__x8_fa_fix(u128 r, __m128i ok, u128 a, u128 b, uint32_t negb) {
+     const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
+-    if (g_spu_fix_count)
++    if (g_spu_fix_count) {
+         for (int i = 0; i < 4; i++) if (!(m >> i & 1)) spu__fix_note(0, a._u32[i], b._u32[i], 0);
++        SPU__FIX_SITE();
++    }
+     if (g_spu_fix_vec && spu__xv_rz())
+         return spu__xv_fa(a, b, negb);
+     for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fa_any(a._u32[i], b._u32[i] ^ negb);
+@@ -1224,8 +1233,10 @@ SPU__X8_SLOW u128 spu__x8_fa_fix(u128 r, __m128i ok, u128 a, u128 b, uint32_t ne
+ }
+ SPU__X8_SLOW u128 spu__x8_fm_fix(u128 r, __m128i ok, u128 a, u128 b) {
+     const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
+-    if (g_spu_fix_count)
++    if (g_spu_fix_count) {
+         for (int i = 0; i < 4; i++) if (!(m >> i & 1)) spu__fix_note(1, a._u32[i], b._u32[i], 0);
++        SPU__FIX_SITE();
++    }
+     if (g_spu_fix_vec && spu__xv_rz())
+         return spu__xv_fm(a, b);
+     for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fm_any(a._u32[i], b._u32[i]);
+@@ -1233,8 +1244,10 @@ SPU__X8_SLOW u128 spu__x8_fm_fix(u128 r, __m128i ok, u128 a, u128 b) {
+ }
+ SPU__X8_SLOW u128 spu__x8_fma_fix(u128 r, __m128i ok, u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+     const int m = _mm_movemask_ps(_mm_castsi128_ps(ok));
+-    if (g_spu_fix_count)
++    if (g_spu_fix_count) {
+         for (int i = 0; i < 4; i++) if (!(m >> i & 1)) spu__fix_note(2, a._u32[i], b._u32[i], c._u32[i]);
++        SPU__FIX_SITE();
++    }
+     if (g_spu_fix_vec && spu__xv_rz())
+         return spu__xv_fma(a, b, c, negp, negc);
+     for (int i = 0; i < 4; i++) if (!(m >> i & 1)) r._u32[i] = spu__fma_any(a._u32[i], b._u32[i], c._u32[i], negp, negc);

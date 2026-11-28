@@ -164,8 +164,9 @@ if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
         # [GT6 0171] the job CRT's local-store fill (0x4124 of every module) as one memset; tools/native_fill_hook.py
         # puts the call in. GT6_NATIVE_FILL=1 / GT6_AB=fill.
         list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/gt6_native_fill.c")
-        # [GT6 0174] module a8dec1's vertex loop (0x6750) fused into one function by tools/native_a8dec1_hook.py (generated
-        # into the lifted module from its own code); gt6_native_a8dec1.c decides when it may run. GT6_NATIVE_A8DEC1=1 / GT6_AB=a8dec1.
+        # [GT6 0174] / [GT6 0179] module a8dec1's vertex loop (0x6750) fused into one function by tools/native_a8dec1_hook.py
+        # (generated into the lifted module from its own code; the live-lane form by tools/spu_lanes.py); gt6_native_a8dec1.c
+        # decides when it may run. On by default; GT6_NATIVE_A8DEC1=0 off, GT6_AB=a8dec1.
         list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/gt6_native_a8dec1.c")
     endif()
     # The job manager itself (the WWS job manager policy module all eight PDI workloads run): its body lifted by
